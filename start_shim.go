@@ -15,11 +15,6 @@ import (
 
 // StartShim is a binary call that executes a new shim returning the address
 func (s *service) StartShim(ctx context.Context, opts shim.StartOpts) (_ string, retErr error) {
-	cmd, err := newCommand(ctx, opts.ID, opts.ContainerdBinary, opts.Address, opts.TTRPCAddress)
-	if err != nil {
-		return "", err
-	}
-
 	address, err := shim.SocketAddress(ctx, opts.Address, grouping)
 	if err != nil {
 		return "", err
@@ -61,6 +56,10 @@ func (s *service) StartShim(ctx context.Context, opts shim.StartOpts) (_ string,
 		return "", err
 	}
 
+	cmd, err := newCommand(ctx, opts.ContainerdBinary, opts.Address, opts.TTRPCAddress)
+	if err != nil {
+		return "", err
+	}
 	cmd.ExtraFiles = append(cmd.ExtraFiles, f)
 
 	if err := cmd.Start(); err != nil {
@@ -85,7 +84,7 @@ func (s *service) StartShim(ctx context.Context, opts shim.StartOpts) (_ string,
 	return address, nil
 }
 
-func newCommand(ctx context.Context, id, bin, containerdAddress, containerdTTRPCAddress string) (*exec.Cmd, error) {
+func newCommand(ctx context.Context, bin, containerdAddress, containerdTTRPCAddress string) (*exec.Cmd, error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return nil, err
@@ -99,8 +98,7 @@ func newCommand(ctx context.Context, id, bin, containerdAddress, containerdTTRPC
 		return nil, err
 	}
 	args := []string{
-		"-namespace", ns,
-		"-id", id,
+		"-namespace", ns, // shim.Run expects this to be set even though we won't use it (unless we do 1 daemon per ns)
 		"-address", containerdAddress,
 	}
 	cmd := exec.Command(self, args...)
