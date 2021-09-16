@@ -2,111 +2,112 @@ package systemdshim
 
 import (
 	"context"
-	"io"
-	"io/ioutil"
+	"crypto/sha256"
+	"fmt"
 	"os"
-	"os/exec"
-	"syscall"
+	"path/filepath"
+	"time"
 
-	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/defaults"
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/runtime/v2/shim"
+	"github.com/coreos/go-systemd/v22/dbus"
 	"github.com/pkg/errors"
 )
 
-// StartShim is a binary call that executes a new shim returning the address
-func (s *service) StartShim(ctx context.Context, opts shim.StartOpts) (_ string, retErr error) {
-	address, err := shim.SocketAddress(ctx, opts.Address, grouping)
-	if err != nil {
-		return "", err
-	}
+const (
+	defaultAddress     = "/run/containerd-systemd-shim/shim.sock"
+	defaultServiceName = "containerd-systemd-shim"
+)
 
-	socket, err := shim.NewSocket(address)
-	if err != nil {
-		if !shim.SocketEaddrinuse(err) {
-			return "", errors.Wrap(err, "create new shim socket")
-		}
-		if shim.CanConnect(address) {
-			if err := shim.WriteAddress("address", address); err != nil {
-				return "", errors.Wrap(err, "write existing socket for shim")
-			}
-			return address, nil
-		}
-		if err := shim.RemoveSocket(address); err != nil {
-			return "", errors.Wrap(err, "remove pre-existing socket")
-		}
-		if socket, err = shim.NewSocket(address); err != nil {
-			return "", errors.Wrap(err, "try create new shim socket 2x")
-		}
-	}
-
-	defer func() {
-		if retErr != nil {
-			socket.Close()
-			_ = shim.RemoveSocket(address)
-		}
-	}()
-
-	// make sure that reexec shim-v2 binary use the value if need
-	if err := shim.WriteAddress("address", address); err != nil {
-		return "", err
-	}
-
-	f, err := socket.File()
-	if err != nil {
-		return "", err
-	}
-
-	cmd, err := newCommand(ctx, opts.ContainerdBinary, opts.Address, opts.TTRPCAddress)
-	if err != nil {
-		return "", err
-	}
-	cmd.ExtraFiles = append(cmd.ExtraFiles, f)
-
-	if err := cmd.Start(); err != nil {
-		f.Close()
-		return "", err
-	}
-
-	defer func() {
-		if retErr != nil {
-			cmd.Process.Kill()
-		}
-	}()
-	go cmd.Wait()
-
-	// TODO: options?
-	// The runc shim uses this to add the shim process to the specified shim cgroup
-	// Since we don't plan to use this, we don't need to do anything, maybe?
-	io.Copy(ioutil.Discard, os.Stdin)
-	if err := shim.AdjustOOMScore(cmd.Process.Pid); err != nil {
-		return "", errors.Wrap(err, "failed to adjust OOM score for shim")
-	}
-	return address, nil
+type StartOpts struct {
+	Address      string
+	TTRPCAddress string
+	Debug        bool
+	Namespace    string
 }
 
-func newCommand(ctx context.Context, bin, containerdAddress, containerdTTRPCAddress string) (*exec.Cmd, error) {
-	ns, err := namespaces.NamespaceRequired(ctx)
-	if err != nil {
-		return nil, err
+func socketAddress(address, namespace string) (string, string) {
+	sockRoot := filepath.Join(defaults.DefaultStateDir, "s")
+	d := sha256.Sum256([]byte(filepath.Join(address, namespace, grouping)))
+	hex := fmt.Sprintf("%x", d)
+	return hex, "unix://" + filepath.Join(sockRoot, hex)
+}
+
+// StartShim is a binary call that executes a new shim returning the address
+func (s *Service) StartShim(ctx context.Context, opts StartOpts) (_ string, retErr error) {
+	if opts.Address == "" {
+		return "", errors.New("address must be provided")
 	}
-	self, err := os.Executable()
-	if err != nil {
-		return nil, err
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return nil, err
-	}
-	args := []string{
-		"-namespace", ns, // shim.Run expects this to be set even though we won't use it (unless we do 1 daemon per ns)
-		"-address", containerdAddress,
-	}
-	cmd := exec.Command(self, args...)
-	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "GOMAXPROCS=4")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
+	base, socket := socketAddress(opts.Address, opts.Namespace)
+
+	if shim.CanConnect(socket) {
+		return socket, nil
 	}
 
-	return cmd, nil
+	exe, err := os.Executable()
+	if err != nil {
+		return "", errors.Wrap(err, "error getting current executable path")
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", errors.Wrap(err, "error getting current working directory")
+	}
+
+	flags := []string{
+		"-address=" + opts.Address,
+		"-socket=" + socket,
+		"--namespace=" + opts.Namespace,
+		"--root=" + filepath.Dir(cwd),
+	}
+	if opts.Debug {
+		flags = append(flags, "-debug")
+	}
+
+	cmd := append([]string{exe}, flags...)
+	cmd = append(cmd, "serve")
+
+	properties := []dbus.Property{
+		dbus.PropType("notify"),
+		dbus.PropExecStart(cmd, false),
+	}
+	unit := "containerd-systemd-shim-" + base + ".service"
+
+	log.G(ctx).WithField("unit-name", unit).Debugf("Starting shim with args: %s", cmd)
+
+	wait := make(chan string, 1)
+
+	_, err = s.conn.StartTransientUnitContext(ctx, unit, "replace", properties, wait)
+	if err != nil {
+		if err2 := s.conn.ResetFailedUnitContext(ctx, unit); err2 != nil {
+			return "", err
+		}
+		_, err = s.conn.StartTransientUnitContext(ctx, unit, "replace", properties, wait)
+		if err != nil {
+			return "", errors.Wrap(err, "error starting systemd shim unit")
+		}
+	}
+
+	log.G(ctx).Debug("Waiting for shim to be ready")
+
+	select {
+	case <-ctx.Done():
+		return "", errors.Wrap(ctx.Err(), "context cancelled while waiting for shim to be ready")
+	case status := <-wait:
+		if status != "done" && status != "skipped" {
+			return "", errors.Errorf("failed to start shim: %s", status)
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("error waiting for shim to be ready to connect to: %w", ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+			if shim.CanConnect(socket) {
+				return socket, nil
+			}
+		}
+	}
 }
