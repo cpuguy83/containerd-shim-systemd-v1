@@ -21,6 +21,7 @@ import (
 	"github.com/cpuguy83/systemdshim"
 	"github.com/gogo/protobuf/proto"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -75,6 +76,11 @@ func main() {
 		id         string
 		publishBin string
 		root       string
+
+		stdin  = os.Getenv("STDIN_PATH")
+		stdout = os.Getenv("STDOUT_PATH")
+		stderr = os.Getenv("STDERR_PATH")
+		// isTerm  = os.Getenv("IS_TERMINAL")
 	)
 
 	flags := flag.NewFlagSet(filepath.Base(os.Args[0]), flag.ContinueOnError)
@@ -97,7 +103,7 @@ func main() {
 
 	if err := flags.Parse(args); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+		os.Exit(2)
 	}
 
 	if debug {
@@ -120,10 +126,13 @@ func main() {
 		log.G(ctx).Errorf("%s -- %s", flags.Args(), os.Args[1:])
 
 		fmt.Fprintln(os.Stderr, namespace+"/"+id+":", err)
-		os.Exit(2)
+		os.Exit(3)
 	}
 
 	switch action {
+	case "run":
+		errOut(run(ctx, stdin, stdout, stderr, append([]string{flags.Args()[1]}, flags.Args()[1:]...)))
+		return
 	case "delete":
 		resp, err := getDeleteResponse()
 		errOut(err)
@@ -197,6 +206,7 @@ func serve(ctx context.Context, ns, address, root string, publisher events.Publi
 		return fmt.Errorf("error ensuring shim socket parent dir exists")
 	}
 
+	unix.Unlink(p)
 	l, err := net.Listen("unix", p)
 	if err != nil {
 		return err
@@ -212,4 +222,53 @@ func serve(ctx context.Context, ns, address, root string, publisher events.Publi
 	<-ctx.Done()
 	svc.Close()
 	return ctx.Err()
+}
+
+func run(ctx context.Context, stdin, stdout, stderr string, args []string) error {
+	// NOTE: If I don't open theses with O_RDWR then I end up with a SIGPIPE
+	var stdinFd int
+	if stdin != "" {
+		fd, err := unix.Open(stdin, unix.O_RDWR, 0)
+		if err != nil {
+			return fmt.Errorf("error opening stdin fifo: %w", err)
+		}
+		stdinFd = fd
+	}
+
+	var stdoutFd int
+	if stdout != "" {
+		fd, err := unix.Open(stdout, unix.O_RDWR, 0)
+		if err != nil {
+			return fmt.Errorf("error opening stdout fifo: %w", err)
+		}
+		stdoutFd = fd
+	}
+
+	var stderrFd int
+	if stderr != "" {
+		fd, err := unix.Open(stderr, unix.O_RDWR, 0)
+		if err != nil {
+			return fmt.Errorf("error opening stderr fifo: %w", err)
+		}
+		stderrFd = fd
+	}
+
+	if stdinFd > 0 {
+		if err := unix.Dup2(stdinFd, 0); err != nil {
+			return fmt.Errorf("error setting stdin: %w", err)
+		}
+	}
+
+	if stdoutFd > 0 {
+		if err := unix.Dup2(stdoutFd, 1); err != nil {
+			return fmt.Errorf("error setting stdout: %w", err)
+		}
+	}
+	if stderrFd > 0 {
+		if err := unix.Dup2(stderrFd, 2); err != nil {
+			return fmt.Errorf("error setting stderr: %w", err)
+		}
+	}
+
+	return syscall.Exec(args[0], args[1:], os.Environ())
 }
