@@ -8,17 +8,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/cgroups"
+	cgroupsv2 "github.com/containerd/cgroups/v2"
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
+	"github.com/containerd/typeurl"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	dbus "github.com/godbus/dbus/v5"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 // We always use the same grouping so there is a single shim for all containers
@@ -28,16 +31,17 @@ var (
 	timeZero = time.UnixMicro(0)
 )
 
-func New(ctx context.Context, ns, root string) (*Service, error) {
+func New(ctx context.Context, ns, root string, publisher events.Publisher) (*Service, error) {
 	conn, err := systemd.NewSystemdConnectionContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Service{
-		conn: conn,
-		root: root,
-		ns:   ns,
+		conn:      conn,
+		root:      root,
+		ns:        ns,
+		publisher: publisher,
 		runc: &runc.Runc{
 			// Root:          filepath.Join(root, "runc"),
 			SystemdCgroup: true,
@@ -46,10 +50,13 @@ func New(ctx context.Context, ns, root string) (*Service, error) {
 }
 
 type Service struct {
-	conn *systemd.Conn
-	runc *runc.Runc
-	root string
-	ns   string
+	conn       *systemd.Conn
+	runc       *runc.Runc
+	root       string
+	ns         string
+	publisher  events.Publisher
+	events     chan interface{}
+	waitEvents chan struct{}
 }
 
 // Cleanup is a binary call that cleans up any resources used by the shim when the Service crashes
@@ -211,6 +218,13 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 	return &taskapi.StartResponse{Pid: p.Value.Value().(uint32)}, nil
 }
 
+func (s *Service) Close() {
+	s.conn.Unsubscribe()
+	s.conn.Close()
+	close(s.events)
+	<-s.waitEvents
+}
+
 // Delete a process or container
 func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *taskapi.DeleteResponse, retErr error) {
 	log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", s.ns))
@@ -306,7 +320,20 @@ func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (*ptypes.Emp
 
 // Pids returns all pids inside the container
 func (s *Service) Pids(ctx context.Context, r *taskapi.PidsRequest) (*taskapi.PidsResponse, error) {
-	return nil, errdefs.ErrNotImplemented
+	ls, err := s.runc.Ps(ctx, runcName(s.ns, r.ID))
+	if err != nil {
+		return nil, err
+	}
+
+	procs := make([]*task.ProcessInfo, 0, len(ls))
+
+	for _, p := range ls {
+		procs = append(procs, &task.ProcessInfo{Pid: uint32(p)})
+	}
+
+	return &taskapi.PidsResponse{
+		Processes: procs,
+	}, nil
 }
 
 // CloseIO of a process
@@ -321,85 +348,65 @@ func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskReque
 
 // Connect returns shim information of the underlying Service
 func (s *Service) Connect(ctx context.Context, r *taskapi.ConnectRequest) (*taskapi.ConnectResponse, error) {
-	return nil, errdefs.ErrNotImplemented
+	var st execState
+	if err := s.getState(ctx, unitName(s.ns, r.ID, "service"), &st); err != nil {
+		return nil, err
+	}
+	return &taskapi.ConnectResponse{TaskPid: st.Pid, ShimPid: uint32(os.Getpid())}, nil
 }
 
 // Shutdown is called after the underlying resources of the shim are cleaned up and the Service can be stopped
 func (s *Service) Shutdown(ctx context.Context, r *taskapi.ShutdownRequest) (*ptypes.Empty, error) {
+	// We ignore this call because we don't actually want containerd to shut us down since systemd manages our lifecycle.
 	return &ptypes.Empty{}, nil
 }
 
 // Stats returns container level system stats for a container and its processes
 func (s *Service) Stats(ctx context.Context, r *taskapi.StatsRequest) (*taskapi.StatsResponse, error) {
-	return nil, errdefs.ErrNotImplemented
+	// TODO: caching?
+
+	var st execState
+	if err := s.getState(ctx, unitName(s.ns, r.ID, "service"), &st); err != nil {
+		return nil, err
+	}
+
+	var stats interface{}
+	if cgroups.Mode() == cgroups.Unified {
+		g, err := cgroupsv2.PidGroupPath(int(st.Pid))
+		if err != nil {
+			return nil, err
+		}
+		cg, err := cgroupsv2.LoadManager("/sys/fs/cgroup", g)
+		if err != nil {
+			return nil, err
+		}
+		m, err := cg.Stat()
+		if err != nil {
+			return nil, err
+		}
+		stats = m
+	} else {
+		cg, err := cgroups.Load(cgroups.V1, cgroups.PidPath(int(st.Pid)))
+		if err != nil {
+			return nil, err
+		}
+		m, err := cg.Stat(cgroups.IgnoreNotExist)
+		if err != nil {
+			return nil, err
+		}
+		stats = m
+	}
+
+	data, err := typeurl.MarshalAny(stats)
+	if err != nil {
+		return nil, err
+	}
+	return &taskapi.StatsResponse{
+		Stats: data,
+	}, nil
 }
 
 // Update the live container
 func (s *Service) Update(ctx context.Context, r *taskapi.UpdateTaskRequest) (*ptypes.Empty, error) {
 	return nil, errdefs.ErrNotImplemented
-}
-
-// Wait for a process to exit
-func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *taskapi.WaitResponse, retErr error) {
-	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(logrus.Fields{
-		"id":        r.ID,
-		"ns":        s.ns,
-		"apiAction": "wait",
-	}))
-
-	log.G(ctx).Info("Start")
-	defer func() {
-		log.G(ctx).WithError(retErr).WithField("exitedAt", retResp.ExitedAt).Info("End")
-	}()
-
-	if err := s.conn.Subscribe(); err != nil {
-		return nil, err
-	}
-
-	name := unitName(s.ns, r.ID, "service")
-	unitCh, errCh := s.conn.SubscribeUnitsCustom(time.Second, 10, func(u1, u2 *systemd.UnitStatus) bool { return u1.ActiveState != u2.ActiveState }, func(id string) bool {
-		return id != name
-	})
-
-	var (
-		st execState
-	)
-
-	if err := s.getState(ctx, name, &st); err != nil {
-		log.G(ctx).WithError(err).Error("failed to get state")
-	}
-
-	if st.ExitedAt.After(timeZero) {
-		return &taskapi.WaitResponse{
-			ExitStatus: st.ExitCode,
-			ExitedAt:   st.ExitedAt,
-		}, nil
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case err := <-errCh:
-			return nil, err
-		case units := <-unitCh:
-			log.G(ctx).Debugf("Got %d state updates", len(units))
-			_, ok := units[name]
-			if !ok {
-				log.G(ctx).Debug("Our unit is not in the state changes")
-				continue
-			}
-
-			if err := s.getState(ctx, name, &st); err != nil {
-				log.G(ctx).WithError(err).Error("failed to get state")
-			}
-
-			if st.ExitedAt.After(timeZero) {
-				return &taskapi.WaitResponse{
-					ExitStatus: st.ExitCode,
-					ExitedAt:   st.ExitedAt,
-				}, nil
-			}
-		}
-	}
 }

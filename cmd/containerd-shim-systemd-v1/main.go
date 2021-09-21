@@ -17,6 +17,7 @@ import (
 
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/runtime/v2/shim"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/cpuguy83/systemdshim"
 	"github.com/gogo/protobuf/proto"
@@ -151,7 +152,10 @@ func main() {
 		errOut(err)
 		return
 	case "serve":
-		err := serve(ctx, namespace, socket, root, nil)
+		publisher, err := shim.NewPublisher(address)
+		errOut(err)
+
+		err = serve(ctx, namespace, socket, root, publisher)
 		errOut(err)
 		return
 	default:
@@ -168,7 +172,7 @@ func getDeleteResponse() ([]byte, error) {
 }
 
 func start(ctx context.Context, opts systemdshim.StartOpts) (string, error) {
-	shim, err := systemdshim.New(ctx, opts.Namespace, "")
+	shim, err := systemdshim.New(ctx, opts.Namespace, "", nil)
 	if err != nil {
 		return "", err
 	}
@@ -184,7 +188,7 @@ func serve(ctx context.Context, ns, address, root string, publisher events.Publi
 	// defer f.Close()
 	// logrus.SetOutput(f)
 
-	shm, err := systemdshim.New(ctx, ns, root)
+	shm, err := systemdshim.New(ctx, ns, root, publisher)
 	if err != nil {
 		return err
 	}
@@ -219,8 +223,11 @@ func serve(ctx context.Context, ns, address, root string, publisher events.Publi
 		cancel()
 	}()
 
+	go shm.Forward(ctx, publisher)
+
 	<-ctx.Done()
 	svc.Close()
+	shm.Close()
 	return ctx.Err()
 }
 
