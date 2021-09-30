@@ -10,6 +10,7 @@ import (
 
 	"github.com/containerd/cgroups"
 	cgroupsv2 "github.com/containerd/cgroups/v2"
+	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/events"
@@ -188,7 +189,23 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	if err != nil {
 		return nil, err
 	}
-	return &taskapi.CreateTaskResponse{Pid: p.Value.Value().(uint32)}, nil
+
+	pid := p.Value.Value().(uint32)
+
+	s.send(&eventsapi.TaskCreate{
+		ContainerID: r.ID,
+		Bundle:      r.Bundle,
+		Rootfs:      r.Rootfs,
+		IO: &eventsapi.TaskIO{
+			Stdin:    r.Stdin,
+			Stdout:   r.Stdout,
+			Stderr:   r.Stderr,
+			Terminal: r.Terminal,
+		},
+		Checkpoint: r.Checkpoint,
+		Pid:        pid,
+	})
+	return &taskapi.CreateTaskResponse{Pid: pid}, nil
 }
 
 // Start the primary user process inside the container
@@ -217,7 +234,12 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 		return nil, err
 	}
 
-	return &taskapi.StartResponse{Pid: p.Value.Value().(uint32)}, nil
+	pid := p.Value.Value().(uint32)
+	s.send(&eventsapi.TaskStart{
+		ContainerID: r.ID,
+		Pid:          pid,
+	})
+	return &taskapi.StartResponse{Pid: pid}, nil
 }
 
 func (s *Service) Close() {
