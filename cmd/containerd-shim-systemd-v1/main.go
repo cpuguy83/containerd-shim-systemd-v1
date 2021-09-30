@@ -135,7 +135,7 @@ func main() {
 		errOut(run(ctx, stdin, stdout, stderr, append([]string{flags.Args()[1]}, flags.Args()[1:]...)))
 		return
 	case "delete":
-		resp, err := getDeleteResponse()
+		resp, err := proto.Marshal(&taskapi.DeleteResponse{})
 		errOut(err)
 		os.Stdout.Write(resp)
 		return
@@ -161,14 +161,6 @@ func main() {
 	default:
 		errOut(fmt.Errorf("unknown action: %s", action))
 	}
-}
-
-func getDeleteResponse() ([]byte, error) {
-	var err error
-	deleteOnce.Do(func() {
-		deleteResp, err = proto.Marshal(&taskapi.DeleteResponse{})
-	})
-	return deleteResp, err
 }
 
 func start(ctx context.Context, opts systemdshim.StartOpts) (string, error) {
