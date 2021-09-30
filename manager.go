@@ -38,10 +38,12 @@ func New(ctx context.Context, ns, root string, publisher events.Publisher) (*Ser
 	}
 
 	return &Service{
-		conn:      conn,
-		root:      root,
-		ns:        ns,
-		publisher: publisher,
+		conn:       conn,
+		root:       root,
+		ns:         ns,
+		publisher:  publisher,
+		events:     make(chan interface{}, 128),
+		waitEvents: make(chan struct{}),
 		runc: &runc.Runc{
 			// Root:          filepath.Join(root, "runc"),
 			SystemdCgroup: true,
