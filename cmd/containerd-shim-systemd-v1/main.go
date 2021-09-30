@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall"
 
 	"github.com/containerd/containerd/events"
@@ -23,11 +22,6 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
-)
-
-var (
-	deleteResp []byte
-	deleteOnce sync.Once
 )
 
 func newCtx() (context.Context, context.CancelFunc) {
