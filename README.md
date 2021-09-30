@@ -27,7 +27,7 @@ $ go build ./cmd/contianerd-shim-systemd-v1
 Put the built binary into $PATH (as seen by the containerd daemon).
 
 ```shell
-# ctr run -t --rm --runtime==io.containerd.systemd.v1 docker.io/busybox:latest test sh
+# ctr run --rm --runtime=io.containerd.systemd.v1 docker.io/busybox:latest test top
 ```
 
 You should be able to do things like
