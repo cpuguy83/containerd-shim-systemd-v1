@@ -13,6 +13,9 @@ import (
 
 func (s *Service) Forward(ctx context.Context, publisher events.Publisher) {
 	ns, _ := namespaces.Namespace(ctx)
+	if ns == "" {
+		ns = s.ns
+	}
 	ctx = namespaces.WithNamespace(context.Background(), ns)
 	for e := range s.events {
 		err := publisher.Publish(ctx, GetTopic(e), e)
