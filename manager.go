@@ -328,12 +328,19 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 
 // Pause the container
 func (s *Service) Pause(ctx context.Context, r *taskapi.PauseRequest) (*ptypes.Empty, error) {
-	return nil, errdefs.ErrNotImplemented
+	err := s.runc.Pause(ctx, runcName(s.ns, r.ID))
+	if err != nil {
+		return nil, err
+	}
+	return &ptypes.Empty{}, nil
 }
 
 // Resume the container
 func (s *Service) Resume(ctx context.Context, r *taskapi.ResumeRequest) (*ptypes.Empty, error) {
-	return nil, errdefs.ErrNotImplemented
+	if err := s.runc.Resume(ctx, runcName(s.ns, r.ID)); err != nil {
+		return nil, err
+	}
+	return &ptypes.Empty{}, nil
 }
 
 // Kill a process
