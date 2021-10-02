@@ -20,7 +20,9 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 
 	log.G(ctx).Info("Start")
 	defer func() {
-		log.G(ctx).WithError(retErr).WithField("exitedAt", retResp.ExitedAt).Info("End")
+		if retResp != nil {
+			log.G(ctx).WithError(retErr).WithField("exitedAt", retResp.ExitedAt).Info("End")
+		}
 	}()
 
 	if err := s.conn.Subscribe(); err != nil {
