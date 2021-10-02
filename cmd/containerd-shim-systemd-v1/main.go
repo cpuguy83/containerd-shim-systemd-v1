@@ -146,7 +146,7 @@ func main() {
 		errOut(err)
 		return
 	case "serve":
-		publisher, err := shim.NewPublisher(address)
+		publisher, err := shim.NewPublisher(os.Getenv("TTRPC_ADDRESS"))
 		errOut(err)
 
 		err = serve(ctx, namespace, socket, root, publisher)

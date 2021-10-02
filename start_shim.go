@@ -71,6 +71,7 @@ func (s *Service) StartShim(ctx context.Context, opts StartOpts) (_ string, retE
 	properties := []dbus.Property{
 		dbus.PropType("notify"),
 		dbus.PropExecStart(cmd, false),
+		{Name: "Environment", Value: godbus.MakeVariant([]string{"TTRPC_ADDRESS=" + opts.TTRPCAddress})},
 	}
 	unit := "containerd-systemd-shim-" + base + ".service"
 
