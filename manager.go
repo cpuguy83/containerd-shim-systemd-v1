@@ -2,14 +2,18 @@ package systemdshim
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/containerd/cgroups"
 	cgroupsv2 "github.com/containerd/cgroups/v2"
+	"github.com/containerd/console"
 	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
@@ -20,9 +24,11 @@ import (
 	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
+	"github.com/cpuguy83/pipes"
 	dbus "github.com/godbus/dbus/v5"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
 )
 
 // We always use the same grouping so there is a single shim for all containers
@@ -60,6 +66,16 @@ type Service struct {
 	publisher  events.Publisher
 	events     chan interface{}
 	waitEvents chan struct{}
+
+	mu       sync.Mutex
+	consoles map[string]*cio
+}
+
+type cio struct {
+	m      console.Console
+	f      io.Closer
+	stdin  io.ReadCloser
+	stdout io.WriteCloser
 }
 
 // Cleanup is a binary call that cleans up any resources used by the shim when the Service crashes
@@ -100,7 +116,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	pidFile := filepath.Join(s.root, r.ID, "pid")
 
-	execStart := []string{runcPath, "create", "--bundle=" + r.Bundle, "--pid-file", pidFile, runcName(s.ns, r.ID)}
+	execStart := []string{runcPath, "create", "--bundle=" + r.Bundle, "--pid-file", pidFile}
 
 	if len(r.Rootfs) > 0 {
 		var mounts []mount.Mount
@@ -126,38 +142,103 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		}()
 	}
 
-	// TODO: TTY
-
-	// TODO: I'd like to use either the "StandardInput/Output/Error" properties here, however systemd is rejecting them.
-	//   Assuming this is because they are not supported for transient units (though code and docs seems to indicate otherwise)
-
-	var envs []string
-	if r.Stdin != "" {
-		envs = append(envs, "STDIN_PATH="+r.Stdin)
-	}
-	if r.Stdout != "" {
-		envs = append(envs, "STDOUT_PATH="+r.Stdout)
-	}
-	if r.Stderr != "" {
-		envs = append(envs, "STDERR_PATH="+r.Stdout)
-	}
-
-	if len(envs) > 0 {
-		// Hack to inject inject fifo's as stdio for tthe container process
-		exe, err := os.Executable()
-		if err != nil {
-			return nil, err
-		}
-		execStart = append([]string{exe, "run"}, execStart...)
-	}
-
 	properties := []systemd.Property{
-		systemd.PropExecStart(execStart, false),
 		systemd.PropType("forking"),
 		{Name: "PIDFile", Value: dbus.MakeVariant(pidFile)},
 	}
-	if len(envs) > 0 {
-		properties = append(properties, systemd.Property{Name: "Environment", Value: dbus.MakeVariant(envs)})
+
+	if r.Stdin != "" {
+		properties = append(properties, systemd.Property{Name: "StandardInputFile", Value: dbus.MakeVariant(r.Stdin)})
+	}
+	if r.Stdout != "" {
+		properties = append(properties, systemd.Property{Name: "StandardOutputFile", Value: dbus.MakeVariant(r.Stdout)})
+	}
+	if r.Stderr != "" {
+		properties = append(properties, systemd.Property{Name: "StandardErrorFile", Value: dbus.MakeVariant(r.Stderr)})
+	}
+	if r.Terminal {
+		socket, err := runc.NewTempConsoleSocket()
+		if err != nil {
+			return nil, fmt.Errorf("error creating console socket: %w", err)
+		}
+		var (
+			stdin  io.ReadCloser
+			stdout io.WriteCloser
+		)
+		if r.Stdin != "" {
+			r, _, err := pipes.OpenFifo(r.Stdin, os.O_RDWR, 0)
+			if err != nil {
+				socket.Close()
+				return nil, fmt.Errorf("error opening stdin pipe: %w", err)
+			}
+			stdin = r
+		}
+		if r.Stdout != "" {
+			_, w, err := pipes.OpenFifo(r.Stdout, os.O_RDWR, 0)
+			if err != nil {
+				socket.Close()
+				return nil, fmt.Errorf("error opening stdout pipe: %w", err)
+			}
+			stdout = w
+		}
+		s.mu.Lock()
+		if s.consoles == nil {
+			s.consoles = make(map[string]*cio)
+		}
+		c := &cio{stdin: stdin, stdout: stdout}
+		s.consoles[r.ID] = c
+		s.mu.Unlock()
+		go func(console *runc.Socket, stdin io.ReadCloser, stdout io.WriteCloser) {
+			defer func() {
+				stdin.Close()
+				stdout.Close()
+				s.Close()
+			}()
+
+			m, err := socket.ReceiveMaster()
+			if err != nil {
+				log.G(ctx).WithError(err).Error("Error setting up console master")
+				return
+			}
+
+			s.mu.Lock()
+			c.m = m
+			s.mu.Unlock()
+			defer m.Close()
+
+			var f io.ReadWriteCloser = m
+
+			nfd, err := unix.Dup(int(m.Fd()))
+			if err != nil {
+				log.G(ctx).WithError(err).Error("Error duping console master")
+			} else {
+				f = os.NewFile(uintptr(nfd), r.ID+"_console")
+				s.mu.Lock()
+				c.f = f
+				s.mu.Unlock()
+			}
+
+			defer f.Close()
+
+			var wg sync.WaitGroup
+			if stdin != nil {
+				wg.Add(1)
+				go func() {
+					io.Copy(f, stdin)
+					wg.Done()
+				}()
+			}
+			if stdout != nil {
+				wg.Add(1)
+				go func() {
+					io.Copy(stdout, f)
+					wg.Done()
+				}()
+			}
+
+			wg.Wait()
+		}(socket, stdin, stdout)
+		execStart = append(execStart, "--console-socket", socket.Path())
 	}
 
 	defer func() {
@@ -166,6 +247,8 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			s.conn.ResetFailedUnitContext(ctx, name)
 		}
 	}()
+
+	properties = append(properties, systemd.PropExecStart(append(execStart, runcName(s.ns, r.ID)), false))
 
 	_, err = s.conn.StartTransientUnitContext(ctx, name, "replace", properties, ch)
 	if err != nil {
@@ -237,7 +320,7 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 	pid := p.Value.Value().(uint32)
 	s.send(&eventsapi.TaskStart{
 		ContainerID: r.ID,
-		Pid:          pid,
+		Pid:         pid,
 	})
 	return &taskapi.StartResponse{Pid: pid}, nil
 }
@@ -287,7 +370,22 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (*pty
 
 // ResizePty of a process
 func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (*ptypes.Empty, error) {
-	return nil, errdefs.ErrNotImplemented
+	s.mu.Lock()
+	c, ok := s.consoles[r.ID]
+	if !ok {
+		s.mu.Unlock()
+		return nil, errdefs.ErrNotFound
+	}
+	if c.m == nil {
+		return &ptypes.Empty{}, nil
+	}
+	s.mu.Unlock()
+
+	if err := c.m.Resize(console.WinSize{Width: uint16(r.Width), Height: uint16(r.Height)}); err != nil {
+		return nil, err
+	}
+
+	return &ptypes.Empty{}, nil
 }
 
 // State returns runtime state of a process
@@ -368,7 +466,32 @@ func (s *Service) Pids(ctx context.Context, r *taskapi.PidsRequest) (*taskapi.Pi
 }
 
 // CloseIO of a process
-func (s *Service) CloseIO(ctx context.Context, r *taskapi.CloseIORequest) (*ptypes.Empty, error) {
+func (s *Service) CloseIO(ctx context.Context, r *taskapi.CloseIORequest) (_ *ptypes.Empty, retErr error) {
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID))
+	log.G(ctx).Info("CloseIO start")
+	defer func() {
+		log.G(ctx).WithError(retErr).Info("CloseIO end")
+	}()
+
+	s.mu.Lock()
+	c, ok := s.consoles[r.ID]
+	if !ok {
+		s.mu.Unlock()
+		return nil, errdefs.ErrNotFound
+	}
+	delete(s.consoles, r.ID)
+	s.mu.Unlock()
+
+	if r.Stdin {
+		c.stdin.Close()
+	}
+	c.stdout.Close()
+	if c.m != nil {
+		c.m.Close()
+	}
+	if c.f != nil {
+		c.f.Close()
+	}
 	return &ptypes.Empty{}, nil
 }
 
