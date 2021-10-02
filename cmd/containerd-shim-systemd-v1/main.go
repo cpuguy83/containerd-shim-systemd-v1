@@ -71,6 +71,7 @@ func main() {
 		id         string
 		publishBin string
 		root       string
+		bundle     string
 
 		stdin  = os.Getenv("STDIN_PATH")
 		stdout = os.Getenv("STDOUT_PATH")
@@ -90,6 +91,7 @@ func main() {
 	// Not used, but containerd sets it so we need to have it.
 	flags.StringVar(&publishBin, "publish-binary", "", "containerd binary with publish subcommand")
 	flags.StringVar(&id, "id", "", "id of the task")
+	flags.StringVar(&bundle, "bundle", "", "path to the bundle directory")
 
 	var args []string
 	if len(os.Args) > 1 {
