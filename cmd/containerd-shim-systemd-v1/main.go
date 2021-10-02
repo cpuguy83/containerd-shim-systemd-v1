@@ -110,6 +110,11 @@ func main() {
 	action := flags.Arg(0)
 
 	ctx, cancel := newCtx()
+	if namespace == "" {
+		namespace = "default"
+	}
+	ctx = namespaces.WithNamespace(ctx, namespace)
+
 	defer cancel()
 	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(logrus.Fields{
 		"action": action,
