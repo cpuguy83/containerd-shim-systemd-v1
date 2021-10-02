@@ -136,6 +136,19 @@ func main() {
 		errOut(run(ctx, stdin, stdout, stderr, append([]string{flags.Args()[1]}, flags.Args()[1:]...)))
 		return
 	case "delete":
+		if bundle != "" {
+			defer func() {
+				mount.UnmountAll(filepath.Join(bundle, "rootfs"), unix.MNT_DETACH)
+				os.RemoveAll(bundle)
+			}()
+			svc, err := systemdshim.New(ctx, namespace, root, nil)
+			if err == nil {
+				svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
+			} else {
+				(&runc.Runc{}).Delete(ctx, id, &runc.DeleteOpts{Force: true})
+				svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
+			}
+		}
 		resp, err := proto.Marshal(&taskapi.DeleteResponse{})
 		errOut(err)
 		os.Stdout.Write(resp)
