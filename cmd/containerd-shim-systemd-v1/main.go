@@ -16,8 +16,11 @@ import (
 
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/runtime/v2/shim"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
+	"github.com/containerd/go-runc"
 	"github.com/cpuguy83/systemdshim"
 	"github.com/gogo/protobuf/proto"
 	"github.com/sirupsen/logrus"

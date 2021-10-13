@@ -12,6 +12,7 @@ import (
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/runtime/v2/shim"
 	"github.com/coreos/go-systemd/v22/dbus"
+	godbus "github.com/godbus/dbus/v5"
 	"github.com/pkg/errors"
 )
 
