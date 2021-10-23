@@ -1,4 +1,4 @@
-module github.com/cpuguy83/systemdshim
+module github.com/cpuguy83/containerd-shim-systemd-v1
 
 go 1.17
 

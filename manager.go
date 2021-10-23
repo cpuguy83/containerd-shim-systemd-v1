@@ -1,4 +1,4 @@
-package systemdshim
+package main
 
 import (
 	"context"
@@ -20,6 +20,7 @@ import (
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/namespaces"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
@@ -38,23 +39,33 @@ var (
 	timeZero = time.UnixMicro(0)
 )
 
-func New(ctx context.Context, ns, root string, publisher events.Publisher) (*Service, error) {
+func New(ctx context.Context, root string, publisher events.Publisher) (*Service, error) {
 	conn, err := systemd.NewSystemdConnectionContext(ctx)
 	if err != nil {
+		return nil, err
+	}
+
+	runcPath, err := exec.LookPath("runc")
+	if err != nil {
+		return nil, fmt.Errorf("error looking up runc path: %w", err)
+	}
+
+	runcRoot := filepath.Join(root, "runc")
+	if err := os.MkdirAll(runcRoot, 0710); err != nil {
 		return nil, err
 	}
 
 	return &Service{
 		conn:       conn,
 		root:       root,
-		ns:         ns,
 		publisher:  publisher,
-		events:     make(chan interface{}, 128),
+		events:     make(chan eventEnvelope, 128),
 		waitEvents: make(chan struct{}),
 		runc: &runc.Runc{
-			// Root:          filepath.Join(root, "runc"),
+			Command:       runcPath,
 			SystemdCgroup: true,
 			PdeathSignal:  syscall.SIGKILL,
+			Root:          runcRoot,
 		}}, nil
 }
 
@@ -62,9 +73,8 @@ type Service struct {
 	conn       *systemd.Conn
 	runc       *runc.Runc
 	root       string
-	ns         string
 	publisher  events.Publisher
-	events     chan interface{}
+	events     chan eventEnvelope
 	waitEvents chan struct{}
 
 	mu       sync.Mutex
@@ -96,27 +106,28 @@ func runcName(ns, id string) string {
 
 // Create a new container
 func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *taskapi.CreateTaskResponse, retErr error) {
-	name := unitName(s.ns, r.ID, "service")
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", s.ns).WithField("unitName", name))
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+
+	name := unitName(ns, r.ID, "service")
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns).WithField("unitName", name))
 
 	log.G(ctx).Info("systemd.Create started")
 	defer func() {
 		log.G(ctx).WithError(retErr).Info("systemd.Create end")
 	}()
+
 	ch := make(chan string, 1)
 	runcPath, err := exec.LookPath("runc")
 	if err != nil {
 		return nil, err
 	}
 
-	// See https://github.com/opencontainers/runc/issues/3202
-	if err := os.MkdirAll("/run/runc", 0700); err != nil {
-		return nil, err
-	}
+	pidFile := filepath.Join(r.Bundle, "pid")
 
-	pidFile := filepath.Join(s.root, r.ID, "pid")
-
-	execStart := []string{runcPath, "create", "--bundle=" + r.Bundle, "--pid-file", pidFile}
+	execStart := []string{runcPath, "--root", s.runc.Root, "create", "--bundle=" + r.Bundle, "--pid-file", pidFile}
 
 	if len(r.Rootfs) > 0 {
 		var mounts []mount.Mount
@@ -186,7 +197,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			s.consoles = make(map[string]*cio)
 		}
 		c := &cio{stdin: stdin, stdout: stdout}
-		s.consoles[r.ID] = c
+		s.consoles[runcName(ns, r.ID)] = c
 		s.mu.Unlock()
 		go func(console *runc.Socket, stdin io.ReadCloser, stdout io.WriteCloser) {
 			defer func() {
@@ -243,12 +254,12 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	defer func() {
 		if retErr != nil {
-			s.runc.Delete(ctx, runcName(s.ns, r.ID), &runc.DeleteOpts{Force: true})
+			s.runc.Delete(ctx, runcName(ns, r.ID), &runc.DeleteOpts{Force: true})
 			s.conn.ResetFailedUnitContext(ctx, name)
 		}
 	}()
 
-	properties = append(properties, systemd.PropExecStart(append(execStart, runcName(s.ns, r.ID)), false))
+	properties = append(properties, systemd.PropExecStart(append(execStart, runcName(ns, r.ID)), false))
 
 	_, err = s.conn.StartTransientUnitContext(ctx, name, "replace", properties, ch)
 	if err != nil {
@@ -275,7 +286,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	pid := p.Value.Value().(uint32)
 
-	s.send(&eventsapi.TaskCreate{
+	s.send(ns, &eventsapi.TaskCreate{
 		ContainerID: r.ID,
 		Bundle:      r.Bundle,
 		Rootfs:      r.Rootfs,
@@ -299,16 +310,21 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 		}
 	}()
 
-	name := unitName(s.ns, r.ID, "service")
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
 
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", s.ns).WithField("unitName", name))
+	name := unitName(ns, r.ID, "service")
+
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns).WithField("unitName", name))
 
 	log.G(ctx).Info("systemd.Start")
 	defer func() {
 		log.G(ctx).WithError(retErr).Info("systemd.Start end")
 	}()
 
-	if err := s.runc.Start(ctx, runcName(s.ns, r.ID)); err != nil {
+	if err := s.runc.Start(ctx, runcName(ns, r.ID)); err != nil {
 		return nil, err
 	}
 
@@ -318,7 +334,7 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 	}
 
 	pid := p.Value.Value().(uint32)
-	s.send(&eventsapi.TaskStart{
+	s.send(ns, &eventsapi.TaskStart{
 		ContainerID: r.ID,
 		Pid:         pid,
 	})
@@ -334,10 +350,15 @@ func (s *Service) Close() {
 
 // Delete a process or container
 func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *taskapi.DeleteResponse, retErr error) {
-	log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", s.ns))
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+
+	log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns))
 
 	log.G(ctx).Info("systemd.Delete begin")
-	name := unitName(s.ns, r.ID, "service")
+	name := unitName(ns, r.ID, "service")
 	defer func() {
 		log.G(ctx).WithError(retErr).Info("systemd.Delete end")
 	}()
@@ -345,7 +366,7 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 	defer func() {
 		mount.UnmountAll(filepath.Join(s.root, r.ID, "rootfs"), 0)
 	}()
-	if err := s.runc.Delete(ctx, runcName(s.ns, r.ID), &runc.DeleteOpts{Force: true}); err != nil {
+	if err := s.runc.Delete(ctx, runcName(ns, r.ID), &runc.DeleteOpts{Force: true}); err != nil {
 		return nil, err
 	}
 
@@ -370,8 +391,12 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (*pty
 
 // ResizePty of a process
 func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (*ptypes.Empty, error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
-	c, ok := s.consoles[r.ID]
+	c, ok := s.consoles[runcName(ns, r.ID)]
 	if !ok {
 		s.mu.Unlock()
 		return nil, errdefs.ErrNotFound
@@ -390,12 +415,17 @@ func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (*
 
 // State returns runtime state of a process
 func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskapi.StateResponse, retErr error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+
 	log.G(ctx).Info("systemd.State")
 	defer func() {
 		log.G(ctx).WithError(retErr).Info("systemd.State end")
 	}()
 
-	st, err := s.runc.State(ctx, runcName(s.ns, r.ID))
+	st, err := s.runc.State(ctx, runcName(ns, r.ID))
 	if err != nil {
 		return nil, err
 	}
@@ -412,7 +442,7 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 
 	if status == task.StatusStopped {
 		var sdSt execState
-		if err := s.getState(ctx, unitName(s.ns, r.ID, "service"), &sdSt); err != nil {
+		if err := s.getState(ctx, unitName(ns, r.ID, "service"), &sdSt); err != nil {
 			return nil, err
 		}
 
@@ -426,7 +456,11 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 
 // Pause the container
 func (s *Service) Pause(ctx context.Context, r *taskapi.PauseRequest) (*ptypes.Empty, error) {
-	err := s.runc.Pause(ctx, runcName(s.ns, r.ID))
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	err = s.runc.Pause(ctx, runcName(ns, r.ID))
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +469,11 @@ func (s *Service) Pause(ctx context.Context, r *taskapi.PauseRequest) (*ptypes.E
 
 // Resume the container
 func (s *Service) Resume(ctx context.Context, r *taskapi.ResumeRequest) (*ptypes.Empty, error) {
-	if err := s.runc.Resume(ctx, runcName(s.ns, r.ID)); err != nil {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	if err := s.runc.Resume(ctx, runcName(ns, r.ID)); err != nil {
 		return nil, err
 	}
 	return &ptypes.Empty{}, nil
@@ -443,13 +481,21 @@ func (s *Service) Resume(ctx context.Context, r *taskapi.ResumeRequest) (*ptypes
 
 // Kill a process
 func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (*ptypes.Empty, error) {
-	s.conn.KillUnitContext(ctx, unitName(s.ns, r.ID, ""), int32(r.Signal))
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	s.conn.KillUnitContext(ctx, unitName(ns, r.ID, ""), int32(r.Signal))
 	return &ptypes.Empty{}, nil
 }
 
 // Pids returns all pids inside the container
 func (s *Service) Pids(ctx context.Context, r *taskapi.PidsRequest) (*taskapi.PidsResponse, error) {
-	ls, err := s.runc.Ps(ctx, runcName(s.ns, r.ID))
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	ls, err := s.runc.Ps(ctx, runcName(ns, r.ID))
 	if err != nil {
 		return nil, err
 	}
@@ -473,13 +519,18 @@ func (s *Service) CloseIO(ctx context.Context, r *taskapi.CloseIORequest) (_ *pt
 		log.G(ctx).WithError(retErr).Info("CloseIO end")
 	}()
 
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
-	c, ok := s.consoles[r.ID]
+	c, ok := s.consoles[runcName(ns, r.ID)]
 	if !ok {
 		s.mu.Unlock()
 		return nil, errdefs.ErrNotFound
 	}
-	delete(s.consoles, r.ID)
+	delete(s.consoles, runcName(ns, r.ID))
 	s.mu.Unlock()
 
 	if r.Stdin {
@@ -502,8 +553,12 @@ func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskReque
 
 // Connect returns shim information of the underlying Service
 func (s *Service) Connect(ctx context.Context, r *taskapi.ConnectRequest) (*taskapi.ConnectResponse, error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
 	var st execState
-	if err := s.getState(ctx, unitName(s.ns, r.ID, "service"), &st); err != nil {
+	if err := s.getState(ctx, unitName(ns, r.ID, "service"), &st); err != nil {
 		return nil, err
 	}
 	return &taskapi.ConnectResponse{TaskPid: st.Pid, ShimPid: uint32(os.Getpid())}, nil
@@ -519,8 +574,13 @@ func (s *Service) Shutdown(ctx context.Context, r *taskapi.ShutdownRequest) (*pt
 func (s *Service) Stats(ctx context.Context, r *taskapi.StatsRequest) (*taskapi.StatsResponse, error) {
 	// TODO: caching?
 
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+
 	var st execState
-	if err := s.getState(ctx, unitName(s.ns, r.ID, "service"), &st); err != nil {
+	if err := s.getState(ctx, unitName(ns, r.ID, "service"), &st); err != nil {
 		return nil, err
 	}
 

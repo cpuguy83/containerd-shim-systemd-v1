@@ -1,10 +1,12 @@
-package systemdshim
+package main
 
 import (
 	"context"
 	"time"
 
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/namespaces"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/sirupsen/logrus"
@@ -12,9 +14,13 @@ import (
 
 // Wait for a process to exit
 func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *taskapi.WaitResponse, retErr error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
 	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(logrus.Fields{
 		"id":        r.ID,
-		"ns":        s.ns,
+		"ns":        ns,
 		"apiAction": "wait",
 	}))
 
@@ -29,7 +35,7 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 		return nil, err
 	}
 
-	name := unitName(s.ns, r.ID, "service")
+	name := unitName(ns, r.ID, "service")
 	unitCh, errCh := s.conn.SubscribeUnitsCustom(time.Second, 10, func(u1, u2 *systemd.UnitStatus) bool { return u1.ActiveState != u2.ActiveState }, func(id string) bool {
 		return id != name
 	})

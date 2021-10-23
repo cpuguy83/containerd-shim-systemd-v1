@@ -5,13 +5,17 @@ This project aims to provide a containerd shim implementation which uses systemd
 Advantages over the standard runc (io.containerd.runc.v2) shim:
 
 1. Containers can be seen and managed using systemctl just like any other system service
-2. There is a single shim per containerd namespace instead of per container (or pod), so essentially O(1) runtime overhead instead of O(n).
+2. There is a single shim per node instead of per container (or pod), so O(1) runtime overhead instead of O(n).
 3. Shutting down or restarting the node will correctly shutdown containers because containers are run as systemd units.
-4. Possible to send all stdout/stderr messages to journald instead of managing pipes.
-5. Shim can be restarted for whatever reason w/o disrupting containers.
+4. Possible to send all stdout/stderr messages to journald instead of managing pipes (TODO).
+5. Shim can be restarted for whatever reason w/o disrupting containers (TODO).
 
-Ideally I'd like to make this 1 shim per node, but currently it must be 1 per namespace due to some API issues.
-In any case, 1 per namespace is *almost* one per node since in most cases you'll only ever use 1 containerd namespace anyway.
+Because of a bug in containerd 1.5, this currently only works starting from
+containerd 1.6.0-beta.1, alternatively you can apply this commit:
+https://github.com/containerd/containerd/commit/130a9c7ddbdd33a95a4b531ff25506d2d1651b20
+There is a possibility this patch could be backported to containerd 1.5, however
+I'd say it is slim since it only helps projects like this one, not current
+production workloads.
 
 This is alpha quality software and does not yet fully implement the containerd shim API.
 Do not use this in production environments.
@@ -19,7 +23,13 @@ Do not use this in production environments.
 #### Build:
 
 ```shell
-$ go build ./cmd/contianerd-shim-systemd-v1
+make build
+```
+
+#### Install:
+```shell
+sudo make install # installs binary
+$(which containerd-shim-systemd-v1) install # installs/starts systemd units
 ```
 
 #### Usage:

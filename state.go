@@ -1,4 +1,4 @@
-package systemdshim
+package main
 
 import (
 	"context"

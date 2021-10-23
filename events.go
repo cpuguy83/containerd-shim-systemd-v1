@@ -1,4 +1,4 @@
-package systemdshim
+package main
 
 import (
 	"context"
@@ -12,13 +12,9 @@ import (
 )
 
 func (s *Service) Forward(ctx context.Context, publisher events.Publisher) {
-	ns, _ := namespaces.Namespace(ctx)
-	if ns == "" {
-		ns = s.ns
-	}
-	ctx = namespaces.WithNamespace(context.Background(), ns)
 	for e := range s.events {
-		err := publisher.Publish(ctx, GetTopic(e), e)
+		ctx := namespaces.WithNamespace(ctx, e.ns)
+		err := publisher.Publish(ctx, GetTopic(e.e), e.e)
 		if err != nil {
 			logrus.WithError(err).Error("post event")
 		}
@@ -29,8 +25,13 @@ func (s *Service) Forward(ctx context.Context, publisher events.Publisher) {
 	close(s.waitEvents)
 }
 
-func (s *Service) send(e interface{}) {
-	s.events <- e
+type eventEnvelope struct {
+	ns string
+	e  interface{}
+}
+
+func (s *Service) send(ns string, e interface{}) {
+	s.events <- eventEnvelope{ns, e}
 }
 
 // GetTopic converts an event from an interface type to the specific
