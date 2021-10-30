@@ -7,7 +7,7 @@ Advantages over the standard runc (io.containerd.runc.v2) shim:
 1. Containers can be seen and managed using systemctl just like any other system service
 2. There is a single shim per node instead of per container (or pod), so O(1) runtime overhead instead of O(n).
 3. Shutting down or restarting the node will correctly shutdown containers because containers are run as systemd units.
-4. Possible to send all stdout/stderr messages to journald instead of managing pipes (TODO).
+4. Possible to send all stdout/stderr messages to journald instead of managing pipes.
 5. Shim can be restarted for whatever reason w/o disrupting containers (TODO).
 
 Because of a bug in containerd 1.5, this currently only works starting from
@@ -19,6 +19,10 @@ production workloads.
 
 This is alpha quality software and does not yet fully implement the containerd shim API.
 Do not use this in production environments.
+
+Regarding point "2" above, for containers which require a TTY we actually spin up a
+helper process to copy from the pty to the stdio pipes. This helper is (mostly)
+written in C and has minimal overhead.
 
 #### Build:
 
