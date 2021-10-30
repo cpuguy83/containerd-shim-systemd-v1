@@ -1,0 +1,13 @@
+version = "unstable"
+
+generator = "gofast"
+
+[includes]
+  # Paths that should be treated as include roots in relation to the vendor
+  # directory. These will be calculated with the vendor directory nearest the
+  # target package.
+  packages = ["github.com/gogo/protobuf"]
+
+[[descriptors]]
+prefix = "github.com/cpuguy83/containerd-shim-systemd-v1/options"
+target = "options/next.pb.txt"

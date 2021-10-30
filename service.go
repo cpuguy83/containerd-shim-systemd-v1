@@ -6,12 +6,14 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/containerd/containerd/log"
 	shimapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/ttrpc"
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/coreos/go-systemd/v22/dbus"
+	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 )
 
 const (
@@ -47,14 +49,14 @@ func (s *service) Close() error {
 	return s.srv.Close()
 }
 
-func serviceUnit(exe string, root, addr, ttrpcAddr string, debug bool) string {
+func serviceUnit(exe string, root, addr, ttrpcAddr string, debug bool, logMode options.LogMode) string {
 	return `
 [Unit]
 Description=containerd shim service that uses systemd to manage containers
 
 [Service]
 Type=notify
-ExecStart=` + exe + ` serve --address=` + addr + ` --ttrpc-address=` + ttrpcAddr + ` --debug=` + strconv.FormatBool(debug) + ` --root=` + root + `
+ExecStart=` + exe + ` --address=` + addr + ` serve` + ` --ttrpc-address=` + ttrpcAddr + ` --debug=` + strconv.FormatBool(debug) + ` --root=` + root + ` --log-mode=` + strings.ToLower(logMode.String()) + `
 `
 }
 
@@ -74,7 +76,7 @@ PassSecurity=yes
 `
 }
 
-func install(ctx context.Context, root, addr, ttrpcAddr, socket string, debug bool) error {
+func install(ctx context.Context, root, addr, ttrpcAddr, socket string, debug bool, logMode options.LogMode) error {
 	conn, err := dbus.NewSystemdConnectionContext(ctx)
 	if err != nil {
 		return err
@@ -86,7 +88,7 @@ func install(ctx context.Context, root, addr, ttrpcAddr, socket string, debug bo
 		return err
 	}
 
-	err = os.WriteFile("/etc/systemd/system/"+serviceName+".service", []byte(serviceUnit(exe, root, addr, ttrpcAddr, debug)), 0644)
+	err = os.WriteFile("/etc/systemd/system/"+serviceName+".service", []byte(serviceUnit(exe, root, addr, ttrpcAddr, debug, logMode)), 0644)
 	if err != nil {
 		return err
 	}

@@ -1,5 +1,14 @@
 package main
 
+/*
+#cgo CFLAGS: -Wall
+extern void handle_pty();
+void __attribute__((constructor)) init(void) {
+	handle_pty();
+}
+*/
+import "C"
+
 import (
 	"context"
 	"flag"
@@ -11,10 +20,11 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"syscall"
 
 	"github.com/containerd/containerd/defaults"
-	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
@@ -22,6 +32,7 @@ import (
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
 	"github.com/coreos/go-systemd/v22/activation"
+	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	"github.com/gogo/protobuf/proto"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -65,7 +76,19 @@ func newCtx() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
+var (
+	defaultLogMode = strings.ToLower(options.LogMode_name[int32(options.LogMode_STDIO)])
+)
+
 func main() {
+	if os.Getenv(ttyHandshakeEnv) == "1" {
+		if err := ttyHandshake(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	var (
 		debug      bool
 		socket     = defaultAddress
@@ -76,37 +99,113 @@ func main() {
 		root       string
 		bundle     string
 		ttrpcAddr  = defaults.DefaultAddress + ".ttrpc"
+		logMode    = defaultLogMode
 	)
 
-	flags := flag.NewFlagSet(filepath.Base(os.Args[0]), flag.ContinueOnError)
+	rootFlags := flag.NewFlagSet(filepath.Base(os.Args[0]), flag.ContinueOnError)
 
+	rootFlags.StringVar(&address, "address", address, "grpc address back to containerd")
+
+	// Not used, but containerd sets it so we need to have it.
+	rootFlags.StringVar(&publishBin, "publish-binary", "", "containerd binary with publish subcommand")
+	rootFlags.StringVar(&id, "id", "", "id of the task")
+	rootFlags.StringVar(&bundle, "bundle", "", "path to the bundle directory")
+	rootFlags.StringVar(&namespace, "namespace", "", "namespace of container")
+
+	if err := rootFlags.Parse(os.Args[1:]); err != nil {
+		fmt.Println(os.Args)
+		rootFlags.Usage()
+		os.Exit(1)
+	}
+
+	if rootFlags.NArg() == 0 {
+		fmt.Println(os.Args)
+		rootFlags.Usage()
+		os.Exit(1)
+	}
+
+	commands := map[string]func(context.Context) error{
+		"install": func(ctx context.Context) error {
+			return install(ctx, root, address, ttrpcAddr, socket, debug, options.LogMode(options.LogMode_value[strings.ToUpper(logMode)]))
+		},
+		"uninstall": uninstall,
+		"delete": func(ctx context.Context) error {
+			if bundle != "" {
+				defer func() {
+					mount.UnmountAll(filepath.Join(bundle, "rootfs"), unix.MNT_DETACH)
+					os.RemoveAll(bundle)
+				}()
+				svc, err := New(ctx, Config{Root: root})
+				if err == nil {
+					ctx = namespaces.WithNamespace(ctx, namespace)
+					svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
+				} else {
+					(&runc.Runc{}).Delete(ctx, id, &runc.DeleteOpts{Force: true})
+					svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
+				}
+			}
+			return proto.MarshalText(os.Stdout, &taskapi.DeleteResponse{})
+		},
+		"start": func(ctx context.Context) error {
+			_, err := os.Stdout.WriteString("unix:///" + socket)
+			return err
+		},
+		"serve": func(ctx context.Context) error {
+			publisher, err := shim.NewPublisher(ttrpcAddr)
+			if err != nil {
+				return err
+			}
+
+			opts := Config{
+				Root:      root,
+				Publisher: publisher,
+				LogMode:   options.LogMode(options.LogMode_value[strings.ToUpper(logMode)]),
+			}
+			return serve(ctx, opts)
+		},
+	}
+
+	if _, ok := commands[rootFlags.Arg(0)]; !ok {
+		rootFlags.Output().Write([]byte("unrecognized command: " + rootFlags.Arg(0) + "\n"))
+		rootFlags.Usage()
+		cmds := make([]string, 0, len(commands))
+		for name := range commands {
+			cmds = append(cmds, name)
+		}
+		sort.Strings(cmds)
+		for _, name := range cmds {
+			rootFlags.Output().Write([]byte(fmt.Sprintf("\t%s\n", name)))
+		}
+		os.Exit(1)
+	}
+
+	flags := flag.NewFlagSet(rootFlags.Name()+" "+rootFlags.Arg(0), flag.ContinueOnError)
 	flags.BoolVar(&debug, "debug", false, "enable debug output in the shim")
-	flags.StringVar(&address, "address", address, "grpc address back to containerd")
 	flags.StringVar(&ttrpcAddr, "ttrpc-address", ttrpcAddr, "ttrpc address back to containerd")
 	flags.StringVar(&root, "root", filepath.Join(defaults.DefaultStateDir, "io.containerd.systemd.v1"), "root to store state in")
 	flags.StringVar(&socket, "socket", socket, "socket path to serve")
 
-	// Not used, but containerd sets it so we need to have it.
-	flags.StringVar(&publishBin, "publish-binary", "", "containerd binary with publish subcommand")
-	flags.StringVar(&id, "id", "", "id of the task")
-	flags.StringVar(&bundle, "bundle", "", "path to the bundle directory")
-	flags.StringVar(&namespace, "namespace", "", "namespace of container")
+	flags.StringVar(&logMode, "log-mode", logMode, "sets the default log mode for containers")
 
-	var args []string
-	if len(os.Args) > 1 {
-		args = os.Args[1:]
+	if len(os.Args) < 2 {
+		flags.Usage()
+		os.Exit(1)
 	}
 
-	if err := flags.Parse(args); err != nil {
+	if err := flags.Parse(rootFlags.Args()[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(2)
+	}
+
+	if logMode == "" {
+		logMode = defaultLogMode
 	}
 
 	if debug {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 
-	action := flags.Arg(0)
+	action := rootFlags.Arg(0)
 
 	ctx, cancel := newCtx()
 	defer cancel()
@@ -128,52 +227,18 @@ func main() {
 		os.Exit(3)
 	}
 
-	switch action {
-	case "install":
-		err := install(ctx, root, address, ttrpcAddr, socket, debug)
-		errOut(err)
-		return
-	case "uninstall":
-		errOut(uninstall(ctx))
-		return
-	case "delete":
-		if bundle != "" {
-			defer func() {
-				mount.UnmountAll(filepath.Join(bundle, "rootfs"), unix.MNT_DETACH)
-				os.RemoveAll(bundle)
-			}()
-			svc, err := New(ctx, root, nil)
-			if err == nil {
-				ctx = namespaces.WithNamespace(ctx, namespace)
-				svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
-			} else {
-				(&runc.Runc{}).Delete(ctx, id, &runc.DeleteOpts{Force: true})
-				svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
-			}
-		}
-		err := proto.MarshalText(os.Stdout, &taskapi.DeleteResponse{})
-		errOut(err)
-		return
-	case "start":
-		_, err := os.Stdout.WriteString("unix:///" + socket)
-		errOut(err)
-		return
-	case "serve":
-		publisher, err := shim.NewPublisher(ttrpcAddr)
-		errOut(err)
-
-		err = serve(ctx, root, publisher)
-		errOut(err)
-		return
-	default:
-		errOut(fmt.Errorf("unknown action: %s", action))
+	cmd, ok := commands[action]
+	if !ok {
+		errOut(fmt.Errorf("unknown command %v", action))
 	}
+
+	errOut(cmd(ctx))
 }
 
-func serve(ctx context.Context, root string, publisher events.Publisher) error {
+func serve(ctx context.Context, cfg Config) error {
 	log.G(ctx).Info("Starting...")
 
-	shm, err := New(ctx, root, publisher)
+	shm, err := New(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -204,7 +269,7 @@ func serve(ctx context.Context, root string, publisher events.Publisher) error {
 		}(l)
 	}
 
-	go shm.Forward(ctx, publisher)
+	go shm.Forward(ctx, cfg.Publisher)
 
 	<-ctx.Done()
 	svc.Close()

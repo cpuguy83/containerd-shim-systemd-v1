@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/namespaces"
@@ -48,6 +49,7 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 		log.G(ctx).WithError(err).Error("failed to get state")
 	}
 
+	log.G(ctx).Debugf("%+v", st)
 	if st.ExitedAt.After(timeZero) {
 		return &taskapi.WaitResponse{
 			ExitStatus: st.ExitCode,
@@ -71,6 +73,19 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 
 			if err := s.getState(ctx, name, &st); err != nil {
 				log.G(ctx).WithError(err).Error("failed to get state")
+			}
+
+			log.G(ctx).Debugf("%+v", st)
+
+			if st.Pid == 0 {
+				c, err := s.runc.State(ctx, runcName(ns, r.ID))
+				if err != nil {
+					log.G(ctx).WithError(err).Warn("error getting runc state")
+					return nil, errdefs.ToGRPC(err)
+				}
+				if toStatus(c.Status) == task.StatusStopped {
+					return &taskapi.WaitResponse{ExitStatus: 139, ExitedAt: time.Now()}, nil
+				}
 			}
 
 			if st.ExitedAt.After(timeZero) {

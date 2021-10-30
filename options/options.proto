@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package containerd.systemd.v1;
+
+import weak "gogoproto/gogo.proto";
+
+option go_package = "github.com/cpuguy83/containerd-shim-systemd-v1/options;options";
+
+enum LogMode {
+    DEFAULT = 0;
+    JOURNALD = 1;
+    STDIO = 2;
+    NULL = 3;
+}
+
+message CreateOptions {
+    LogMode log_mode = 1;
+    bool sd_notify_enable = 2;
+}

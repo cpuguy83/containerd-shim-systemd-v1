@@ -3,17 +3,16 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/containerd/cgroups"
 	cgroupsv2 "github.com/containerd/cgroups/v2"
-	"github.com/containerd/console"
 	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
@@ -25,21 +24,26 @@ import (
 	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
-	"github.com/cpuguy83/pipes"
+	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	dbus "github.com/godbus/dbus/v5"
 	ptypes "github.com/gogo/protobuf/types"
+	"github.com/moby/locker"
 	"github.com/pkg/errors"
-	"golang.org/x/sys/unix"
+	"github.com/sirupsen/logrus"
+	"go4.org/syncutil/singleflight"
 )
-
-// We always use the same grouping so there is a single shim for all containers
-const grouping = "systemd-shim"
 
 var (
 	timeZero = time.UnixMicro(0)
 )
 
-func New(ctx context.Context, root string, publisher events.Publisher) (*Service, error) {
+type Config struct {
+	Root      string
+	Publisher events.Publisher
+	LogMode   options.LogMode
+}
+
+func New(ctx context.Context, cfg Config) (*Service, error) {
 	conn, err := systemd.NewSystemdConnectionContext(ctx)
 	if err != nil {
 		return nil, err
@@ -50,20 +54,32 @@ func New(ctx context.Context, root string, publisher events.Publisher) (*Service
 		return nil, fmt.Errorf("error looking up runc path: %w", err)
 	}
 
-	runcRoot := filepath.Join(root, "runc")
+	runcRoot := filepath.Join(cfg.Root, "runc")
 	if err := os.MkdirAll(runcRoot, 0710); err != nil {
 		return nil, err
 	}
 
+	exe, err := os.Executable()
+	if err != nil {
+		exe = os.Args[0]
+	}
+
+	debug := logrus.GetLevel() >= logrus.DebugLevel
 	return &Service{
-		conn:       conn,
-		root:       root,
-		publisher:  publisher,
-		events:     make(chan eventEnvelope, 128),
-		waitEvents: make(chan struct{}),
+		conn:           conn,
+		exe:            exe,
+		root:           cfg.Root,
+		publisher:      cfg.Publisher,
+		events:         make(chan eventEnvelope, 128),
+		waitEvents:     make(chan struct{}),
+		defaultLogMode: cfg.LogMode,
+		single:         &singleflight.Group{},
+		ttyMu:          locker.New(),
+		ttys:           make(map[string]net.Conn),
 		runc: &runc.Runc{
+			Debug:         debug,
 			Command:       runcPath,
-			SystemdCgroup: true,
+			SystemdCgroup: false,
 			PdeathSignal:  syscall.SIGKILL,
 			Root:          runcRoot,
 		}}, nil
@@ -77,15 +93,15 @@ type Service struct {
 	events     chan eventEnvelope
 	waitEvents chan struct{}
 
-	mu       sync.Mutex
-	consoles map[string]*cio
-}
+	single *singleflight.Group
 
-type cio struct {
-	m      console.Console
-	f      io.Closer
-	stdin  io.ReadCloser
-	stdout io.WriteCloser
+	ttyMu *locker.Locker
+	ttys  map[string]net.Conn
+
+	defaultLogMode options.LogMode
+
+	// exe is used to re-exec the shim binary to start up a pty copier
+	exe string
 }
 
 // Cleanup is a binary call that cleans up any resources used by the shim when the Service crashes
@@ -119,7 +135,17 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		log.G(ctx).WithError(retErr).Info("systemd.Create end")
 	}()
 
-	ch := make(chan string, 1)
+	var opts options.CreateOptions
+	if r.Options != nil {
+		if err := typeurl.UnmarshalTo(r.Options, &opts); err != nil {
+			return nil, errdefs.ToGRPC(err)
+		}
+	}
+
+	if opts.LogMode == options.LogMode_DEFAULT {
+		opts.LogMode = s.defaultLogMode
+	}
+
 	runcPath, err := exec.LookPath("runc")
 	if err != nil {
 		return nil, err
@@ -127,7 +153,10 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	pidFile := filepath.Join(r.Bundle, "pid")
 
-	execStart := []string{runcPath, "--root", s.runc.Root, "create", "--bundle=" + r.Bundle, "--pid-file", pidFile}
+	execStart := []string{runcPath, "--debug=" + strconv.FormatBool(s.runc.Debug), "--systemd-cgroup=" + strconv.FormatBool(s.runc.SystemdCgroup), "--root", s.runc.Root, "create", "--bundle=" + r.Bundle}
+	if !opts.SdNotifyEnable {
+		execStart = append(execStart, []string{"--pid-file", pidFile}...)
+	}
 
 	if len(r.Rootfs) > 0 {
 		var mounts []mount.Mount
@@ -153,107 +182,94 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		}()
 	}
 
-	properties := []systemd.Property{
-		systemd.PropType("forking"),
-		{Name: "PIDFile", Value: dbus.MakeVariant(pidFile)},
+	var properties []systemd.Property
+	if opts.SdNotifyEnable {
+		properties = []systemd.Property{systemd.PropType("notify")}
+	} else {
+		properties = []systemd.Property{
+			systemd.PropType("forking"),
+			{Name: "PIDFile", Value: dbus.MakeVariant(pidFile)},
+		}
+	}
+
+	var ttyHandler []systemd.Property
+	if r.Terminal {
+		// TODO: We need to bind the pty copier to the container's lifecycle
+		// This would ensure that once the container exits, the pty copier exits
+
+		sockPath := ttySockPath(s.root, ns, r.ID, "")
+
+		ttyHandler = []systemd.Property{
+			systemd.PropType("notify"),
+			systemd.PropExecStart([]string{s.exe}, false),
+			systemd.PropDescription("TTY Handshake for " + name),
+			{Name: "Environment", Value: dbus.MakeVariant([]string{
+				ttyHandshakeEnv + "=1",
+				ttySockPathEnv + "=" + sockPath,
+			})},
+			{Name: "StandardInputFile", Value: dbus.MakeVariant(r.Stdin)},
+			{Name: "StandardOutputFile", Value: dbus.MakeVariant(r.Stdout)},
+			{Name: "StandardError", Value: dbus.MakeVariant("journal")},
+		}
+
+		// Add the console socket option to runc's exec-start
+		execStart = append(execStart, "--console-socket", sockPath)
+
+		ttyUnit := unitName(ns, r.ID+"-tty", "service")
+		defer func() {
+			if retErr != nil {
+				s.conn.StopUnitContext(ctx, ttyUnit, "replace", nil)
+				s.conn.ResetFailedUnitContext(ctx, ttyUnit)
+			}
+		}()
+
+		chTTY := make(chan string, 1)
+		if _, err := s.conn.StartTransientUnitContext(ctx, ttyUnit, "replace", ttyHandler, chTTY); err != nil {
+			if e := s.conn.ResetFailedUnitContext(ctx, ttyUnit); e == nil {
+				_, err2 := s.conn.StartTransientUnitContext(ctx, ttyUnit, "replace", ttyHandler, chTTY)
+				if err2 == nil {
+					err = nil
+				}
+			} else {
+				log.G(ctx).WithField("unit", ttyUnit).WithError(e).Warn("Error reseting failed unit")
+			}
+			if err != nil {
+				return nil, fmt.Errorf("error starting tty service: %w", err)
+			}
+		}
+		select {
+		case <-ctx.Done():
+		case status := <-chTTY:
+			if status != "done" {
+				return nil, fmt.Errorf("failed to start tty service: %s", status)
+			}
+		}
+
 	}
 
 	if r.Stdin != "" {
 		properties = append(properties, systemd.Property{Name: "StandardInputFile", Value: dbus.MakeVariant(r.Stdin)})
 	}
-	if r.Stdout != "" {
-		properties = append(properties, systemd.Property{Name: "StandardOutputFile", Value: dbus.MakeVariant(r.Stdout)})
-	}
-	if r.Stderr != "" {
-		properties = append(properties, systemd.Property{Name: "StandardErrorFile", Value: dbus.MakeVariant(r.Stderr)})
-	}
-	if r.Terminal {
-		socket, err := runc.NewTempConsoleSocket()
-		if err != nil {
-			return nil, fmt.Errorf("error creating console socket: %w", err)
-		}
-		var (
-			stdin  io.ReadCloser
-			stdout io.WriteCloser
-		)
-		if r.Stdin != "" {
-			r, _, err := pipes.OpenFifo(r.Stdin, os.O_RDWR, 0)
-			if err != nil {
-				socket.Close()
-				return nil, fmt.Errorf("error opening stdin pipe: %w", err)
-			}
-			stdin = r
-		}
+
+	switch opts.LogMode {
+	case options.LogMode_STDIO:
 		if r.Stdout != "" {
-			_, w, err := pipes.OpenFifo(r.Stdout, os.O_RDWR, 0)
-			if err != nil {
-				socket.Close()
-				return nil, fmt.Errorf("error opening stdout pipe: %w", err)
-			}
-			stdout = w
+			properties = append(properties, systemd.Property{Name: "StandardOutputFile", Value: dbus.MakeVariant(r.Stdout)})
 		}
-		s.mu.Lock()
-		if s.consoles == nil {
-			s.consoles = make(map[string]*cio)
+		if r.Stderr != "" {
+			properties = append(properties, systemd.Property{Name: "StandardErrorFile", Value: dbus.MakeVariant(r.Stderr)})
 		}
-		c := &cio{stdin: stdin, stdout: stdout}
-		s.consoles[runcName(ns, r.ID)] = c
-		s.mu.Unlock()
-		go func(console *runc.Socket, stdin io.ReadCloser, stdout io.WriteCloser) {
-			defer func() {
-				stdin.Close()
-				stdout.Close()
-				s.Close()
-			}()
-
-			m, err := socket.ReceiveMaster()
-			if err != nil {
-				log.G(ctx).WithError(err).Error("Error setting up console master")
-				return
-			}
-
-			s.mu.Lock()
-			c.m = m
-			s.mu.Unlock()
-			defer m.Close()
-
-			var f io.ReadWriteCloser = m
-
-			nfd, err := unix.Dup(int(m.Fd()))
-			if err != nil {
-				log.G(ctx).WithError(err).Error("Error duping console master")
-			} else {
-				f = os.NewFile(uintptr(nfd), r.ID+"_console")
-				s.mu.Lock()
-				c.f = f
-				s.mu.Unlock()
-			}
-
-			defer f.Close()
-
-			var wg sync.WaitGroup
-			if stdin != nil {
-				wg.Add(1)
-				go func() {
-					io.Copy(f, stdin)
-					wg.Done()
-				}()
-			}
-			if stdout != nil {
-				wg.Add(1)
-				go func() {
-					io.Copy(stdout, f)
-					wg.Done()
-				}()
-			}
-
-			wg.Wait()
-		}(socket, stdin, stdout)
-		execStart = append(execStart, "--console-socket", socket.Path())
+	case options.LogMode_NULL:
+		properties = append(properties, systemd.Property{Name: "StandardOutput", Value: dbus.MakeVariant("null")})
+		properties = append(properties, systemd.Property{Name: "StandardError", Value: dbus.MakeVariant("null")})
+	case options.LogMode_JOURNALD:
+	default:
+		return nil, fmt.Errorf("%w: invalid log mode: %s", errdefs.ErrInvalidArgument, opts.LogMode)
 	}
 
 	defer func() {
 		if retErr != nil {
+			s.conn.StopUnitContext(ctx, name, "replace", nil)
 			s.runc.Delete(ctx, runcName(ns, r.ID), &runc.DeleteOpts{Force: true})
 			s.conn.ResetFailedUnitContext(ctx, name)
 		}
@@ -261,22 +277,28 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	properties = append(properties, systemd.PropExecStart(append(execStart, runcName(ns, r.ID)), false))
 
-	_, err = s.conn.StartTransientUnitContext(ctx, name, "replace", properties, ch)
+	chMain := make(chan string, 1)
+	_, err = s.conn.StartTransientUnitContext(ctx, name, "replace", properties, chMain)
 	if err != nil {
 		if e := s.conn.ResetFailedUnitContext(ctx, name); e == nil {
-			_, err2 := s.conn.StartTransientUnitContext(ctx, name, "replace", properties, ch)
+			_, err2 := s.conn.StartTransientUnitContext(ctx, name, "replace", properties, chMain)
 			if err2 == nil {
 				err = nil
 			}
+		} else {
+			log.G(ctx).WithField("unit", name).WithError(e).Warn("Error reseting failed unit")
 		}
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error starting systemd runc unit: %w", err)
 		}
 	}
 
 	select {
 	case <-ctx.Done():
-	case <-ch:
+	case status := <-chMain:
+		if status != "done" {
+			return nil, fmt.Errorf("failed to start runc init: %s", status)
+		}
 	}
 
 	p, err := s.conn.GetServicePropertyContext(ctx, name, "MainPID")
@@ -365,6 +387,9 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 
 	defer func() {
 		mount.UnmountAll(filepath.Join(s.root, r.ID, "rootfs"), 0)
+		if err := os.RemoveAll(filepath.Join(s.root, ns, r.ID)); err != nil {
+			log.G(ctx).WithError(err).Error("Error removing container root directory")
+		}
 	}()
 	if err := s.runc.Delete(ctx, runcName(ns, r.ID), &runc.DeleteOpts{Force: true}); err != nil {
 		return nil, err
@@ -374,8 +399,14 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 	if err := s.getState(ctx, name, &st); err != nil && !errdefs.IsNotFound(err) {
 		log.G(ctx).WithError(err).Error("Error getting unit state")
 	}
-
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("statusCode", st.ExitCode))
+
+	if st.ExitCode != 0 {
+		if err := s.conn.ResetFailedUnitContext(ctx, name); err != nil {
+			log.G(ctx).WithError(err).Debug("Error reseting failed unit")
+		}
+		s.conn.ResetFailedUnitContext(ctx, unitName(ns, r.ID+"-tty", "service"))
+	}
 
 	return &taskapi.DeleteResponse{
 		Pid:        st.Pid,
@@ -387,30 +418,6 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 // Exec an additional process inside the container
 func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (*ptypes.Empty, error) {
 	return nil, errdefs.ErrNotImplemented
-}
-
-// ResizePty of a process
-func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (*ptypes.Empty, error) {
-	ns, err := namespaces.NamespaceRequired(ctx)
-	if err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	c, ok := s.consoles[runcName(ns, r.ID)]
-	if !ok {
-		s.mu.Unlock()
-		return nil, errdefs.ErrNotFound
-	}
-	if c.m == nil {
-		return &ptypes.Empty{}, nil
-	}
-	s.mu.Unlock()
-
-	if err := c.m.Resize(console.WinSize{Width: uint16(r.Width), Height: uint16(r.Height)}); err != nil {
-		return nil, err
-	}
-
-	return &ptypes.Empty{}, nil
 }
 
 // State returns runtime state of a process
@@ -509,41 +516,6 @@ func (s *Service) Pids(ctx context.Context, r *taskapi.PidsRequest) (*taskapi.Pi
 	return &taskapi.PidsResponse{
 		Processes: procs,
 	}, nil
-}
-
-// CloseIO of a process
-func (s *Service) CloseIO(ctx context.Context, r *taskapi.CloseIORequest) (_ *ptypes.Empty, retErr error) {
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID))
-	log.G(ctx).Info("CloseIO start")
-	defer func() {
-		log.G(ctx).WithError(retErr).Info("CloseIO end")
-	}()
-
-	ns, err := namespaces.NamespaceRequired(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	s.mu.Lock()
-	c, ok := s.consoles[runcName(ns, r.ID)]
-	if !ok {
-		s.mu.Unlock()
-		return nil, errdefs.ErrNotFound
-	}
-	delete(s.consoles, runcName(ns, r.ID))
-	s.mu.Unlock()
-
-	if r.Stdin {
-		c.stdin.Close()
-	}
-	c.stdout.Close()
-	if c.m != nil {
-		c.m.Close()
-	}
-	if c.f != nil {
-		c.f.Close()
-	}
-	return &ptypes.Empty{}, nil
 }
 
 // Checkpoint the container
