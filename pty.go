@@ -198,6 +198,8 @@ func (s *Service) CloseIO(ctx context.Context, r *taskapi.CloseIORequest) (_ *pt
 	return nil, errdefs.ErrNotImplemented
 }
 
+// This is pretty standard stuff but I copied this from github.com/containerd/go-runc, with some minor changes.
+// This receives the pty master fd from runc.
 func recvFd(socket *net.UnixConn) (int, error) {
 	const MaxNameLen = 4096
 	var oobSpace = unix.CmsgSpace(4)
