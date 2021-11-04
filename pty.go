@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/coreos/go-systemd/v22/daemon"
+	systemd "github.com/coreos/go-systemd/v22/dbus"
+	dbus "github.com/godbus/dbus/v5"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -102,59 +105,33 @@ func ttyHandshake() error {
 	return nil
 }
 
-func ttySockPath(root, ns, id, execID string) string {
-	if execID != "" {
-		return filepath.Join(root, ns, id, "tty-"+execID+".sock")
-	}
-	return filepath.Join(root, ns, id, "tty.sock")
-}
+func (p *process) ResizePTY(ctx context.Context, width, height int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-// ResizePty of a process
-func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_ *ptypes.Empty, retErr error) {
-	ns, err := namespaces.NamespaceRequired(ctx)
-	if err != nil {
-		return nil, err
-	}
+	conn := p.ttyConn
 
-	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(logrus.Fields{
-		"id":        r.ID,
-		"ns":        ns,
-		"apiAction": "resizePty",
-	}))
+	var noRetry bool
+	if conn == nil {
+		noRetry = true
 
-	log.G(ctx).Info("start")
-	defer func() {
-		log.G(ctx).WithError(err).Info("end")
-	}()
-
-	conn, err := s.getTTY(ctx, ns, r.ID, r.ExecID)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := s.doResizePty(ctx, conn, r.Width, r.Height); err != nil {
-		sp := ttySockPath(s.root, ns, r.ID, r.ExecID)
-		s.ttyMu.Lock(sp)
-		delete(s.ttys, sp)
-		s.ttyMu.Unlock(sp)
-
-		conn, err = s.getTTY(ctx, ns, r.ID, r.ExecID)
+		var err error
+		conn, err = net.Dial("unix", p.ttySockPath())
 		if err != nil {
-			return nil, err
+			p.mu.Unlock()
+			return fmt.Errorf("could not dial tty sock: %w", err)
 		}
-
-		if err := s.doResizePty(ctx, conn, r.Width, r.Height); err != nil {
-			return nil, err
-		}
+		p.ttyConn = conn
 	}
 
-	return &ptypes.Empty{}, nil
-}
-
-func (s *Service) doResizePty(ctx context.Context, conn net.Conn, width, height uint32) error {
-	_, err := conn.Write([]byte("1 " + strconv.Itoa(int(width)) + " " + strconv.Itoa(int(height))))
+	_, err := conn.Write([]byte("1 " + strconv.Itoa(width) + " " + strconv.Itoa(height)))
 	if err != nil {
-		return fmt.Errorf("error writing winsize to tty handler: %w", err)
+		if !noRetry {
+			p.ttyConn.Close()
+			p.ttyConn = nil
+			return p.ResizePTY(ctx, width, height)
+		}
+		return fmt.Errorf("error writing winsize to the tty handler: %w", err)
 	}
 
 	resp := make([]byte, 128)
@@ -174,23 +151,34 @@ func (s *Service) doResizePty(ctx context.Context, conn net.Conn, width, height 
 	return nil
 }
 
-func (s *Service) getTTY(ctx context.Context, ns, id, execID string) (net.Conn, error) {
-	sockPath := ttySockPath(s.root, ns, id, execID)
-
-	s.ttyMu.Lock(sockPath)
-	defer s.ttyMu.Unlock(sockPath)
-
-	if conn, ok := s.ttys[sockPath]; ok {
-		return conn, nil
-	}
-
-	conn, err := net.Dial("unix", sockPath)
+// ResizePty of a process
+func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_ *ptypes.Empty, retErr error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("error getting connection to tty handler: %s", sockPath)
+		return nil, err
 	}
 
-	s.ttys[sockPath] = conn
-	return conn, nil
+	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(logrus.Fields{
+		"id":        r.ID,
+		"ns":        ns,
+		"apiAction": "resizePty",
+	}))
+
+	log.G(ctx).Info("start")
+	defer func() {
+		log.G(ctx).WithError(retErr).Info("end")
+	}()
+
+	p := s.processes.Get(path.Join(ns, r.ID))
+	if p == nil {
+		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "resize")
+	}
+
+	if err := p.ResizePTY(ctx, int(r.Width), int(r.Height)); err != nil {
+		return nil, err
+	}
+
+	return &ptypes.Empty{}, nil
 }
 
 // CloseIO of a process
@@ -237,4 +225,57 @@ func recvFd(socket *net.UnixConn) (int, error) {
 		return -1, fmt.Errorf("recvfd: number of fds is not 1: %d", len(fds))
 	}
 	return fds[0], nil
+}
+
+func (p *process) ttySockPath() string {
+	return filepath.Join(p.root, p.id+"-tty.sock")
+}
+
+func (p *process) makePty(ctx context.Context) (_ string, retErr error) {
+	sockPath := p.ttySockPath()
+
+	properties := []systemd.Property{
+		systemd.PropType("notify"),
+		systemd.PropExecStart([]string{p.exe}, false),
+		systemd.PropDescription("TTY Handshake for containerd-" + p.Name()),
+		{Name: "Environment", Value: dbus.MakeVariant([]string{
+			ttyHandshakeEnv + "=1",
+			ttySockPathEnv + "=" + sockPath,
+		})},
+		{Name: "StandardInputFile", Value: dbus.MakeVariant(p.Stdin)},
+		{Name: "StandardOutputFile", Value: dbus.MakeVariant(p.Stdout)},
+		{Name: "StandardError", Value: dbus.MakeVariant("journal")},
+	}
+
+	ttyUnit := unitName(p.ns, p.id+"-tty") + ".service"
+	defer func() {
+		if retErr != nil {
+			p.systemd.StopUnitContext(ctx, ttyUnit, "replace", nil)
+			p.systemd.ResetFailedUnitContext(ctx, ttyUnit)
+		}
+	}()
+
+	chTTY := make(chan string, 1)
+	if _, err := p.systemd.StartTransientUnitContext(ctx, ttyUnit, "replace", properties, chTTY); err != nil {
+		if e := p.systemd.ResetFailedUnitContext(ctx, ttyUnit); e == nil {
+			_, err2 := p.systemd.StartTransientUnitContext(ctx, ttyUnit, "replace", properties, chTTY)
+			if err2 == nil {
+				err = nil
+			}
+		} else {
+			log.G(ctx).WithField("unit", ttyUnit).WithError(e).Warn("Error reseting failed unit")
+		}
+		if err != nil {
+			return "", fmt.Errorf("error starting tty service: %w", err)
+		}
+	}
+	select {
+	case <-ctx.Done():
+	case status := <-chTTY:
+		if status != "done" {
+			return "", fmt.Errorf("failed to start tty service: %s", status)
+		}
+	}
+
+	return sockPath, nil
 }

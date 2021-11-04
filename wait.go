@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"path"
 	"time"
 
 	"github.com/containerd/containerd/api/types/task"
@@ -32,29 +33,43 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 		}
 	}()
 
-	if err := s.conn.Subscribe(); err != nil {
+	// TODO: exec
+	p := s.processes.Get(path.Join(ns, r.ID))
+	if p == nil {
+		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
+	}
+
+	st, err := p.Wait(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPCf(err, "wait")
+	}
+
+	return &taskapi.WaitResponse{
+		ExitedAt:   st.ExitedAt,
+		ExitStatus: st.ExitCode,
+	}, nil
+}
+
+// TODO: May need to refactor this for exec processes
+func (p *process) Wait(ctx context.Context) (*pState, error) {
+	if err := p.systemd.Subscribe(); err != nil {
 		return nil, err
 	}
 
-	name := unitName(ns, r.ID, "service")
-	unitCh, errCh := s.conn.SubscribeUnitsCustom(time.Second, 10, func(u1, u2 *systemd.UnitStatus) bool { return u1.ActiveState != u2.ActiveState }, func(id string) bool {
+	name := unitName(p.ns, p.id) + ".service"
+	unitCh, errCh := p.systemd.SubscribeUnitsCustom(time.Second, 10, func(u1, u2 *systemd.UnitStatus) bool { return u1.ActiveState != u2.ActiveState }, func(id string) bool {
 		return id != name
 	})
 
-	var (
-		st execState
-	)
+	var st pState
 
-	if err := s.getState(ctx, name, &st); err != nil {
+	if err := getUnitState(ctx, p.systemd, name, &st); err != nil {
 		log.G(ctx).WithError(err).Error("failed to get state")
 	}
 
 	log.G(ctx).Debugf("%+v", st)
 	if st.ExitedAt.After(timeZero) {
-		return &taskapi.WaitResponse{
-			ExitStatus: st.ExitCode,
-			ExitedAt:   st.ExitedAt,
-		}, nil
+		return &st, nil
 	}
 
 	for {
@@ -71,28 +86,27 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 				continue
 			}
 
-			if err := s.getState(ctx, name, &st); err != nil {
+			if err := getUnitState(ctx, p.systemd, name, &st); err != nil {
 				log.G(ctx).WithError(err).Error("failed to get state")
 			}
 
 			log.G(ctx).Debugf("%+v", st)
 
 			if st.Pid == 0 {
-				c, err := s.runc.State(ctx, runcName(ns, r.ID))
+				c, err := p.runc.State(ctx, runcName(p.ns, p.id))
 				if err != nil {
 					log.G(ctx).WithError(err).Warn("error getting runc state")
 					return nil, errdefs.ToGRPC(err)
 				}
 				if toStatus(c.Status) == task.StatusStopped {
-					return &taskapi.WaitResponse{ExitStatus: 139, ExitedAt: time.Now()}, nil
+					st.ExitCode = 139
+					st.ExitedAt = time.Now()
+					return &st, nil
 				}
 			}
 
 			if st.ExitedAt.After(timeZero) {
-				return &taskapi.WaitResponse{
-					ExitStatus: st.ExitCode,
-					ExitedAt:   st.ExitedAt,
-				}, nil
+				return &st, nil
 			}
 		}
 	}

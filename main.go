@@ -124,6 +124,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	flags := flag.NewFlagSet(rootFlags.Name()+" "+rootFlags.Arg(0), flag.ContinueOnError)
+
 	commands := map[string]func(context.Context) error{
 		"install": func(ctx context.Context) error {
 			return install(ctx, root, address, ttrpcAddr, socket, debug, options.LogMode(options.LogMode_value[strings.ToUpper(logMode)]))
@@ -179,10 +181,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	flags := flag.NewFlagSet(rootFlags.Name()+" "+rootFlags.Arg(0), flag.ContinueOnError)
 	flags.BoolVar(&debug, "debug", false, "enable debug output in the shim")
 	flags.StringVar(&ttrpcAddr, "ttrpc-address", ttrpcAddr, "ttrpc address back to containerd")
-	flags.StringVar(&root, "root", filepath.Join(defaults.DefaultStateDir, "io.containerd.systemd.v1"), "root to store state in")
+	flags.StringVar(&root, "root", filepath.Join(defaults.DefaultStateDir, shimName), "root to store state in")
 	flags.StringVar(&socket, "socket", socket, "socket path to serve")
 
 	flags.StringVar(&logMode, "log-mode", logMode, "sets the default log mode for containers")

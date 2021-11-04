@@ -2,14 +2,59 @@ package main
 
 import (
 	"context"
+	"path"
 	"time"
 
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/namespaces"
+	taskapi "github.com/containerd/containerd/runtime/v2/task"
+	"github.com/coreos/go-systemd/v22/dbus"
 )
 
-func (s *Service) getState(ctx context.Context, unit string, st *execState) error {
-	state, err := s.conn.GetAllPropertiesContext(ctx, unit)
+// State returns runtime state of a process
+func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskapi.StateResponse, retErr error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+
+	log.G(ctx).Info("systemd.State")
+	defer func() {
+		log.G(ctx).WithError(retErr).Info("systemd.State end")
+	}()
+
+	p := s.processes.Get(path.Join(ns, r.ID))
+	if p == nil {
+		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s not found", r.ID)
+	}
+
+	st, err := p.State(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPCf(err, "state")
+	}
+
+	if st.pState.ExitedAt.After(timeZero) {
+		ctx = log.WithLogger(ctx, log.G(ctx).WithField("status", st.Status).WithField("exitedAt", st.ExitedAt))
+	}
+
+	return &taskapi.StateResponse{
+		ID:         st.ID,
+		Bundle:     st.Bundle,
+		Pid:        st.Pid,
+		ExitStatus: uint32(st.Status),
+		ExitedAt:   st.ExitedAt,
+		Status:     st.Status,
+		Stdin:      st.Stdin,
+		Stdout:     st.Stdout,
+		Stderr:     st.Stderr,
+		Terminal:   st.Terminal,
+	}, nil
+}
+
+func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState) error {
+	state, err := conn.GetAllPropertiesContext(ctx, unit)
 	if err != nil {
 		return err
 	}
@@ -24,6 +69,42 @@ func (s *Service) getState(ctx context.Context, unit string, st *execState) erro
 		st.ExitedAt = time.UnixMicro(int64(ts.(uint64)))
 	}
 	return nil
+}
+
+type State struct {
+	pState
+	Bundle                string
+	ID                    string
+	Stdin, Stdout, Stderr string
+	Terminal              bool
+	Status                task.Status
+}
+
+func (p *process) State(ctx context.Context) (*State, error) {
+	c, err := p.runc.State(ctx, runcName(p.ns, p.id))
+	if err != nil {
+		return nil, err
+	}
+
+	status := toStatus(c.Status)
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("status", status))
+
+	resp := &State{
+		Bundle:   c.Bundle,
+		ID:       c.ID,
+		Stdin:    p.Stdin,
+		Stdout:   p.Stdout,
+		Stderr:   p.Stderr,
+		Terminal: p.Terminal,
+	}
+
+	if status == task.StatusStopped {
+		if err := getUnitState(ctx, p.systemd, unitName(p.ns, p.id)+".service", &resp.pState); err != nil {
+			return nil, err
+		}
+	}
+
+	return resp, nil
 }
 
 func toStatus(s string) task.Status {
@@ -43,7 +124,7 @@ func toStatus(s string) task.Status {
 	}
 }
 
-type execState struct {
+type pState struct {
 	ExitedAt time.Time
 	ExitCode uint32
 	Pid      uint32
