@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"time"
 
@@ -20,9 +21,14 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 		return nil, errdefs.ToGRPC(err)
 	}
 
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns).WithField("execID", r.ExecID))
+
 	log.G(ctx).Info("systemd.State")
 	defer func() {
 		log.G(ctx).WithError(retErr).Info("systemd.State end")
+		if retErr != nil {
+			retErr = errdefs.ToGRPC(fmt.Errorf("state: %w", retErr))
+		}
 	}()
 
 	p := s.processes.Get(path.Join(ns, r.ID))
@@ -30,9 +36,21 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s not found", r.ID)
 	}
 
-	st, err := p.State(ctx)
-	if err != nil {
-		return nil, errdefs.ToGRPCf(err, "state")
+	var st *State
+	if r.ExecID != "" {
+		ep := p.(*initProcess).execs.Get(r.ExecID)
+		if ep == nil {
+			return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "exec %s not found", r.ExecID)
+		}
+		st, err = ep.State(ctx)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		st, err = p.State(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if st.pState.ExitedAt.After(timeZero) {
@@ -80,7 +98,7 @@ type State struct {
 	Status                task.Status
 }
 
-func (p *process) State(ctx context.Context) (*State, error) {
+func (p *initProcess) State(ctx context.Context) (*State, error) {
 	c, err := p.runc.State(ctx, runcName(p.ns, p.id))
 	if err != nil {
 		return nil, err
@@ -105,6 +123,38 @@ func (p *process) State(ctx context.Context) (*State, error) {
 	}
 
 	return resp, nil
+}
+
+func (p *execProcess) State(ctx context.Context) (*State, error) {
+	st := &State{
+		ID:       p.id,
+		Bundle:   p.parent.Bundle,
+		Stdin:    p.Stdin,
+		Stdout:   p.Stdout,
+		Stderr:   p.Stderr,
+		Terminal: p.Terminal,
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.pid != 0 {
+		if err := getUnitState(ctx, p.systemd, unitName(p.ns, p.id)+".service", &st.pState); err != nil {
+			return nil, err
+		}
+	}
+
+	// TODO: pause states
+	switch {
+	case st.ExitedAt.After(timeZero):
+		st.Status = task.StatusStopped
+	case p.pid > 0:
+		st.Status = task.StatusRunning
+	default:
+		st.Status = task.StatusCreated
+	}
+
+	return st, nil
 }
 
 func toStatus(s string) task.Status {

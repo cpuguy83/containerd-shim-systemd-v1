@@ -13,6 +13,7 @@ import (
 
 	"github.com/containerd/cgroups"
 	cgroupsv2 "github.com/containerd/cgroups/v2"
+	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/events"
@@ -137,7 +138,7 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 		return nil, errdefs.ToGRPC(err)
 	}
 
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns))
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns).WithField("execID", r.ExecID))
 
 	log.G(ctx).Info("systemd.Start")
 	defer func() {
@@ -145,9 +146,31 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 	}()
 
 	p := s.processes.Get(path.Join(ns, r.ID))
-	pid, err := p.Start(ctx)
-	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+
+	var pid uint32
+	if r.ExecID != "" {
+		ep := p.(*initProcess).execs.Get(r.ExecID)
+		if ep == nil {
+			return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "exec id %v not found", r.ExecID)
+		}
+		pid, err = ep.Start(ctx)
+		if err != nil {
+			return nil, errdefs.ToGRPC(err)
+		}
+		s.send(ns, &eventsapi.TaskExecStarted{
+			ContainerID: r.ID,
+			ExecID:      r.ExecID,
+			Pid:         pid,
+		})
+	} else {
+		pid, err = p.Start(ctx)
+		if err != nil {
+			return nil, errdefs.ToGRPC(err)
+		}
+		s.send(ns, &eventsapi.TaskStart{
+			ContainerID: r.ID,
+			Pid:         pid,
+		})
 	}
 
 	return &taskapi.StartResponse{Pid: pid}, nil
@@ -197,8 +220,18 @@ func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (*ptypes.Emp
 		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
 	}
 
-	if err := p.Kill(ctx, int(r.Signal), r.All); err != nil {
-		return nil, errdefs.ToGRPC(err)
+	if r.ExecID != "" {
+		ep := p.(*initProcess).execs.Get(r.ExecID)
+		if ep == nil {
+			return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "exec id %v not found", r.ExecID)
+		}
+		if err := ep.Kill(ctx, int(r.Signal), r.All); err != nil {
+			return nil, errdefs.ToGRPC(err)
+		}
+	} else {
+		if err := p.Kill(ctx, int(r.Signal), r.All); err != nil {
+			return nil, errdefs.ToGRPC(err)
+		}
 	}
 	return &ptypes.Empty{}, nil
 }

@@ -164,9 +164,9 @@ func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_
 		"apiAction": "resizePty",
 	}))
 
-	log.G(ctx).Info("start")
+	log.G(ctx).Info("systemd.ResizePTY start")
 	defer func() {
-		log.G(ctx).WithError(retErr).Info("end")
+		log.G(ctx).WithError(retErr).Info("systemd.ResizePTY end")
 	}()
 
 	p := s.processes.Get(path.Join(ns, r.ID))
@@ -174,8 +174,15 @@ func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_
 		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "resize")
 	}
 
-	if err := p.ResizePTY(ctx, int(r.Width), int(r.Height)); err != nil {
-		return nil, err
+	if r.ExecID != "" {
+		ep := p.(*initProcess).execs.Get(r.ExecID)
+		if err := ep.ResizePTY(ctx, int(r.Width), int(r.Height)); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := p.ResizePTY(ctx, int(r.Width), int(r.Height)); err != nil {
+			return nil, err
+		}
 	}
 
 	return &ptypes.Empty{}, nil
@@ -231,7 +238,7 @@ func (p *process) ttySockPath() string {
 	return filepath.Join(p.root, p.id+"-tty.sock")
 }
 
-func (p *process) makePty(ctx context.Context) (_ string, retErr error) {
+func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
 	sockPath := p.ttySockPath()
 
 	properties := []systemd.Property{
@@ -266,16 +273,16 @@ func (p *process) makePty(ctx context.Context) (_ string, retErr error) {
 			log.G(ctx).WithField("unit", ttyUnit).WithError(e).Warn("Error reseting failed unit")
 		}
 		if err != nil {
-			return "", fmt.Errorf("error starting tty service: %w", err)
+			return "", "", fmt.Errorf("error starting tty service: %w", err)
 		}
 	}
 	select {
 	case <-ctx.Done():
 	case status := <-chTTY:
 		if status != "done" {
-			return "", fmt.Errorf("failed to start tty service: %s", status)
+			return "", "", fmt.Errorf("failed to start tty service: %s", status)
 		}
 	}
 
-	return sockPath, nil
+	return ttyUnit, sockPath, nil
 }

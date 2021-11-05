@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sync"
 
 	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/errdefs"
@@ -13,7 +14,6 @@ import (
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
@@ -65,7 +65,11 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		Rootfs:           r.Rootfs,
 		checkpoint:       r.Checkpoint,
 		parentCheckpoint: r.ParentCheckpoint,
+		execs: &processManager{
+			ls: make(map[string]Process),
+		},
 	}
+	p.process.cond = sync.NewCond(&p.process.mu)
 
 	if err := s.processes.Add(path.Join(ns, r.ID), p); err != nil {
 		return nil, errdefs.ToGRPC(err)
@@ -113,10 +117,49 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 // Exec an additional process inside the container
 func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *ptypes.Empty, retErr error) {
-	return nil, errdefs.ToGRPC(errdefs.ErrNotImplemented)
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+
+	p := s.processes.Get(path.Join(ns, r.ID))
+	if p == nil {
+		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
+	}
+	pInit := p.(*initProcess)
+
+	// TODO: In order to support shim restarts we need to persist this.
+	ep := &execProcess{
+		Spec:   r.Spec,
+		parent: pInit,
+		execID: r.ExecID,
+		process: &process{
+			ns:       ns,
+			root:     pInit.root,
+			id:       r.ID + "-" + r.ExecID,
+			Stdin:    r.Stdin,
+			Stdout:   r.Stdout,
+			Stderr:   r.Stderr,
+			Terminal: r.Terminal,
+			systemd:  s.conn,
+			runc:     s.runc,
+			exe:      s.exe,
+			opts:     options.CreateOptions{LogMode: s.defaultLogMode},
+		}}
+	ep.process.cond = sync.NewCond(&ep.process.mu)
+	err = pInit.execs.Add(r.ExecID, ep)
+
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+	s.send(ns, &eventsapi.TaskExecAdded{
+		ContainerID: pInit.id,
+		ExecID:      r.ExecID,
+	})
+	return &ptypes.Empty{}, nil
 }
 
-func (p *process) startUnit(ctx context.Context, cmd []string, pidFile string) (_ uint32, retErr error) {
+func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id string) (_ uint32, retErr error) {
 	execStart, err := p.runcCmd(cmd)
 	if err != nil {
 		return 0, err
@@ -125,10 +168,12 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile string) (
 	if p.opts.SdNotifyEnable {
 		properties = []systemd.Property{systemd.PropType("notify")}
 	} else {
-		execStart = append(execStart, "--pid-file="+pidFile)
-		properties = []systemd.Property{
-			systemd.PropType("forking"),
-			{Name: "PIDFile", Value: dbus.MakeVariant(pidFile)},
+		if pidFile != "" {
+			execStart = append(execStart, "--pid-file="+pidFile)
+			properties = []systemd.Property{
+				systemd.PropType("forking"),
+				{Name: "PIDFile", Value: dbus.MakeVariant(pidFile)},
+			}
 		}
 	}
 
@@ -137,10 +182,21 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile string) (
 		// This would ensure that once the container exits, the pty copier exits
 
 		// Add the console socket option to runc's exec-start
-		sockPath, err := p.makePty(ctx)
+		ttyUnit, sockPath, err := p.makePty(ctx)
 		if err != nil {
 			return 0, fmt.Errorf("error setting up tty handler: %w", err)
 		}
+		defer func() {
+			if retErr != nil {
+				if _, err := p.systemd.StopUnitContext(ctx, ttyUnit, "replace", nil); err != nil {
+					log.G(ctx).WithError(err).WithField("unit", ttyUnit).Error("failed to stop tty unit unit")
+				}
+				if err := p.systemd.ResetFailedUnitContext(ctx, ttyUnit); err != nil {
+					log.G(ctx).WithError(err).WithField("unit", ttyUnit).Warn("Error reseting tty unit")
+				}
+			}
+		}()
+
 		execStart = append(execStart, "--console-socket", sockPath)
 	}
 
@@ -169,12 +225,11 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile string) (
 	defer func() {
 		if retErr != nil {
 			p.systemd.StopUnitContext(ctx, name, "replace", nil)
-			p.runc.Delete(ctx, runcName(p.ns, p.id), &runc.DeleteOpts{Force: true})
 			p.systemd.ResetFailedUnitContext(ctx, name)
 		}
 	}()
 
-	properties = append(properties, systemd.PropExecStart(append(execStart, runcName(p.ns, p.id)), false))
+	properties = append(properties, systemd.PropExecStart(append(execStart, id), false))
 
 	chMain := make(chan string, 1)
 	_, err = p.systemd.StartTransientUnitContext(ctx, name, "replace", properties, chMain)
@@ -208,6 +263,7 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile string) (
 	p.mu.Lock()
 	p.pid = pid.Value.Value().(uint32)
 	ret := p.pid
+	p.cond.Broadcast()
 	p.mu.Unlock()
 
 	return ret, nil
@@ -246,5 +302,5 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	execStart := []string{"create", "--bundle=" + p.Bundle}
 
 	pidFile := filepath.Join(p.root, "pid")
-	return p.startUnit(ctx, execStart, pidFile)
+	return p.startUnit(ctx, execStart, pidFile, runcName(p.ns, p.id))
 }

@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io/ioutil"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"sync"
 
@@ -12,6 +16,7 @@ import (
 	"github.com/containerd/go-runc"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
+	ptypes "github.com/gogo/protobuf/types"
 )
 
 type processManager struct {
@@ -44,7 +49,6 @@ func (m *processManager) Delete(id string) {
 }
 
 type Process interface {
-	Create(context.Context) (uint32, error)
 	Start(context.Context) (uint32, error)
 	ResizePTY(ctx context.Context, w, h int) error
 	Wait(context.Context) (*pState, error)
@@ -73,6 +77,7 @@ type process struct {
 	ttyConn net.Conn
 
 	mu         sync.Mutex
+	cond       *sync.Cond
 	pid        uint32
 	exitStatus int
 	status     int
@@ -111,6 +116,8 @@ type initProcess struct {
 
 	checkpoint       string
 	parentCheckpoint string
+
+	execs *processManager
 }
 
 func (p *initProcess) Start(ctx context.Context) (uint32, error) {
@@ -120,4 +127,32 @@ func (p *initProcess) Start(ctx context.Context) (uint32, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.pid, nil
+}
+
+type execProcess struct {
+	*process
+	Spec   *ptypes.Any
+	parent *initProcess
+	execID string
+}
+
+func (p *execProcess) Start(ctx context.Context) (uint32, error) {
+	f, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), p.id+"process-json")
+	if err != nil {
+		return 0, fmt.Errorf("error creating process.json file: %w", err)
+	}
+
+	if _, err := f.Write(p.Spec.Value); err != nil {
+		return 0, fmt.Errorf("error writing process.json: %w", err)
+	}
+	f.Close()
+
+	execStart := []string{"exec", "--process", f.Name(), "-d"}
+
+	pidFile := filepath.Join(p.root, p.id+"-pid")
+	if p.Terminal {
+		execStart = append(execStart, "-t")
+	}
+
+	return p.startUnit(ctx, execStart, pidFile, runcName(p.ns, p.parent.id))
 }
