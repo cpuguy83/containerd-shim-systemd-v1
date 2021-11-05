@@ -250,6 +250,10 @@ func serve(ctx context.Context, cfg Config) error {
 	}
 	defer svc.Close()
 
+	if err := shm.watchUnits(ctx); err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 

@@ -254,7 +254,7 @@ func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
 		{Name: "StandardError", Value: dbus.MakeVariant("journal")},
 	}
 
-	ttyUnit := unitName(p.ns, p.id+"-tty") + ".service"
+	ttyUnit := unitName(p.ns, p.id+"-tty")
 	defer func() {
 		if retErr != nil {
 			p.systemd.StopUnitContext(ctx, ttyUnit, "replace", nil)

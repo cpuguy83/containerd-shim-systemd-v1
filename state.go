@@ -14,6 +14,37 @@ import (
 	"github.com/coreos/go-systemd/v22/dbus"
 )
 
+func (s *Service) watchUnits(ctx context.Context) error {
+	updates := make(chan *dbus.SubStateUpdate, 100)
+	errs := make(chan error, 100)
+	go func() {
+		var st pState
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case err := <-errs:
+				log.G(ctx).WithError(err).Error("error while watching for unit state updates")
+			case u := <-updates:
+				p := s.units.Get(u.UnitName)
+				if p == nil {
+					continue
+				}
+				if err := getUnitState(ctx, s.conn, u.UnitName, &st); err != nil {
+					log.G(ctx).WithError(err).Warn("Error getting unit state")
+					continue
+				}
+				p.SetState(st)
+				log.G(ctx).WithField("unit", u.UnitName).WithField("substate", u.SubState).Debugf("%+v", p.ProcessState())
+				st.Reset()
+			}
+		}
+	}()
+
+	s.conn.SetSubStateSubscriber(updates, errs)
+	return nil
+}
+
 // State returns runtime state of a process
 func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskapi.StateResponse, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
@@ -53,17 +84,13 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 		}
 	}
 
-	if st.pState.ExitedAt.After(timeZero) {
-		ctx = log.WithLogger(ctx, log.G(ctx).WithField("status", st.Status).WithField("exitedAt", st.ExitedAt))
-	}
-
 	return &taskapi.StateResponse{
 		ID:         st.ID,
 		Bundle:     st.Bundle,
-		Pid:        st.Pid,
-		ExitStatus: uint32(st.Status),
-		ExitedAt:   st.ExitedAt,
-		Status:     st.Status,
+		Pid:        st.State.Pid,
+		ExitStatus: st.State.ExitCode,
+		ExitedAt:   st.State.ExitedAt,
+		Status:     toStatus(st.State.Status),
 		Stdin:      st.Stdin,
 		Stdout:     st.Stdout,
 		Stderr:     st.Stderr,
@@ -86,41 +113,33 @@ func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState)
 	if ts := state["ExecMainExitTimestamp"]; ts != nil {
 		st.ExitedAt = time.UnixMicro(int64(ts.(uint64)))
 	}
+	if status := state["SubState"]; status != nil {
+		st.Status = status.(string)
+	}
 	return nil
 }
 
 type State struct {
-	pState
+	State                 pState
 	Bundle                string
 	ID                    string
 	Stdin, Stdout, Stderr string
 	Terminal              bool
-	Status                task.Status
 }
 
 func (p *initProcess) State(ctx context.Context) (*State, error) {
-	c, err := p.runc.State(ctx, runcName(p.ns, p.id))
-	if err != nil {
-		return nil, err
-	}
-
-	status := toStatus(c.Status)
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("status", status))
-
 	resp := &State{
-		Bundle:   c.Bundle,
-		ID:       c.ID,
+		Bundle:   p.Bundle,
+		ID:       p.id,
 		Stdin:    p.Stdin,
 		Stdout:   p.Stdout,
 		Stderr:   p.Stderr,
 		Terminal: p.Terminal,
 	}
 
-	if status == task.StatusStopped {
-		if err := getUnitState(ctx, p.systemd, unitName(p.ns, p.id)+".service", &resp.pState); err != nil {
-			return nil, err
-		}
-	}
+	p.mu.Lock()
+	p.state.CopyTo(&resp.State)
+	p.mu.Unlock()
 
 	return resp, nil
 }
@@ -136,23 +155,8 @@ func (p *execProcess) State(ctx context.Context) (*State, error) {
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.pid != 0 {
-		if err := getUnitState(ctx, p.systemd, unitName(p.ns, p.id)+".service", &st.pState); err != nil {
-			return nil, err
-		}
-	}
-
-	// TODO: pause states
-	switch {
-	case st.ExitedAt.After(timeZero):
-		st.Status = task.StatusStopped
-	case p.pid > 0:
-		st.Status = task.StatusRunning
-	default:
-		st.Status = task.StatusCreated
-	}
+	p.state.CopyTo(&st.State)
+	p.mu.Unlock()
 
 	return st, nil
 }
@@ -167,7 +171,7 @@ func toStatus(s string) task.Status {
 		return task.StatusPausing
 	case "paused":
 		return task.StatusPaused
-	case "stopped":
+	case "stopped", "dead", "failed":
 		return task.StatusStopped
 	default:
 		return task.StatusUnknown
@@ -178,6 +182,32 @@ type pState struct {
 	ExitedAt time.Time
 	ExitCode uint32
 	Pid      uint32
+	Status   string
+}
+
+func (s *pState) Reset() {
+	s.ExitedAt = timeZero
+	s.ExitCode = 0
+	s.Pid = 0
+	s.Status = ""
+}
+
+// CopyTo copies the state to the provided destination.
+// It does not override non-zero values (except "Status") in the destination.
+// This is to ensure we don't override real information in the state w/, for instance, state info for a deleted unit.
+func (s *pState) CopyTo(other *pState) {
+	if !other.ExitedAt.After(timeZero) {
+		other.ExitedAt = s.ExitedAt
+	}
+	if other.ExitCode == 0 {
+		other.ExitCode = s.ExitCode
+	}
+	if other.Pid == 0 {
+		other.Pid = s.Pid
+	}
+	if s.Status != "" {
+		other.Status = s.Status
+	}
 }
 
 type execStartState struct {

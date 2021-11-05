@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path"
@@ -25,7 +24,6 @@ import (
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	ptypes "github.com/gogo/protobuf/types"
-	"github.com/moby/locker"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"go4.org/syncutil/singleflight"
@@ -79,9 +77,8 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		waitEvents:     make(chan struct{}),
 		defaultLogMode: cfg.LogMode,
 		single:         &singleflight.Group{},
-		ttyMu:          locker.New(),
-		ttys:           make(map[string]net.Conn),
 		processes:      &processManager{ls: make(map[string]Process)},
+		units:          &unitManager{idx: make(map[string]Process)},
 		runc: &runc.Runc{
 			Debug:         debug,
 			Command:       runcPath,
@@ -101,10 +98,8 @@ type Service struct {
 
 	single *singleflight.Group
 
-	ttyMu *locker.Locker
-	ttys  map[string]net.Conn
-
 	processes *processManager
+	units     *unitManager
 
 	defaultLogMode options.LogMode
 
@@ -118,7 +113,7 @@ func (s *Service) Cleanup(ctx context.Context) (*taskapi.DeleteResponse, error) 
 }
 
 func unitName(ns, id string) string {
-	return "containerd-" + ns + "-" + id
+	return "containerd-" + ns + "-" + id + ".service"
 }
 
 func runcName(ns, id string) string {

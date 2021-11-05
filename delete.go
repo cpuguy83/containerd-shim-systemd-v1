@@ -23,7 +23,7 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 		return nil, errdefs.ToGRPC(err)
 	}
 
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns))
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns).WithField("execID", r.ExecID))
 	log.G(ctx).Info("systemd.Delete begin")
 	defer func() {
 		if retErr != nil {
@@ -37,7 +37,7 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s", r.ID)
 	}
 
-	var st *pState
+	var st pState
 	if r.ExecID != "" {
 		pInit := p.(*initProcess)
 		ep := pInit.execs.Get(r.ExecID)
@@ -49,12 +49,14 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 			return nil, errdefs.ToGRPC(err)
 		}
 		pInit.execs.Delete(r.ExecID)
+		s.units.Delete(ep)
 	} else {
 		st, err = p.Delete(ctx)
 		if err != nil {
 			return nil, errdefs.ToGRPC(err)
 		}
 		s.processes.Delete(path.Join(ns, r.ID))
+		s.units.Delete(p)
 	}
 
 	return &taskapi.DeleteResponse{
@@ -64,9 +66,7 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 	}, nil
 }
 
-func (p *initProcess) Delete(ctx context.Context) (*pState, error) {
-	name := unitName(p.ns, p.id) + ".service"
-
+func (p *initProcess) Delete(ctx context.Context) (pState, error) {
 	defer func() {
 		if err := mount.UnmountAll(filepath.Join(p.Bundle, "rootfs"), 0); err != nil {
 			log.G(ctx).WithError(err).Error("failed to cleanup rootfs mount")
@@ -76,40 +76,57 @@ func (p *initProcess) Delete(ctx context.Context) (*pState, error) {
 		}
 	}()
 
+	ch := make(chan *pState)
+	go func() {
+		ps, err := p.waitForExit(ctx)
+		if err != nil {
+			log.G(ctx).WithError(err).Error("waitForExit failed")
+			close(ch)
+			return
+		}
+		ch <- &ps
+	}()
+
 	if err := p.runc.Delete(ctx, runcName(p.ns, p.id), &runc.DeleteOpts{Force: true}); err != nil {
-		return nil, err
+		return pState{}, err
 	}
 
-	var st pState
-	if err := getUnitState(ctx, p.systemd, name, &st); err != nil {
-		log.G(ctx).WithError(err).Error("Error getting unit state")
-	} else {
-		ctx = log.WithLogger(ctx, log.G(ctx).WithField("statusCode", st.ExitCode))
+	var ps *pState
+	select {
+	case <-ctx.Done():
+		return pState{}, ctx.Err()
+	case ps = <-ch:
 	}
 
 	if p.Terminal {
-		p.systemd.KillUnitContext(ctx, unitName(p.ns, p.id+"-tty")+".service", 9)
+		p.systemd.KillUnitContext(ctx, unitName(p.ns, p.id+"-tty"), 9)
 	}
 
-	return &st, nil
+	p.mu.Lock()
+	p.deleted = true
+	p.cond.Broadcast()
+	p.mu.Unlock()
+
+	return *ps, nil
 }
 
 // TODO: It seems like the runc shim deletes the init process in this case
 // Here we are cleaning up the exec process, which is different, but seems more correct...
 // That said this may cause some unexpected behavior as related to the runc shim.
-func (p *execProcess) Delete(ctx context.Context) (*pState, error) {
-	name := unitName(p.ns, p.id) + ".service"
-	p.systemd.KillUnitWithTarget(ctx, name, dbus.Main, 9)
+func (p *execProcess) Delete(ctx context.Context) (pState, error) {
+	p.systemd.KillUnitWithTarget(ctx, p.Name(), dbus.Main, 9)
 
 	if p.Terminal {
-		ttyName := unitName(p.ns, p.id+"-tty") + ".service"
+		ttyName := unitName(p.ns, p.id+"-tty")
 		p.systemd.KillUnitWithTarget(ctx, ttyName, dbus.Main, 9)
 	}
 
-	var st pState
-	getUnitState(ctx, p.systemd, name, &st)
+	p.mu.Lock()
+	p.deleted = true
+	p.cond.Broadcast()
+	p.mu.Unlock()
 
 	p.parent.execs.Delete(p.execID)
 
-	return &st, nil
+	return p.ProcessState(), nil
 }

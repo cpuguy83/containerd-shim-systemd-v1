@@ -33,6 +33,9 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	log.G(ctx).Info("systemd.Create started")
 	defer func() {
 		log.G(ctx).WithError(retErr).Info("systemd.Create end")
+		if retErr != nil {
+			retErr = errdefs.ToGRPC(fmt.Errorf("delete: %w", retErr))
+		}
 	}()
 
 	var opts options.CreateOptions
@@ -72,12 +75,17 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	p.process.cond = sync.NewCond(&p.process.mu)
 
 	if err := s.processes.Add(path.Join(ns, r.ID), p); err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, err
 	}
+	s.units.Add(p)
 
 	defer func() {
 		if retErr != nil {
 			s.processes.Delete(path.Join(ns, r.ID))
+			s.units.Delete(p)
+			if _, err := p.Delete(ctx); err != nil {
+				log.G(ctx).WithError(err).Error("error cleaning up failed process")
+			}
 		}
 	}()
 
@@ -93,10 +101,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	pid, err := p.Create(ctx)
 	if err != nil {
-		if _, err := p.Delete(ctx); err != nil {
-			log.G(ctx).WithError(err).Error("error cleaning up failed process")
-		}
-		return nil, errdefs.ToGRPC(err)
+		return nil, err
 	}
 
 	s.send(ns, &eventsapi.TaskCreate{
@@ -148,10 +153,11 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 		}}
 	ep.process.cond = sync.NewCond(&ep.process.mu)
 	err = pInit.execs.Add(r.ExecID, ep)
-
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errdefs.ToGRPCf(err, "process %s", r.ExecID)
 	}
+	s.units.Add(ep)
+
 	s.send(ns, &eventsapi.TaskExecAdded{
 		ContainerID: pInit.id,
 		ExecID:      r.ExecID,
@@ -221,7 +227,7 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id strin
 		return 0, fmt.Errorf("%w: invalid log mode: %s", errdefs.ErrInvalidArgument, p.opts.LogMode)
 	}
 
-	name := unitName(p.ns, p.id) + ".service"
+	name := p.Name()
 	defer func() {
 		if retErr != nil {
 			p.systemd.StopUnitContext(ctx, name, "replace", nil)
@@ -235,6 +241,7 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id strin
 	_, err = p.systemd.StartTransientUnitContext(ctx, name, "replace", properties, chMain)
 	if err != nil {
 		if e := p.systemd.ResetFailedUnitContext(ctx, name); e == nil {
+			chMain = make(chan string, 1)
 			_, err2 := p.systemd.StartTransientUnitContext(ctx, name, "replace", properties, chMain)
 			if err2 == nil {
 				err = nil
@@ -251,6 +258,12 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id strin
 	case <-ctx.Done():
 	case status := <-chMain:
 		if status != "done" {
+			var ps pState
+			if err := getUnitState(ctx, p.systemd, name, &ps); err != nil {
+				log.G(ctx).WithError(err).Warn("Errring getting unit state")
+			} else {
+				p.SetState(ps)
+			}
 			return 0, fmt.Errorf("failed to start runc init: %s", status)
 		}
 	}
@@ -260,13 +273,9 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id strin
 		return 0, err
 	}
 
-	p.mu.Lock()
-	p.pid = pid.Value.Value().(uint32)
-	ret := p.pid
-	p.cond.Broadcast()
-	p.mu.Unlock()
-
-	return ret, nil
+	ps := pState{Pid: pid.Value.Value().(uint32)}
+	p.SetState(ps)
+	return ps.Pid, nil
 }
 
 // For init processes we start a unit immediately.
