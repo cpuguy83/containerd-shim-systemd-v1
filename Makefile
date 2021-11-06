@@ -15,7 +15,7 @@ ifeq ($(ALL), 1)
 install: build
 	sudo $(prog) uninstall || true
 	sudo $(INSTALL) bin/* $(PREFIX)/bin
-	sudo $(prog) install --debug
+	sudo $(prog) install --debug $(TRACEFLAGS)
 else
 install:
 	$(INSTALL) bin/* $(PREFIX)/bin

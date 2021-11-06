@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path"
@@ -126,9 +128,20 @@ func main() {
 
 	flags := flag.NewFlagSet(rootFlags.Name()+" "+rootFlags.Arg(0), flag.ContinueOnError)
 
+	traceCfg := TraceFlags(flags)
+
 	commands := map[string]func(context.Context) error{
 		"install": func(ctx context.Context) error {
-			return install(ctx, root, address, ttrpcAddr, socket, debug, options.LogMode(options.LogMode_value[strings.ToUpper(logMode)]))
+			cfg := installConfig{
+				Root:      root,
+				Addr:      address,
+				TTRPCAddr: ttrpcAddr,
+				Debug:     debug,
+				Socket:    socket,
+				LogMode:   options.LogMode(options.LogMode_value[strings.ToUpper(logMode)]),
+				Trace:     *traceCfg,
+			}
+			return install(ctx, cfg)
 		},
 		"uninstall": uninstall,
 		"delete": func(ctx context.Context) error {
@@ -153,6 +166,12 @@ func main() {
 			return err
 		},
 		"serve": func(ctx context.Context) error {
+			done, err := ConfigureTracing(ctx, traceCfg)
+			if err != nil {
+				return err
+			}
+			defer done(ctx)
+
 			publisher, err := shim.NewPublisher(ttrpcAddr)
 			if err != nil {
 				return err
@@ -238,6 +257,14 @@ func main() {
 
 func serve(ctx context.Context, cfg Config) error {
 	log.G(ctx).Info("Starting...")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/profile", pprof.Profile)
+	go func() {
+		if err := http.ListenAndServe("127.0.0.1:8089", mux); err != nil {
+			log.G(ctx).WithError(err).Fatal("ListenAndServe")
+		}
+	}()
 
 	shm, err := New(ctx, cfg)
 	if err != nil {

@@ -18,6 +18,8 @@ import (
 	dbus "github.com/godbus/dbus/v5"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"golang.org/x/sys/unix"
 )
 
@@ -239,6 +241,14 @@ func (p *process) ttySockPath() string {
 }
 
 func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
+	ctx, span := StartSpan(ctx, "process.StartTTY")
+	defer func() {
+		if retErr != nil {
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.End()
+	}()
+
 	sockPath := p.ttySockPath()
 
 	properties := []systemd.Property{
@@ -279,6 +289,7 @@ func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
 	select {
 	case <-ctx.Done():
 	case status := <-chTTY:
+		span.SetAttributes(attribute.String("tty-unit-stats", status))
 		if status != "done" {
 			return "", "", fmt.Errorf("failed to start tty service: %s", status)
 		}

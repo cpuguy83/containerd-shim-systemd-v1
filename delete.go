@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -14,6 +13,9 @@ import (
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
 	"github.com/coreos/go-systemd/v22/dbus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Delete a process or container
@@ -23,14 +25,16 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 		return nil, errdefs.ToGRPC(err)
 	}
 
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns).WithField("execID", r.ExecID))
-	log.G(ctx).Info("systemd.Delete begin")
+	ctx, span := StartSpan(ctx, "service.Delete", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
 	defer func() {
 		if retErr != nil {
-			retErr = fmt.Errorf("delete: %w", err)
+			retErr = errdefs.ToGRPCf(retErr, "delete")
+			span.SetStatus(codes.Error, retErr.Error())
 		}
-		log.G(ctx).WithError(retErr).Info("systemd.Delete end")
+		span.End()
 	}()
+
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns).WithField("execID", r.ExecID))
 
 	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {
@@ -66,7 +70,22 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 	}, nil
 }
 
-func (p *initProcess) Delete(ctx context.Context) (pState, error) {
+func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error) {
+	ctx, span := StartSpan(ctx, "InitProcess.Delete")
+	defer func() {
+		if retErr != nil {
+			retErr = errdefs.ToGRPCf(retErr, "delete")
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.SetAttributes(
+			attribute.Int("pid", int(retState.Pid)),
+			attribute.Int("exitCode", int(retState.ExitCode)),
+			attribute.String("unitStatus", retState.Status),
+			attribute.Stringer("exitedAt", retState.ExitedAt),
+		)
+		span.End()
+	}()
+
 	defer func() {
 		if err := mount.UnmountAll(filepath.Join(p.Bundle, "rootfs"), 0); err != nil {
 			log.G(ctx).WithError(err).Error("failed to cleanup rootfs mount")
@@ -76,26 +95,13 @@ func (p *initProcess) Delete(ctx context.Context) (pState, error) {
 		}
 	}()
 
-	ch := make(chan *pState)
-	go func() {
-		ps, err := p.waitForExit(ctx)
-		if err != nil {
-			log.G(ctx).WithError(err).Error("waitForExit failed")
-			close(ch)
-			return
-		}
-		ch <- &ps
-	}()
-
 	if err := p.runc.Delete(ctx, runcName(p.ns, p.id), &runc.DeleteOpts{Force: true}); err != nil {
 		return pState{}, err
 	}
 
-	var ps *pState
-	select {
-	case <-ctx.Done():
-		return pState{}, ctx.Err()
-	case ps = <-ch:
+	ps, err := p.waitForExit(ctx)
+	if err != nil {
+		return pState{}, err
 	}
 
 	if p.Terminal {
@@ -107,13 +113,27 @@ func (p *initProcess) Delete(ctx context.Context) (pState, error) {
 	p.cond.Broadcast()
 	p.mu.Unlock()
 
-	return *ps, nil
+	return ps, nil
 }
 
 // TODO: It seems like the runc shim deletes the init process in this case
 // Here we are cleaning up the exec process, which is different, but seems more correct...
 // That said this may cause some unexpected behavior as related to the runc shim.
-func (p *execProcess) Delete(ctx context.Context) (pState, error) {
+func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error) {
+	ctx, span := StartSpan(ctx, "ExecProcess.Delete")
+	defer func() {
+		if retErr != nil {
+			retErr = errdefs.ToGRPCf(retErr, "delete")
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.SetAttributes(
+			attribute.Int("pid", int(retState.Pid)),
+			attribute.Int("exitCode", int(retState.ExitCode)),
+			attribute.String("unitStatus", retState.Status),
+			attribute.Stringer("exitedAt", retState.ExitedAt),
+		)
+		span.End()
+	}()
 	p.systemd.KillUnitWithTarget(ctx, p.Name(), dbus.Main, 9)
 
 	if p.Terminal {

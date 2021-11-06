@@ -19,6 +19,9 @@ import (
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	dbus "github.com/godbus/dbus/v5"
 	ptypes "github.com/gogo/protobuf/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Create a new container
@@ -28,15 +31,16 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		return nil, errdefs.ToGRPC(err)
 	}
 
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns))
-
-	log.G(ctx).Info("systemd.Create started")
+	ctx, span := StartSpan(ctx, "service.Create", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID)))
 	defer func() {
-		log.G(ctx).WithError(retErr).Info("systemd.Create end")
 		if retErr != nil {
-			retErr = errdefs.ToGRPC(fmt.Errorf("delete: %w", retErr))
+			retErr = errdefs.ToGRPCf(retErr, "create")
+			span.SetStatus(codes.Error, retErr.Error())
 		}
+		span.End()
 	}()
+
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns))
 
 	var opts options.CreateOptions
 	if r.Options != nil {
@@ -127,6 +131,15 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 		return nil, errdefs.ToGRPC(err)
 	}
 
+	ctx, span := StartSpan(ctx, "service.Exec", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
+	defer func() {
+		if retErr != nil {
+			retErr = errdefs.ToGRPCf(retErr, "exec")
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.End()
+	}()
+
 	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {
 		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
@@ -166,6 +179,14 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 }
 
 func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id string) (_ uint32, retErr error) {
+	ctx, span := StartSpan(ctx, "process.StartUnit")
+	defer func() {
+		if retErr != nil {
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.End()
+	}()
+
 	execStart, err := p.runcCmd(cmd)
 	if err != nil {
 		return 0, err
@@ -284,6 +305,14 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id strin
 //
 // TODO: checkpoint support
 func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
+	ctx, span := StartSpan(ctx, "InitProcess.Create")
+	defer func() {
+		if retErr != nil {
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.End()
+	}()
+
 	if len(p.Rootfs) > 0 {
 		var mounts []mount.Mount
 		for _, m := range p.Rootfs {

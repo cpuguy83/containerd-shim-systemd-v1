@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"path"
 	"time"
 
@@ -12,6 +11,9 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/coreos/go-systemd/v22/dbus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func (s *Service) watchUnits(ctx context.Context) error {
@@ -26,17 +28,26 @@ func (s *Service) watchUnits(ctx context.Context) error {
 			case err := <-errs:
 				log.G(ctx).WithError(err).Error("error while watching for unit state updates")
 			case u := <-updates:
+
 				p := s.units.Get(u.UnitName)
 				if p == nil {
 					continue
 				}
+
+				ctx, span := StartSpan(ctx, "service.watchUnits.GetSubState", trace.WithAttributes(
+					attribute.String("unit", u.UnitName),
+				))
+
 				if err := getUnitState(ctx, s.conn, u.UnitName, &st); err != nil {
 					log.G(ctx).WithError(err).Warn("Error getting unit state")
+					span.SetStatus(codes.Error, err.Error())
+					span.End()
 					continue
 				}
 				p.SetState(st)
 				log.G(ctx).WithField("unit", u.UnitName).WithField("substate", u.SubState).Debugf("%+v", p.ProcessState())
 				st.Reset()
+				span.End()
 			}
 		}
 	}()
@@ -52,15 +63,16 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 		return nil, errdefs.ToGRPC(err)
 	}
 
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns).WithField("execID", r.ExecID))
-
-	log.G(ctx).Info("systemd.State")
+	ctx, span := StartSpan(ctx, "service.State", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
 	defer func() {
-		log.G(ctx).WithError(retErr).Info("systemd.State end")
 		if retErr != nil {
-			retErr = errdefs.ToGRPC(fmt.Errorf("state: %w", retErr))
+			retErr = errdefs.ToGRPCf(retErr, "state")
+			span.SetStatus(codes.Error, retErr.Error())
 		}
+		span.End()
 	}()
+
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns).WithField("execID", r.ExecID))
 
 	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {

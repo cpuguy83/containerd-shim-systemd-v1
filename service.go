@@ -23,7 +23,7 @@ const (
 )
 
 func newService(ts shimapi.TaskService) (*service, error) {
-	s, err := ttrpc.NewServer(ttrpc.WithServerHandshaker(ttrpc.UnixSocketRequireSameUser()))
+	s, err := ttrpc.NewServer(ttrpc.WithServerHandshaker(ttrpc.UnixSocketRequireSameUser()), ttrpc.WithUnaryServerInterceptor(traceInterceptor))
 	if err != nil {
 		return nil, err
 	}
@@ -49,14 +49,14 @@ func (s *service) Close() error {
 	return s.srv.Close()
 }
 
-func serviceUnit(exe string, root, addr, ttrpcAddr string, debug bool, logMode options.LogMode) string {
+func serviceUnit(exe string, cfg installConfig) string {
 	return `
 [Unit]
 Description=containerd shim service that uses systemd to manage containers
 
 [Service]
 Type=notify
-ExecStart=` + exe + ` --address=` + addr + ` serve` + ` --ttrpc-address=` + ttrpcAddr + ` --debug=` + strconv.FormatBool(debug) + ` --root=` + root + ` --log-mode=` + strings.ToLower(logMode.String()) + `
+ExecStart=` + exe + ` --address=` + cfg.Addr + ` serve` + ` --ttrpc-address=` + cfg.TTRPCAddr + ` --debug=` + strconv.FormatBool(cfg.Debug) + ` --root=` + cfg.Root + ` --log-mode=` + strings.ToLower(cfg.LogMode.String()) + ` ` + cfg.Trace.StringFlags() + `
 `
 }
 
@@ -76,7 +76,17 @@ PassSecurity=yes
 `
 }
 
-func install(ctx context.Context, root, addr, ttrpcAddr, socket string, debug bool, logMode options.LogMode) error {
+type installConfig struct {
+	Trace     TraceConfig
+	Root      string
+	Addr      string
+	TTRPCAddr string
+	Debug     bool
+	LogMode   options.LogMode
+	Socket    string
+}
+
+func install(ctx context.Context, cfg installConfig) error {
 	conn, err := dbus.NewSystemdConnectionContext(ctx)
 	if err != nil {
 		return err
@@ -88,12 +98,12 @@ func install(ctx context.Context, root, addr, ttrpcAddr, socket string, debug bo
 		return err
 	}
 
-	err = os.WriteFile("/etc/systemd/system/"+serviceName+".service", []byte(serviceUnit(exe, root, addr, ttrpcAddr, debug, logMode)), 0644)
+	os.WriteFile("/etc/systemd/system/"+serviceName+".service", []byte(serviceUnit(exe, cfg)), 0644)
 	if err != nil {
 		return err
 	}
 
-	err = os.WriteFile("/etc/systemd/system/"+serviceName+".socket", []byte(socketUnit(socket)), 0644)
+	err = os.WriteFile("/etc/systemd/system/"+serviceName+".socket", []byte(socketUnit(cfg.Socket)), 0644)
 	if err != nil {
 		os.RemoveAll("/etc/systemd/system/" + serviceName + ".service")
 		return err

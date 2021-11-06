@@ -19,6 +19,8 @@ import (
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	ptypes "github.com/gogo/protobuf/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type processManager struct {
@@ -175,7 +177,17 @@ type initProcess struct {
 	execs *processManager
 }
 
-func (p *initProcess) Start(ctx context.Context) (uint32, error) {
+func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
+	ctx, span := StartSpan(ctx, "InitProcess.Start")
+	defer func() {
+		if retErr != nil {
+			retErr = errdefs.ToGRPCf(retErr, "start")
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.SetAttributes(attribute.Int("pid", int(pid)))
+		span.End()
+	}()
+
 	if err := p.runc.Start(ctx, runcName(p.ns, p.id)); err != nil {
 		return 0, err
 	}
@@ -191,7 +203,17 @@ type execProcess struct {
 	execID string
 }
 
-func (p *execProcess) Start(ctx context.Context) (uint32, error) {
+func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
+	ctx, span := StartSpan(ctx, "InitProcess.Start")
+	defer func() {
+		if retErr != nil {
+			retErr = errdefs.ToGRPCf(retErr, "start")
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.SetAttributes(attribute.Int("pid", int(pid)))
+		span.End()
+	}()
+
 	f, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), p.id+"process-json")
 	if err != nil {
 		return 0, fmt.Errorf("error creating process.json file: %w", err)
@@ -209,7 +231,7 @@ func (p *execProcess) Start(ctx context.Context) (uint32, error) {
 		execStart = append(execStart, "-t")
 	}
 
-	pid, err := p.startUnit(ctx, execStart, pidFile, runcName(p.ns, p.parent.id))
+	pid, err = p.startUnit(ctx, execStart, pidFile, runcName(p.ns, p.parent.id))
 	if err != nil {
 		if _, err := p.Delete(ctx); err != nil {
 			log.G(ctx).WithError(err).Warn("Error cleaning up after failed exec start")

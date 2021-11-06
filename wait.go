@@ -10,6 +10,9 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Wait for a process to exit
@@ -18,6 +21,16 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
+
+	ctx, span := StartSpan(ctx, "service.Wait", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
+	defer func() {
+		if retErr != nil {
+			retErr = errdefs.ToGRPCf(retErr, "wait")
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.End()
+	}()
+
 	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(logrus.Fields{
 		"id":        r.ID,
 		"ns":        ns,
