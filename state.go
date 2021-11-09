@@ -16,43 +16,96 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-func (s *Service) watchUnits(ctx context.Context) error {
-	updates := make(chan *dbus.SubStateUpdate, 100)
-	errs := make(chan error, 100)
-	go func() {
-		var st pState
-		for {
+// Watch periodically polls systemd for status updates of units being tracked.
+//
+// We are polling instead of watching for systemd events b/c the events seem to trigger a library bug
+// where we end up getting bombarded with events at a rediculous rate, causing huge amounts of CPU usage.
+// Until that gets figured out, we need to keep using polling.
+func (m *unitManager) Watch(ctx context.Context) {
+	filterFn := func(p Process) bool {
+		return p.ProcessState().ExitedAt.After(timeZero)
+	}
+
+	var st pState
+
+	for {
+		m.mu.Lock()
+		for len(m.idx) == 0 {
 			select {
 			case <-ctx.Done():
+				m.mu.Unlock()
+				log.G(ctx).WithError(ctx.Err()).Info("Exiting unit watch loop")
 				return
-			case err := <-errs:
-				log.G(ctx).WithError(err).Error("error while watching for unit state updates")
-			case u := <-updates:
-
-				p := s.units.Get(u.UnitName)
-				if p == nil {
-					continue
-				}
-
-				ctx, span := StartSpan(ctx, "service.watchUnits.GetSubState", trace.WithAttributes(
-					attribute.String("unit", u.UnitName),
-				))
-
-				if err := getUnitState(ctx, s.conn, u.UnitName, &st); err != nil {
-					log.G(ctx).WithError(err).Warn("Error getting unit state")
-					span.SetStatus(codes.Error, err.Error())
-					span.End()
-					continue
-				}
-				p.SetState(st)
-				log.G(ctx).WithField("unit", u.UnitName).WithField("substate", u.SubState).Debugf("%+v", p.ProcessState())
-				st.Reset()
-				span.End()
+			default:
 			}
+			m.cond.Wait()
 		}
-	}()
+		m.mu.Unlock()
 
-	s.conn.SetSubStateSubscriber(updates, errs)
+		select {
+		case <-ctx.Done():
+			log.G(ctx).WithError(ctx.Err()).Info("Exiting unit watch loop")
+			return
+		default:
+		}
+
+		units, err := m.sd.ListUnitsByNamesContext(ctx, m.Keys(filterFn))
+		if err != nil {
+			log.G(ctx).WithError(err).Error("Error while watching unit statuses")
+		}
+
+		for _, unit := range units {
+			p := m.Get(unit.Name)
+			if p == nil {
+				log.G(ctx).Debugf("Skipping unit status update for unknown unit: %s", p)
+				continue
+			}
+
+			state := p.ProcessState()
+			if state.Status == "running" && unit.SubState == "running" {
+				continue
+			}
+
+			if state.ExitedAt.After(timeZero) {
+				// Process is already exited, we don't care about state updates on this unit anymore
+				continue
+			}
+
+			log.G(ctx).Debugf("Getting unit state for %s", unit.Name)
+			if err := getUnitState(ctx, m.sd, p.Name(), &st); err != nil {
+				log.G(ctx).WithError(err).WithField("unit", p.Name()).Warn("Error getting unit state")
+				st.Reset()
+				continue
+			}
+
+			p.SetState(st)
+			st.Reset()
+		}
+
+		select {
+		case <-ctx.Done():
+			log.G(ctx).WithError(ctx.Err()).Info("Exiting unit watch loop")
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (m *unitManager) Keys(filter func(p Process) bool) []string {
+	m.mu.Lock()
+	keys := make([]string, 0, len(m.idx))
+	for k, p := range m.idx {
+		if filter(p) {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	m.mu.Unlock()
+	return keys
+}
+
+func (s *Service) watchUnits(ctx context.Context) error {
+	go s.units.Watch(ctx)
 	return nil
 }
 

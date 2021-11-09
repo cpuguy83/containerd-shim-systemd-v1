@@ -28,14 +28,23 @@ type processManager struct {
 	ls map[string]Process
 }
 
+func newUnitManager(conn *systemd.Conn) *unitManager {
+	um := &unitManager{idx: make(map[string]Process), sd: conn}
+	um.cond = sync.NewCond(&um.mu)
+	return um
+}
+
 type unitManager struct {
-	mu  sync.Mutex
-	idx map[string]Process
+	sd   *systemd.Conn
+	mu   sync.Mutex
+	cond *sync.Cond
+	idx  map[string]Process
 }
 
 func (m *unitManager) Add(p Process) {
 	m.mu.Lock()
 	m.idx[p.Name()] = p
+	m.cond.Signal()
 	m.mu.Unlock()
 }
 
