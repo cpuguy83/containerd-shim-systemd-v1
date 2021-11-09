@@ -30,8 +30,11 @@ type eventEnvelope struct {
 	e  interface{}
 }
 
-func (s *Service) send(ns string, e interface{}) {
-	s.events <- eventEnvelope{ns, e}
+func (s *Service) send(ctx context.Context, ns string, e interface{}) {
+	select {
+	case <-ctx.Done():
+	case s.events <- eventEnvelope{ns, e}:
+	}
 }
 
 // GetTopic converts an event from an interface type to the specific

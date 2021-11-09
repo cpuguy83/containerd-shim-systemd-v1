@@ -66,7 +66,7 @@ func (m *unitManager) Watch(ctx context.Context) {
 				continue
 			}
 
-			if state.ExitedAt.After(timeZero) {
+			if state.Exited() {
 				// Process is already exited, we don't care about state updates on this unit anymore
 				continue
 			}
@@ -78,7 +78,8 @@ func (m *unitManager) Watch(ctx context.Context) {
 				continue
 			}
 
-			p.SetState(st)
+			p.SetState(ctx, st)
+
 			st.Reset()
 		}
 
@@ -255,6 +256,10 @@ func (s *pState) Reset() {
 	s.ExitCode = 0
 	s.Pid = 0
 	s.Status = ""
+}
+
+func (s pState) Exited() bool {
+	return s.ExitedAt.After(timeZero)
 }
 
 // CopyTo copies the state to the provided destination.

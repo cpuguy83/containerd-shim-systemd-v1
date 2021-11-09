@@ -80,7 +80,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		defaultLogMode: cfg.LogMode,
 		single:         &singleflight.Group{},
 		processes:      &processManager{ls: make(map[string]Process)},
-		units:          &unitManager{idx: make(map[string]Process)},
+		units:          newUnitManager(conn),
 		runc: &runc.Runc{
 			Debug:         debug,
 			Command:       runcPath,
@@ -152,7 +152,7 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 		if err != nil {
 			return nil, errdefs.ToGRPC(err)
 		}
-		s.send(ns, &eventsapi.TaskExecStarted{
+		s.send(ctx, ns, &eventsapi.TaskExecStarted{
 			ContainerID: r.ID,
 			ExecID:      r.ExecID,
 			Pid:         pid,
@@ -162,7 +162,7 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 		if err != nil {
 			return nil, errdefs.ToGRPC(err)
 		}
-		s.send(ns, &eventsapi.TaskStart{
+		s.send(ctx, ns, &eventsapi.TaskStart{
 			ContainerID: r.ID,
 			Pid:         pid,
 		})

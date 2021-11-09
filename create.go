@@ -108,7 +108,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		return nil, err
 	}
 
-	s.send(ns, &eventsapi.TaskCreate{
+	s.send(ctx, ns, &eventsapi.TaskCreate{
 		ContainerID: r.ID,
 		Bundle:      r.Bundle,
 		Rootfs:      r.Rootfs,
@@ -171,7 +171,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 	}
 	s.units.Add(ep)
 
-	s.send(ns, &eventsapi.TaskExecAdded{
+	s.send(ctx, ns, &eventsapi.TaskExecAdded{
 		ContainerID: pInit.id,
 		ExecID:      r.ExecID,
 	})
@@ -295,7 +295,7 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id strin
 	}
 
 	ps := pState{Pid: pid.Value.Value().(uint32)}
-	p.SetState(ps)
+	p.SetState(ctx, ps)
 	return ps.Pid, nil
 }
 

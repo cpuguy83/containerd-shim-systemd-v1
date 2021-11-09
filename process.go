@@ -35,10 +35,11 @@ func newUnitManager(conn *systemd.Conn) *unitManager {
 }
 
 type unitManager struct {
-	sd   *systemd.Conn
-	mu   sync.Mutex
-	cond *sync.Cond
-	idx  map[string]Process
+	sd        *systemd.Conn
+	mu        sync.Mutex
+	cond      *sync.Cond
+	sendEvent func(context.Context, string, interface{})
+	idx       map[string]Process
 }
 
 func (m *unitManager) Add(p Process) {
@@ -96,7 +97,7 @@ type Process interface {
 	Kill(context.Context, int, bool) error
 	Pid() uint32
 	Name() string
-	SetState(state pState)
+	SetState(context.Context, pState)
 	ProcessState() pState
 }
 
@@ -132,18 +133,14 @@ func (p *process) ProcessState() pState {
 	return st
 }
 
-func (p *process) SetState(state pState) {
+func (p *process) SetState(ctx context.Context, state pState) {
 	p.mu.Lock()
-	p.doSetState(state)
-	p.mu.Unlock()
-}
-
-func (p *process) doSetState(state pState) {
 	state.CopyTo(&p.state)
-	if p.state.Pid > 0 && p.state.Status == "dead" && !p.state.ExitedAt.After(timeZero) {
+	if p.state.Pid > 0 && p.state.Status == "dead" && !p.state.Exited() {
 		p.state.ExitedAt = time.Now()
 	}
 	p.cond.Broadcast()
+	p.mu.Unlock()
 }
 
 func (p *process) Name() string {
@@ -184,6 +181,8 @@ type initProcess struct {
 	parentCheckpoint string
 
 	execs *processManager
+
+	sendEvent func(ctx context.Context, ns string, evt interface{})
 }
 
 func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
@@ -201,8 +200,20 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		return 0, err
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.state.Pid, nil
+
+func (p *initProcess) SetState(ctx context.Context, state pState) {
+	p.process.SetState(ctx, state)
+
+	st := p.ProcessState()
+	if st.Exited() {
+		p.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
+			ContainerID: p.id,
+			ID:          p.id,
+			ExitStatus:  st.ExitCode,
+			ExitedAt:    st.ExitedAt,
+			Pid:         st.Pid,
+		})
+	}
 }
 
 type execProcess struct {
@@ -248,4 +259,19 @@ func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		return 0, err
 	}
 	return pid, nil
+}
+
+func (p *execProcess) SetState(ctx context.Context, state pState) {
+	p.process.SetState(ctx, state)
+
+	st := p.ProcessState()
+	if st.Exited() {
+		p.parent.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
+			ContainerID: p.parent.id,
+			ID:          p.execID,
+			ExitStatus:  st.ExitCode,
+			ExitedAt:    st.ExitedAt,
+			Pid:         st.Pid,
+		})
+	}
 }
