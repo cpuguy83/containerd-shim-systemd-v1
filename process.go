@@ -224,7 +224,7 @@ type execProcess struct {
 }
 
 func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
-	ctx, span := StartSpan(ctx, "InitProcess.Start")
+	ctx, span := StartSpan(ctx, "ExecProcess.Start")
 	defer func() {
 		if retErr != nil {
 			retErr = errdefs.ToGRPCf(retErr, "start")
