@@ -27,6 +27,7 @@ import (
 	"syscall"
 
 	"github.com/containerd/containerd/defaults"
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
@@ -145,21 +146,38 @@ func main() {
 		},
 		"uninstall": uninstall,
 		"delete": func(ctx context.Context) error {
+			var (
+				resp *taskapi.DeleteResponse
+				err  error
+			)
 			if bundle != "" {
 				defer func() {
 					mount.UnmountAll(filepath.Join(bundle, "rootfs"), unix.MNT_DETACH)
 					os.RemoveAll(bundle)
 				}()
+
 				svc, err := New(ctx, Config{Root: root})
 				if err == nil {
 					ctx = namespaces.WithNamespace(ctx, namespace)
-					svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
+					resp, err = svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
 				} else {
 					(&runc.Runc{}).Delete(ctx, id, &runc.DeleteOpts{Force: true})
-					svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
+					resp, err = svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
+				}
+				if err != nil && !errdefs.IsNotFound(errdefs.FromGRPC(err)) {
+					return err
 				}
 			}
-			return proto.MarshalText(os.Stdout, &taskapi.DeleteResponse{})
+
+			if resp == nil {
+				resp = &taskapi.DeleteResponse{}
+			}
+			data, err := proto.Marshal(resp)
+			if err != nil {
+				return err
+			}
+			_, err = os.Stdout.Write(data)
+			return err
 		},
 		"start": func(ctx context.Context) error {
 			_, err := os.Stdout.WriteString("unix:///" + socket)
@@ -183,6 +201,56 @@ func main() {
 				LogMode:   options.LogMode(options.LogMode_value[strings.ToUpper(logMode)]),
 			}
 			return serve(ctx, opts)
+		},
+		"create": func(ctx context.Context) (retErr error) {
+			runtime.LockOSThread()
+
+			data, err := os.ReadFile(os.Getenv("CREATE_TASK_CONFIG"))
+			if err != nil {
+				return fmt.Errorf("error reading task config stream")
+			}
+
+			var create taskapi.CreateTaskRequest
+			if err := proto.Unmarshal(data, &create); err != nil {
+				return fmt.Errorf("error unmarshaling task config data")
+			}
+			if len(create.Rootfs) > 0 {
+				// This is pretty much the whole reason we have this special subcommand.
+				// We want to prevent this mount from escaping to the host mount namespace.
+				// First, create a new mount ns, then we remount the host rootfs with our own propagation.
+				if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
+					return err
+				}
+
+				// Note: Do not use private mount propagation here, otherwise we'll prevent unmounts for stuff we don't care about on the host.
+				if err := unix.Mount("", "/", "", unix.MS_SLAVE|unix.MS_REC, ""); err != nil {
+					return err
+				}
+
+				var mounts []mount.Mount
+				for _, m := range create.Rootfs {
+					mounts = append(mounts, mount.Mount{
+						Type:    m.Type,
+						Source:  m.Source,
+						Options: m.Options,
+					})
+				}
+
+				rootfs := filepath.Join(create.Bundle, "rootfs")
+				if err := os.Mkdir(rootfs, 0700); err != nil && !os.IsExist(err) {
+					return fmt.Errorf("error creating rootfs dir: %w", err)
+				}
+				if err := mount.All(mounts, rootfs); err != nil {
+					return fmt.Errorf("error mounting rootfs: %w", err)
+				}
+				defer func() {
+					if retErr != nil {
+						mount.UnmountAll(rootfs, 0)
+					}
+				}()
+			}
+
+			return syscall.Exec(os.Args[2], os.Args[2:], nil)
 		},
 	}
 

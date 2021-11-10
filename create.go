@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -11,7 +12,6 @@ import (
 	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/typeurl"
@@ -19,6 +19,7 @@ import (
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	dbus "github.com/godbus/dbus/v5"
 	ptypes "github.com/gogo/protobuf/types"
+	"github.com/golang/protobuf/proto"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -179,7 +180,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 	return &ptypes.Empty{}, nil
 }
 
-func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id string) (_ uint32, retErr error) {
+func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFile, id string, extraEnvs []string) (_ uint32, retErr error) {
 	ctx, span := StartSpan(ctx, "process.StartUnit")
 	defer func() {
 		if retErr != nil {
@@ -192,6 +193,9 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id strin
 	if err != nil {
 		return 0, err
 	}
+	if len(prefixCmd) > 0 {
+		execStart = append(prefixCmd, execStart...)
+	}
 	var properties []systemd.Property
 	if p.opts.SdNotifyEnable {
 		properties = []systemd.Property{systemd.PropType("notify")}
@@ -203,6 +207,11 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id strin
 				{Name: "PIDFile", Value: dbus.MakeVariant(pidFile)},
 			}
 		}
+	}
+
+	properties = append(properties, systemd.Property{Name: "Delegate", Value: dbus.MakeVariant(true)})
+	if len(extraEnvs) > 0 {
+		properties = append(properties, systemd.Property{Name: "Environment", Value: dbus.MakeVariant(extraEnvs)})
 	}
 
 	if p.Terminal {
@@ -314,32 +323,27 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 		span.End()
 	}()
 
-	if len(p.Rootfs) > 0 {
-		var mounts []mount.Mount
-		for _, m := range p.Rootfs {
-			mounts = append(mounts, mount.Mount{
-				Type:    m.Type,
-				Source:  m.Source,
-				Options: m.Options,
-			})
-		}
-
-		rootfs := filepath.Join(p.Bundle, "rootfs")
-		if err := os.Mkdir(rootfs, 0700); err != nil && !os.IsExist(err) {
-			return 0, err
-		}
-		if err := mount.All(mounts, rootfs); err != nil {
-			return 0, err
-		}
-		defer func() {
-			if retErr != nil {
-				mount.UnmountAll(rootfs, 0)
-			}
-		}()
-	}
-
 	execStart := []string{"create", "--bundle=" + p.Bundle}
 
+	f, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), p.id+"-task-config")
+	if err != nil {
+		return 0, fmt.Errorf("error creating task config temp file: %w", err)
+	}
+	defer func() {
+		f.Close()
+		os.RemoveAll(f.Name())
+	}()
+
+	req := taskapi.CreateTaskRequest{Bundle: p.Bundle, Rootfs: p.Rootfs}
+	data, err := proto.Marshal(&req)
+	if err != nil {
+		return 0, fmt.Errorf("error marshaling task create config")
+	}
+
+	if _, err := f.Write(data); err != nil {
+		return 0, fmt.Errorf("error writing task create config to file")
+	}
+
 	pidFile := filepath.Join(p.root, "pid")
-	return p.startUnit(ctx, execStart, pidFile, runcName(p.ns, p.id))
+	return p.startUnit(ctx, []string{p.exe, "create"}, execStart, pidFile, runcName(p.ns, p.id), []string{"CREATE_TASK_CONFIG=" + f.Name()})
 }

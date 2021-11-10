@@ -255,7 +255,7 @@ func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		execStart = append(execStart, "-t")
 	}
 
-	pid, err = p.startUnit(ctx, execStart, pidFile, runcName(p.ns, p.parent.id))
+	pid, err = p.startUnit(ctx, nil, execStart, pidFile, runcName(p.ns, p.parent.id), nil)
 	if err != nil {
 		if _, err := p.Delete(ctx); err != nil {
 			log.G(ctx).WithError(err).Warn("Error cleaning up after failed exec start")
