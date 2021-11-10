@@ -72,6 +72,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		Rootfs:           r.Rootfs,
 		checkpoint:       r.Checkpoint,
 		parentCheckpoint: r.ParentCheckpoint,
+		sendEvent:        s.send,
 		execs: &processManager{
 			ls: make(map[string]Process),
 		},
@@ -283,7 +284,7 @@ func (p *process) startUnit(ctx context.Context, cmd []string, pidFile, id strin
 			if err := getUnitState(ctx, p.systemd, name, &ps); err != nil {
 				log.G(ctx).WithError(err).Warn("Errring getting unit state")
 			} else {
-				p.SetState(ps)
+				p.SetState(ctx, ps)
 			}
 			return 0, fmt.Errorf("failed to start runc init: %s", status)
 		}

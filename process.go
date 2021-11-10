@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
@@ -189,7 +190,6 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	ctx, span := StartSpan(ctx, "InitProcess.Start")
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "start")
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.SetAttributes(attribute.Int("pid", int(pid)))
@@ -197,9 +197,13 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	}()
 
 	if err := p.runc.Start(ctx, runcName(p.ns, p.id)); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("runc start: %w", err)
 	}
 	p.mu.Lock()
+	pid = p.state.Pid
+	p.mu.Unlock()
+	return pid, nil
+}
 
 func (p *initProcess) SetState(ctx context.Context, state pState) {
 	p.process.SetState(ctx, state)
