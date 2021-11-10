@@ -1,0 +1,52 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+jobs:
+  integration:
+    runs-on: ubuntu-18.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: src/github.com/cpuguy83/containerd-shim-systemd/v1
+    steps:
+      - uses: actions/setup-go@v2
+        with:
+          go-version: '1.17.3'
+      - uses: actions/checkout@v2
+        with:
+          path: src/github.com/cpuguy83/containerd-shim-systemd/v1
+      - uses: actions/checkout@v2
+        with:
+          path: src/github.com/containerd/containerd
+          repository: containerd/containerd
+          ref: v1.6.0-beta.1
+      - name: get containerd
+        run: |
+            set -ex
+            curl -SLf https://github.com/containerd/containerd/releases/download/v${VERSION}/containerd-${VERSION}-linux-amd64.tar.gz | tar -xvz
+            sudo systemctl stop containerd
+            cd bin
+            for i in *; do sudo mv $i $(command -v $i); done
+            sudo systemctl start containerd
+        env:
+          VERSION: 1.6.0-beta.1
+      - name: install
+        run: make install ALL=1
+      - name: test
+        run: |
+          export GOPATH=${GITHUB_WORKSPACE}
+          cd "${GITHUB_WORKSPACE}/src/github.com/containerd/containerd"
+          sudo -E EXTRA_TESTFLAGS=${EXTRA_TESTFLAGS} -E PATH=${PATH} make integration
+        env:
+          TEST_RUNTIME: io.containerd.systemd.v1
+          RUNC_FLAVOR: runc
+          EXTRA_TESTLAGS: "-no-criu"
+      - name: debug
+        if: ${{ failure() }}
+        run: |
+          sudo journalctl --system -u containerd-shim-systemd-v1
