@@ -23,7 +23,7 @@ const (
 )
 
 func newService(ts shimapi.TaskService) (*service, error) {
-	s, err := ttrpc.NewServer(ttrpc.WithServerHandshaker(ttrpc.UnixSocketRequireSameUser()), ttrpc.WithUnaryServerInterceptor(traceInterceptor))
+	s, err := ttrpc.NewServer(ttrpc.WithServerHandshaker(ttrpc.UnixSocketRequireSameUser()), ttrpc.WithUnaryServerInterceptor(UnaryServerInterceptor))
 	if err != nil {
 		return nil, err
 	}
