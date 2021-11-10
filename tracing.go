@@ -6,11 +6,11 @@ import (
 	"fmt"
 
 	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/tracing"
 	"github.com/containerd/ttrpc"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
@@ -91,24 +91,96 @@ func ConfigureTracing(ctx context.Context, cfg *TraceConfig) (func(context.Conte
 }
 
 func StartSpan(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
-	return otel.Tracer(shimName).Start(ctx, name, opts...)
+	return otel.Tracer("").Start(ctx, name, opts...)
 }
 
-func traceInterceptor(ctx context.Context, u ttrpc.Unmarshaler, i *ttrpc.UnaryServerInfo, m ttrpc.Method) (interface{}, error) {
-	if ns, _ := namespaces.Namespace(ctx); ns != "" {
-		namespaces.WithNamespace(ctx, ns)
-	}
-	ctx, span := StartSpan(ctx, i.FullMethod,
-		trace.WithSpanKind(trace.SpanKindServer),
-		trace.WithAttributes(
-			semconv.RPCSystemKey.String("ttrpc"),
-		),
-	)
-	defer span.End()
+var (
+	RPCSystemAttr = semconv.RPCSystemKey.String("ttrpc")
+)
 
-	ret, err := m(ctx, u)
+func UnaryServerInterceptor(ctx context.Context, u ttrpc.Unmarshaler, info *ttrpc.UnaryServerInfo, m ttrpc.Method) (interface{}, error) {
+	if md, ok := ttrpc.GetMetadata(ctx); ok {
+		ctx = otel.GetTextMapPropagator().Extract(ctx, &carrier{md})
+	}
+
+	ctx, span := StartSpan(ctx, info.FullMethod,
+		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithAttributes(RPCSystemAttr),
+	)
+
+	span.AddEvent("sent")
+	resp, err := m(ctx, u)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 	}
-	return ret, err
+	span.AddEvent("received")
+
+	span.End()
+
+	return resp, err
+}
+
+func UnaryClientInterceptor(ctx context.Context, req *ttrpc.Request, resp *ttrpc.Response, info *ttrpc.UnaryClientInfo, invoker ttrpc.Invoker) error {
+	ctx, span := StartSpan(ctx, info.FullMethod,
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			RPCSystemAttr,
+			attribute.String("rpc.ttrpc.service", req.Service),
+			attribute.String("rpc.ttrpc.method", req.Method),
+		),
+	)
+
+	span.AddEvent("sent", trace.WithAttributes(
+		attribute.Int("message.payload.size", len(req.Payload)),
+	))
+
+	if span.IsRecording() {
+		md, ok := ttrpc.GetMetadata(ctx)
+		if !ok {
+			md = ttrpc.MD{}
+		}
+		otel.GetTextMapPropagator().Inject(ctx, &carrier{md})
+		ctx = ttrpc.WithMetadata(ctx, md)
+	}
+
+	err := invoker(ctx, req, resp)
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+	}
+
+	span.AddEvent("received", trace.WithAttributes(
+		attribute.Int("message.payload.size", len(resp.Payload)),
+	))
+	if resp.Status != nil {
+		span.SetAttributes(
+			attribute.Int("rpc.ttrpc.response.status", int(resp.Status.Code)),
+		)
+	}
+
+	span.End()
+	return err
+}
+
+type carrier struct {
+	md ttrpc.MD
+}
+
+func (c *carrier) Get(key string) string {
+	v, _ := c.md.Get(key)
+	if len(v) == 0 {
+		return ""
+	}
+	return v[0]
+}
+
+func (c *carrier) Set(key, value string) {
+	c.md.Set(key, value)
+}
+
+func (c *carrier) Keys() []string {
+	keys := make([]string, 0, len(c.md))
+	for k := range c.md {
+		keys = append(keys, k)
+	}
+	return keys
 }
