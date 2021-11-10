@@ -36,11 +36,10 @@ func newUnitManager(conn *systemd.Conn) *unitManager {
 }
 
 type unitManager struct {
-	sd        *systemd.Conn
-	mu        sync.Mutex
-	cond      *sync.Cond
-	sendEvent func(context.Context, string, interface{})
-	idx       map[string]Process
+	sd   *systemd.Conn
+	mu   sync.Mutex
+	cond *sync.Cond
+	idx  map[string]Process
 }
 
 func (m *unitManager) Add(p Process) {
@@ -98,7 +97,7 @@ type Process interface {
 	Kill(context.Context, int, bool) error
 	Pid() uint32
 	Name() string
-	SetState(context.Context, pState)
+	SetState(context.Context, pState) pState
 	ProcessState() pState
 }
 
@@ -134,14 +133,16 @@ func (p *process) ProcessState() pState {
 	return st
 }
 
-func (p *process) SetState(ctx context.Context, state pState) {
+func (p *process) SetState(ctx context.Context, state pState) pState {
 	p.mu.Lock()
 	state.CopyTo(&p.state)
 	if p.state.Pid > 0 && p.state.Status == "dead" && !p.state.Exited() {
 		p.state.ExitedAt = time.Now()
 	}
+	p.state.CopyTo(&state)
 	p.cond.Broadcast()
 	p.mu.Unlock()
+	return state
 }
 
 func (p *process) Name() string {
@@ -205,10 +206,8 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	return pid, nil
 }
 
-func (p *initProcess) SetState(ctx context.Context, state pState) {
-	p.process.SetState(ctx, state)
-
-	st := p.ProcessState()
+func (p *initProcess) SetState(ctx context.Context, state pState) pState {
+	st := p.process.SetState(ctx, state)
 	if st.Exited() {
 		p.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
 			ContainerID: p.id,
@@ -218,6 +217,7 @@ func (p *initProcess) SetState(ctx context.Context, state pState) {
 			Pid:         st.Pid,
 		})
 	}
+	return st
 }
 
 type execProcess struct {
@@ -265,10 +265,8 @@ func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	return pid, nil
 }
 
-func (p *execProcess) SetState(ctx context.Context, state pState) {
-	p.process.SetState(ctx, state)
-
-	st := p.ProcessState()
+func (p *execProcess) SetState(ctx context.Context, state pState) pState {
+	st := p.process.SetState(ctx, state)
 	if st.Exited() {
 		p.parent.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
 			ContainerID: p.parent.id,
@@ -278,4 +276,5 @@ func (p *execProcess) SetState(ctx context.Context, state pState) {
 			Pid:         st.Pid,
 		})
 	}
+	return st
 }
