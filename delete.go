@@ -99,9 +99,13 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		return pState{}, err
 	}
 
-	ps, err := p.waitForExit(ctx)
-	if err != nil {
-		return pState{}, err
+	var ps pState
+	if p.Pid() > 0 {
+		var err error
+		ps, err = p.waitForExit(ctx)
+		if err != nil {
+			return pState{}, err
+		}
 	}
 
 	if p.Terminal {

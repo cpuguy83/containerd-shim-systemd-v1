@@ -82,7 +82,7 @@ func (p *process) waitForExit(ctx context.Context) (pState, error) {
 			log.G(ctx).Debug("wait: dead")
 			break
 		}
-		if p.state.ExitCode > 0 || p.state.ExitedAt.After(timeZero) {
+		if p.state.ExitCode > 0 || p.state.Exited() {
 			log.G(ctx).Debug("wait: exited")
 			break
 		}
