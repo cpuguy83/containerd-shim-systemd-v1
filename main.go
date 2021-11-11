@@ -114,6 +114,7 @@ func main() {
 	rootFlags.StringVar(&id, "id", "", "id of the task")
 	rootFlags.StringVar(&bundle, "bundle", "", "path to the bundle directory")
 	rootFlags.StringVar(&namespace, "namespace", "", "namespace of container")
+	rootFlags.BoolVar(&debug, "debug", debug, "enable debug output in the shim")
 
 	if err := rootFlags.Parse(os.Args[1:]); err != nil {
 		fmt.Println(os.Args)
@@ -268,7 +269,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	flags.BoolVar(&debug, "debug", false, "enable debug output in the shim")
+	flags.BoolVar(&debug, "debug", debug, "enable debug output in the shim")
 	flags.StringVar(&ttrpcAddr, "ttrpc-address", ttrpcAddr, "ttrpc address back to containerd")
 	flags.StringVar(&root, "root", filepath.Join(defaults.DefaultStateDir, shimName), "root to store state in")
 	flags.StringVar(&socket, "socket", socket, "socket path to serve")
