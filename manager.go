@@ -28,7 +28,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
-	"go4.org/syncutil/singleflight"
 )
 
 const shimName = "io.containerd.systemd.v1"
@@ -78,7 +77,6 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		events:         make(chan eventEnvelope, 128),
 		waitEvents:     make(chan struct{}),
 		defaultLogMode: cfg.LogMode,
-		single:         &singleflight.Group{},
 		processes:      &processManager{ls: make(map[string]Process)},
 		units:          newUnitManager(conn),
 		runc: &runc.Runc{
@@ -97,8 +95,6 @@ type Service struct {
 	publisher  events.Publisher
 	events     chan eventEnvelope
 	waitEvents chan struct{}
-
-	single *singleflight.Group
 
 	processes *processManager
 	units     *unitManager
