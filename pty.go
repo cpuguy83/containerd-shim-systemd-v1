@@ -120,7 +120,6 @@ func (p *process) ResizePTY(ctx context.Context, width, height int) error {
 		var err error
 		conn, err = net.Dial("unix", p.ttySockPath())
 		if err != nil {
-			p.mu.Unlock()
 			return fmt.Errorf("could not dial tty sock: %w", err)
 		}
 		p.ttyConn = conn
