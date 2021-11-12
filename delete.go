@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -74,7 +75,7 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 	ctx, span := StartSpan(ctx, "InitProcess.Delete")
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "delete")
+			retErr = fmt.Errorf("delete: %w", retErr)
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.SetAttributes(
@@ -85,6 +86,10 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		)
 		span.End()
 	}()
+
+	if !p.ProcessState().Exited() {
+		return pState{}, fmt.Errorf("container has not exited: %w", errdefs.ErrFailedPrecondition)
+	}
 
 	defer func() {
 		if err := mount.UnmountAll(filepath.Join(p.Bundle, "rootfs"), 0); err != nil {
@@ -127,7 +132,7 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	ctx, span := StartSpan(ctx, "ExecProcess.Delete")
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "delete")
+			retErr = fmt.Errorf("delete: %w", retErr)
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.SetAttributes(
@@ -138,6 +143,11 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 		)
 		span.End()
 	}()
+
+	if !p.ProcessState().Exited() && !p.parent.ProcessState().Exited() {
+		return pState{}, fmt.Errorf("exec has not exited: %w", errdefs.ErrFailedPrecondition)
+	}
+
 	p.systemd.KillUnitWithTarget(ctx, p.Name(), dbus.Main, 9)
 
 	if p.Terminal {
