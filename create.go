@@ -45,8 +45,9 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	var opts options.CreateOptions
 	if r.Options != nil {
+		log.G(ctx).WithField("typeurl", r.Options.TypeUrl).Debug("Decoding create options")
 		if err := typeurl.UnmarshalTo(r.Options, &opts); err != nil {
-			return nil, errdefs.ToGRPC(err)
+			return nil, err
 		}
 	}
 

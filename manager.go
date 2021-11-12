@@ -18,7 +18,7 @@ import (
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/namespaces"
-	runcshimopts "github.com/containerd/containerd/runtime/v2/runc/options"
+	"github.com/containerd/containerd/runtime/linux/runctypes"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
@@ -302,6 +302,7 @@ func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskReque
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
+		log.G(ctx).WithError(retErr).Debug("Checkpoint")
 	}()
 
 	p := s.processes.Get(path.Join(ns, r.ID))
@@ -309,11 +310,14 @@ func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskReque
 		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
 	}
 
-	var opts runcshimopts.CheckpointOptions
+	var opts runctypes.CheckpointOptions
 	if r.Options != nil {
-		if err := typeurl.UnmarshalTo(r.Options, &opts); err != nil {
+		v, err := typeurl.UnmarshalAny(r.Options)
+		if err != nil {
+			log.G(ctx).WithError(err).WithField("typeurl", r.Options.TypeUrl).Debug("error unmarshalling *Any")
 			return nil, err
 		}
+		opts = *(v.(*runctypes.CheckpointOptions))
 	}
 
 	var actions []runc.CheckpointAction
