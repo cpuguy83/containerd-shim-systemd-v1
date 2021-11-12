@@ -18,6 +18,7 @@ import (
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/namespaces"
+	runcshimopts "github.com/containerd/containerd/runtime/v2/runc/options"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
@@ -288,8 +289,52 @@ func (s *Service) Pids(ctx context.Context, r *taskapi.PidsRequest) (_ *taskapi.
 }
 
 // Checkpoint the container
-func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskRequest) (*ptypes.Empty, error) {
-	return nil, errdefs.ErrNotImplemented
+func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskRequest) (_ *ptypes.Empty, retErr error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+
+	ctx, span := StartSpan(ctx, "service.Checkpoint")
+	defer func() {
+		if retErr != nil {
+			retErr = errdefs.ToGRPCf(retErr, "checkpoint")
+			span.SetStatus(codes.Error, retErr.Error())
+		}
+		span.End()
+	}()
+
+	p := s.processes.Get(path.Join(ns, r.ID))
+	if p == nil {
+		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
+	}
+
+	var opts runcshimopts.CheckpointOptions
+	if r.Options != nil {
+		if err := typeurl.UnmarshalTo(r.Options, &opts); err != nil {
+			return nil, err
+		}
+	}
+
+	var actions []runc.CheckpointAction
+	if !opts.Exit {
+		actions = append(actions, runc.LeaveRunning)
+	}
+	err = s.runc.Checkpoint(ctx, runcName(ns, r.ID), &runc.CheckpointOpts{
+		ImagePath:                opts.ImagePath,
+		WorkDir:                  opts.WorkPath,
+		AllowOpenTCP:             opts.OpenTcp,
+		AllowExternalUnixSockets: opts.ExternalUnixSockets,
+		AllowTerminal:            opts.Terminal,
+		FileLocks:                opts.FileLocks,
+		Cgroups:                  runc.CgroupMode(opts.CgroupsMode),
+		EmptyNamespaces:          opts.EmptyNamespaces,
+	}, actions...)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ptypes.Empty{}, nil
 }
 
 // Connect returns shim information of the underlying Service

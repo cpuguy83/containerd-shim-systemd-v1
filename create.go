@@ -323,6 +323,10 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 		span.End()
 	}()
 
+	if p.checkpoint != "" {
+		return 0, nil
+	}
+
 	execStart := []string{"create", "--bundle=" + p.Bundle}
 
 	f, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), p.id+"-task-config")

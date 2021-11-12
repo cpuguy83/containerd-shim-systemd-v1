@@ -197,6 +197,9 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		span.End()
 	}()
 
+	if p.checkpoint != "" {
+		return p.restore(ctx)
+	}
 	if err := p.runc.Start(ctx, runcName(p.ns, p.id)); err != nil {
 		return 0, fmt.Errorf("runc start: %w", err)
 	}
@@ -204,6 +207,20 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	pid = p.state.Pid
 	p.mu.Unlock()
 	return pid, nil
+}
+
+func (p *initProcess) restore(ctx context.Context) (pid uint32, retErr error) {
+	execStart := []string{
+		"restore",
+		"--image-path=" + p.checkpoint,
+		"--work-path=" + p.root,
+		"--detach",
+	}
+
+	if p.Terminal {
+		execStart = append(execStart, "--console-socket="+p.ttySockPath())
+	}
+	return p.startUnit(ctx, nil, execStart, filepath.Join(p.root, "pid"), runcName(p.ns, p.id), nil)
 }
 
 func (p *initProcess) SetState(ctx context.Context, state pState) pState {
