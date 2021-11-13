@@ -40,7 +40,10 @@ jobs:
         env:
           VERSION: 1.6.0-beta.1
       - name: install
-        run: make install ALL=1
+        run: |
+          make build
+          sudo make install
+          sudo $(command -v containerd-shim-systemd-v1) install
       - name: test
         run: |
           export GOPATH=${GITHUB_WORKSPACE}
