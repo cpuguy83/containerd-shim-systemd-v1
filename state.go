@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"time"
 
@@ -132,14 +133,14 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 
 	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s not found", r.ID)
+		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
 	var st *State
 	if r.ExecID != "" {
 		ep := p.(*initProcess).execs.Get(r.ExecID)
 		if ep == nil {
-			return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "exec %s not found", r.ExecID)
+			return nil, fmt.Errorf("exec %s: %w", r.ExecID, errdefs.ErrNotFound)
 		}
 		st, err = ep.State(ctx)
 		if err != nil {

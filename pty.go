@@ -168,11 +168,14 @@ func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_
 	log.G(ctx).Info("systemd.ResizePTY start")
 	defer func() {
 		log.G(ctx).WithError(retErr).Info("systemd.ResizePTY end")
+		if retErr != nil {
+			retErr = errdefs.ToGRPC(retErr)
+		}
 	}()
 
 	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "resize")
+		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
 	if r.ExecID != "" {

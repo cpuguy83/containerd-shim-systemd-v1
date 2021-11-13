@@ -53,7 +53,7 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 	if r.ExecID != "" {
 		p = p.(*initProcess).execs.Get(r.ExecID)
 		if p == nil {
-			return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
+			return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 		}
 	}
 

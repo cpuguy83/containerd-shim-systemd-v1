@@ -153,11 +153,11 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 	if r.ExecID != "" {
 		ep := p.(*initProcess).execs.Get(r.ExecID)
 		if ep == nil {
-			return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "exec id %v not found", r.ExecID)
+			return nil, fmt.Errorf("exec %s: %w", r.ExecID, errdefs.ErrNotFound)
 		}
 		pid, err = ep.Start(ctx)
 		if err != nil {
-			return nil, errdefs.ToGRPC(err)
+			return nil, err
 		}
 		s.send(ctx, ns, &eventsapi.TaskExecStarted{
 			ContainerID: r.ID,
@@ -167,7 +167,7 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 	} else {
 		pid, err = p.Start(ctx)
 		if err != nil {
-			return nil, errdefs.ToGRPC(err)
+			return nil, err
 		}
 		s.send(ctx, ns, &eventsapi.TaskStart{
 			ContainerID: r.ID,
@@ -247,13 +247,13 @@ func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (_ *ptypes.E
 
 	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
+		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
 	if r.ExecID != "" {
 		ep := p.(*initProcess).execs.Get(r.ExecID)
 		if ep == nil {
-			return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "exec id %v not found", r.ExecID)
+			return nil, fmt.Errorf("exec %s: %w", r.ExecID, errdefs.ErrNotFound)
 		}
 		if err := ep.Kill(ctx, int(r.Signal), r.All); err != nil {
 			return nil, errdefs.ToGRPC(err)
@@ -317,7 +317,7 @@ func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskReque
 
 	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
+		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
 	var opts runc.CheckpointOpts
@@ -384,7 +384,7 @@ func (s *Service) Connect(ctx context.Context, r *taskapi.ConnectRequest) (_ *ta
 
 	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
+		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
 	return &taskapi.ConnectResponse{TaskPid: p.Pid(), ShimPid: uint32(os.Getpid())}, nil
@@ -417,7 +417,7 @@ func (s *Service) Stats(ctx context.Context, r *taskapi.StatsRequest) (_ *taskap
 	p := s.processes.Get(path.Join(ns, r.ID))
 
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
+		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
 	pid := p.Pid()

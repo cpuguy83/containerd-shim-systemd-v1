@@ -39,7 +39,7 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 
 	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s", r.ID)
+		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
 	var st pState
@@ -47,18 +47,18 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 		pInit := p.(*initProcess)
 		ep := pInit.execs.Get(r.ExecID)
 		if ep == nil {
-			return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "exec %s", r.ExecID)
+			return nil, fmt.Errorf("exec %s: %w", r.ExecID, errdefs.ErrNotFound)
 		}
 		st, err = ep.Delete(ctx)
 		if err != nil {
-			return nil, errdefs.ToGRPC(err)
+			return nil, err
 		}
 		pInit.execs.Delete(r.ExecID)
 		s.units.Delete(ep)
 	} else {
 		st, err = p.Delete(ctx)
 		if err != nil {
-			return nil, errdefs.ToGRPC(err)
+			return nil, err
 		}
 		s.processes.Delete(path.Join(ns, r.ID))
 		s.units.Delete(p)

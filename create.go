@@ -183,7 +183,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 
 	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {
-		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
+		return nil, fmt.Errorf("%w: process %s does not exist", errdefs.ErrNotFound, r.ID)
 	}
 	pInit := p.(*initProcess)
 
@@ -208,7 +208,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 	ep.process.cond = sync.NewCond(&ep.process.mu)
 	err = pInit.execs.Add(r.ExecID, ep)
 	if err != nil {
-		return nil, errdefs.ToGRPCf(err, "process %s", r.ExecID)
+		return nil, fmt.Errorf("process %s: %w", r.ExecID, err)
 	}
 	s.units.Add(ep)
 
