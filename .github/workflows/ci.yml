@@ -58,4 +58,9 @@ jobs:
       - name: debug
         if: ${{ failure() }}
         run: |
-          sudo journalctl --system -u containerd-shim-systemd-v1
+          sudo journalctl --system -u containerd-shim-systemd-v1 | tee ${GITHUB_WORKSPACE}/containerd-shim-systemd-v1.log
+      - uses: actions/upload-artifact@v2
+        if: ${{ failure() }}
+        with:
+          name: daemon-log
+          path: ${{github.workspace}}/containerd-shim-systemd-v1.log
