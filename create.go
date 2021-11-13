@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -374,7 +375,12 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 		return 0, nil
 	}
 
-	execStart := []string{"create", "--bundle=" + p.Bundle}
+	execStart := []string{
+		"create",
+		"--bundle=" + p.Bundle,
+		"--no-pivot=" + strconv.FormatBool(p.opts.NoPivotRoot),
+		"--no-new-keyring=" + strconv.FormatBool(p.opts.NoNewKeyring),
+	}
 
 	f, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), p.id+"-task-config")
 	if err != nil {

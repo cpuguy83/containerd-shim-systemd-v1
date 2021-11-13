@@ -282,6 +282,8 @@ func (p *initProcess) restore(ctx context.Context) (pid uint32, retErr error) {
 		"--image-path=" + p.checkpoint,
 		"--work-path=" + p.root,
 		"--bundle=" + p.Bundle,
+		"--no-pivot=" + strconv.FormatBool(p.opts.NoPivotRoot),
+		"--no-subreaper",
 	}
 
 	if p.Terminal || p.opts.Terminal {
