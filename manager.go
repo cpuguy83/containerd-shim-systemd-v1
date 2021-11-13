@@ -18,6 +18,7 @@ import (
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/runtime/linux/runctypes"
 	v2runcopts "github.com/containerd/containerd/runtime/v2/runc/options"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
@@ -319,30 +320,45 @@ func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskReque
 		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s does not exist", r.ID)
 	}
 
-	var opts v2runcopts.CheckpointOptions
+	var opts runc.CheckpointOpts
+	var exit bool
 	if r.Options != nil {
 		v, err := typeurl.UnmarshalAny(r.Options)
 		if err != nil {
 			log.G(ctx).WithError(err).WithField("typeurl", r.Options.TypeUrl).Debug("error unmarshalling *Any")
 			return nil, err
 		}
-		opts = *(v.(*v2runcopts.CheckpointOptions))
+		switch vv := v.(type) {
+		case *v2runcopts.CheckpointOptions:
+			exit = vv.Exit
+			opts.AllowOpenTCP = vv.OpenTcp
+			opts.AllowExternalUnixSockets = vv.ExternalUnixSockets
+			opts.AllowTerminal = vv.Terminal
+			opts.FileLocks = vv.FileLocks
+			opts.EmptyNamespaces = vv.EmptyNamespaces
+			opts.Cgroups = runc.CgroupMode(vv.CgroupsMode)
+			opts.ImagePath = vv.ImagePath
+			opts.WorkDir = vv.WorkPath
+		case *runctypes.CheckpointOptions:
+			exit = vv.Exit
+			opts.AllowOpenTCP = vv.OpenTcp
+			opts.AllowExternalUnixSockets = vv.ExternalUnixSockets
+			opts.AllowTerminal = vv.Terminal
+			opts.FileLocks = vv.FileLocks
+			opts.EmptyNamespaces = vv.EmptyNamespaces
+			opts.Cgroups = runc.CgroupMode(vv.CgroupsMode)
+			opts.ImagePath = vv.ImagePath
+			opts.WorkDir = vv.WorkPath
+		default:
+			return nil, fmt.Errorf("unknown checkpoint options type: %w", errdefs.ErrInvalidArgument)
+		}
 	}
 
 	var actions []runc.CheckpointAction
-	if !opts.Exit {
+	if !exit {
 		actions = append(actions, runc.LeaveRunning)
 	}
-	err = s.runc.Checkpoint(ctx, runcName(ns, r.ID), &runc.CheckpointOpts{
-		ImagePath:                opts.ImagePath,
-		WorkDir:                  opts.WorkPath,
-		AllowOpenTCP:             opts.OpenTcp,
-		AllowExternalUnixSockets: opts.ExternalUnixSockets,
-		AllowTerminal:            opts.Terminal,
-		FileLocks:                opts.FileLocks,
-		Cgroups:                  runc.CgroupMode(opts.CgroupsMode),
-		EmptyNamespaces:          opts.EmptyNamespaces,
-	}, actions...)
+	err = s.runc.Checkpoint(ctx, runcName(ns, r.ID), &opts, actions...)
 	if err != nil {
 		return nil, err
 	}
