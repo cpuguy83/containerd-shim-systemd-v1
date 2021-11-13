@@ -18,7 +18,6 @@ import (
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/go-runc"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
-	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	ptypes "github.com/gogo/protobuf/types"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -101,6 +100,55 @@ type Process interface {
 	ProcessState() pState
 }
 
+type CreateOptions struct {
+	// Native config
+	LogMode        string
+	SdNotifyEnable bool
+
+	// From runc types
+	BinaryName          string
+	Root                string
+	CriuPath            string
+	NoPivotRoot         bool
+	OpenTcp             bool
+	ExternalUnixSockets bool
+	Terminal            bool
+	FileLocks           bool
+	EmptyNamespaces     []string
+	CgroupsMode         string
+	NoNewKeyring        bool
+	IoUid               uint32
+	IoGid               uint32
+	CriuWorkPath        string
+	CriuImagePath       string
+	SystemdCgroup       bool
+}
+
+func (c CreateOptions) RestoreArgs() []string {
+	var args []string
+
+	if c.NoPivotRoot {
+		args = append(args, "--no-pivot")
+	}
+	if c.OpenTcp {
+		args = append(args, "--tcp-established")
+	}
+	if c.FileLocks {
+		args = append(args, "--file-locks")
+	}
+	if c.ExternalUnixSockets {
+		args = append(args, "--ext-unix-sk")
+	}
+	for _, ns := range c.EmptyNamespaces {
+		args = append(args, "--empty-ns="+ns)
+	}
+	if c.CgroupsMode != "" {
+		args = append(args, "--manage-cgroups-mode="+c.CgroupsMode)
+	}
+
+	return args
+}
+
 type process struct {
 	ns   string
 	id   string
@@ -113,7 +161,7 @@ type process struct {
 	Stderr   string
 	Terminal bool
 
-	opts options.CreateOptions
+	opts CreateOptions
 
 	systemd *systemd.Conn
 	runc    *runc.Runc
@@ -162,7 +210,7 @@ func (p *process) runcCmd(cmd []string) ([]string, error) {
 		return nil, err
 	}
 
-	return append([]string{runcPath, "--debug=" + strconv.FormatBool(p.runc.Debug), "--systemd-cgroup=" + strconv.FormatBool(p.runc.SystemdCgroup), "--root", p.runc.Root}, cmd...), nil
+	return append([]string{runcPath, "--debug=" + strconv.FormatBool(p.runc.Debug), "--systemd-cgroup=" + strconv.FormatBool(p.opts.SystemdCgroup), "--root", p.runc.Root}, cmd...), nil
 }
 
 func (p *process) Kill(ctx context.Context, sig int, all bool) error {
@@ -170,7 +218,26 @@ func (p *process) Kill(ctx context.Context, sig int, all bool) error {
 	if all {
 		who = systemd.All
 	}
-	return p.systemd.KillUnitWithTarget(ctx, unitName(p.ns, p.id), who, int32(sig))
+	if p.Pid() == 0 {
+		return fmt.Errorf("not started: %w", errdefs.ErrFailedPrecondition)
+	}
+	if err := p.systemd.KillUnitWithTarget(ctx, unitName(p.ns, p.id), who, int32(sig)); err != nil {
+		units, e := p.systemd.ListUnitsByNamesContext(ctx, []string{p.Name()})
+		if err != nil {
+			log.G(ctx).WithError(e).Errorf("Failed to list units")
+		} else {
+			for _, u := range units {
+				if u.Name != p.Name() {
+					continue
+				}
+				if u.ActiveState != "running" {
+					return fmt.Errorf("not running: %w", errdefs.ErrFailedPrecondition)
+				}
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 type initProcess struct {
@@ -214,12 +281,14 @@ func (p *initProcess) restore(ctx context.Context) (pid uint32, retErr error) {
 		"restore",
 		"--image-path=" + p.checkpoint,
 		"--work-path=" + p.root,
-		"--detach",
+		"--bundle=" + p.Bundle,
 	}
 
-	if p.Terminal {
-		execStart = append(execStart, "--console-socket="+p.ttySockPath())
+	if p.Terminal || p.opts.Terminal {
+		execStart = append(execStart, "--detach")
 	}
+
+	execStart = append(execStart, p.opts.RestoreArgs()...)
 	return p.startUnit(ctx, nil, execStart, filepath.Join(p.root, "pid"), runcName(p.ns, p.id), nil)
 }
 

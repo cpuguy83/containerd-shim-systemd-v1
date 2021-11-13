@@ -87,7 +87,7 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		span.End()
 	}()
 
-	if !p.ProcessState().Exited() {
+	if !p.ProcessState().ExitedAt.After(timeZero) {
 		return pState{}, fmt.Errorf("container has not exited: %w", errdefs.ErrFailedPrecondition)
 	}
 

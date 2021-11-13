@@ -2,17 +2,21 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 	"sync"
+	"time"
 
 	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/runtime/linux/runctypes"
+	v2runcopts "github.com/containerd/containerd/runtime/v2/runc/options"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/typeurl"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
@@ -20,6 +24,7 @@ import (
 	dbus "github.com/godbus/dbus/v5"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/proto"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -43,16 +48,46 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns))
 
-	var opts options.CreateOptions
-	if r.Options != nil {
-		log.G(ctx).WithField("typeurl", r.Options.TypeUrl).Debug("Decoding create options")
-		if err := typeurl.UnmarshalTo(r.Options, &opts); err != nil {
-			return nil, err
+	var opts CreateOptions
+	if r.Options != nil && r.Options.TypeUrl != "" {
+		v, err := typeurl.UnmarshalAny(r.Options)
+		if err != nil {
+			log.G(ctx).WithError(err).WithField("typeurl", r.Options.TypeUrl).Debug("invalid create options")
+			return nil, fmt.Errorf("error unmarshalling options: %w", err)
 		}
+		switch vv := v.(type) {
+		case *options.CreateOptions:
+			opts.LogMode = vv.LogMode.String()
+			opts.SdNotifyEnable = vv.SdNotifyEnable
+			// TODO: Add other runc options to our CreateOptions.
+		case *v2runcopts.Options:
+			opts.NoPivotRoot = vv.NoPivotRoot
+			opts.NoNewKeyring = vv.NoNewKeyring
+			opts.IoUid = vv.IoUid
+			opts.IoGid = vv.IoGid
+			opts.BinaryName = vv.BinaryName
+			opts.Root = vv.Root
+			opts.CriuPath = vv.CriuPath
+			opts.SystemdCgroup = vv.SystemdCgroup
+			opts.CriuImagePath = vv.CriuImagePath
+			opts.CriuWorkPath = vv.CriuWorkPath
+		case *runctypes.CreateOptions:
+			opts.NoPivotRoot = vv.NoPivotRoot
+			opts.NoNewKeyring = vv.NoNewKeyring
+			opts.IoUid = vv.IoUid
+			opts.IoGid = vv.IoGid
+			opts.CriuImagePath = vv.CriuImagePath
+			opts.CriuWorkPath = vv.CriuWorkPath
+			opts.ExternalUnixSockets = vv.ExternalUnixSockets
+			opts.FileLocks = vv.FileLocks
+			opts.Terminal = vv.Terminal
+			opts.EmptyNamespaces = vv.EmptyNamespaces
+		}
+		log.G(ctx).WithField("typeurl", r.Options.TypeUrl).Debug("Decoding create options")
 	}
 
-	if opts.LogMode == options.LogMode_DEFAULT {
-		opts.LogMode = s.defaultLogMode
+	if opts.LogMode == "" {
+		opts.LogMode = s.defaultLogMode.String()
 	}
 
 	root := filepath.Join(s.root, ns, r.ID)
@@ -79,6 +114,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			ls: make(map[string]Process),
 		},
 	}
+	log.G(ctx).Debugf("%+v", p)
 	p.process.cond = sync.NewCond(&p.process.mu)
 
 	if err := s.processes.Add(path.Join(ns, r.ID), p); err != nil {
@@ -88,6 +124,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	defer func() {
 		if retErr != nil {
+			p.SetState(ctx, pState{ExitCode: 139, ExitedAt: time.Now(), Status: "failed"})
 			s.processes.Delete(path.Join(ns, r.ID))
 			s.units.Delete(p)
 			if _, err := p.Delete(ctx); err != nil {
@@ -165,7 +202,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 			systemd:  s.conn,
 			runc:     s.runc,
 			exe:      s.exe,
-			opts:     options.CreateOptions{LogMode: s.defaultLogMode},
+			opts:     CreateOptions{LogMode: s.defaultLogMode.String()},
 		}}
 	ep.process.cond = sync.NewCond(&ep.process.mu)
 	err = pInit.execs.Add(r.ExecID, ep)
@@ -215,11 +252,9 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 		properties = append(properties, systemd.Property{Name: "Environment", Value: dbus.MakeVariant(extraEnvs)})
 	}
 
-	if p.Terminal {
+	if p.Terminal || p.opts.Terminal {
 		// TODO: We need to bind the pty copier to the container's lifecycle
 		// This would ensure that once the container exits, the pty copier exits
-
-		// Add the console socket option to runc's exec-start
 		ttyUnit, sockPath, err := p.makePty(ctx)
 		if err != nil {
 			return 0, fmt.Errorf("error setting up tty handler: %w", err)
@@ -235,6 +270,7 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 			}
 		}()
 
+		// Add the console socket option to runc's exec-start
 		execStart = append(execStart, "--console-socket", sockPath)
 	}
 
@@ -243,7 +279,7 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 	}
 
 	// TODO: journald+tty?
-	switch p.opts.LogMode {
+	switch options.LogMode(options.LogMode_value[p.opts.LogMode]) {
 	case options.LogMode_STDIO:
 		if p.Stdout != "" {
 			properties = append(properties, systemd.Property{Name: "StandardOutputFile", Value: dbus.MakeVariant(p.Stdout)})
@@ -325,6 +361,16 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	}()
 
 	if p.checkpoint != "" {
+		// We seem to be missing Terminal info when doing a restore, so get that from the spec.
+		data, err := os.ReadFile(filepath.Join(p.Bundle, "config.json"))
+		if err != nil {
+			return 0, fmt.Errorf("could not read config.json: %w", err)
+		}
+		var spec specs.Spec
+		if err := json.Unmarshal(data, &spec); err != nil {
+			return 0, fmt.Errorf("error unmarshalling config.json")
+		}
+		p.Terminal = spec.Process.Terminal
 		return 0, nil
 	}
 
