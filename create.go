@@ -331,9 +331,9 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 			if err := getUnitState(ctx, p.systemd, name, &ps); err != nil {
 				log.G(ctx).WithError(err).Warn("Error getting unit state")
 			} else {
-				p.SetState(ctx, ps)
+				ps = p.SetState(ctx, ps)
 			}
-			return 0, fmt.Errorf("failed to start runc init: %s", status)
+			return 0, fmt.Errorf("failed to start runc init, systemd startup status: %s, process status: %s", status, ps)
 		}
 	}
 

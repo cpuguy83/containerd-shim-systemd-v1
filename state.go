@@ -265,6 +265,10 @@ func (s pState) Exited() bool {
 	return s.Pid > 0 && s.ExitedAt.After(timeZero)
 }
 
+func (s pState) String() string {
+	return fmt.Sprintf("pid: %d, code: %d, exitedAt: %s, status: %s", s.Pid, s.ExitCode, s.ExitedAt, s.Status)
+}
+
 // CopyTo copies the state to the provided destination.
 // It does not override non-zero values (except "Status") in the destination.
 // This is to ensure we don't override real information in the state w/, for instance, state info for a deleted unit.
