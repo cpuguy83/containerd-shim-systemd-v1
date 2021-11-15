@@ -329,7 +329,7 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 		if status != "done" {
 			var ps pState
 			if err := getUnitState(ctx, p.systemd, name, &ps); err != nil {
-				log.G(ctx).WithError(err).Warn("Errring getting unit state")
+				log.G(ctx).WithError(err).Warn("Error getting unit state")
 			} else {
 				p.SetState(ctx, ps)
 			}
