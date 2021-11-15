@@ -28,11 +28,15 @@ jobs:
       - name: Install gotestsum
         run: go install gotest.tools/gotestsum@latest
       - name: Install required packages
-        run: sudo apt-get update && sudo apt-get install -y criu
+        run: |
+            set -e -x
+            sudo add-apt-repository ppa:criu/ppa
+            sudo apt-get update
+            sudo apt-get install -y criu
       - name: get containerd
         run: |
             set -ex
-            curl -SLf https://github.com/containerd/containerd/releases/download/v${VERSION}/containerd-${VERSION}-linux-amd64.tar.gz | tar -xvz
+            curl -SLf https://github.com/containerd/containerd/releases/download/v${VERSION}/containerd-${VERSION}.linux-amd64.tar.gz | tar -xvz
             sudo systemctl stop containerd
             cd bin
             for i in *; do sudo mv $i $(command -v $i); done
