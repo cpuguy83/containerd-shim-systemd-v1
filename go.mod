@@ -4,10 +4,10 @@ go 1.17
 
 require (
 	github.com/containerd/cgroups v1.0.2
-	github.com/containerd/containerd v1.6.0-beta.1
-	github.com/containerd/containerd/api v1.6.0-beta.1
+	github.com/containerd/containerd v1.6.0-beta.2
+	github.com/containerd/containerd/api v1.6.0-beta.2
 	github.com/containerd/go-runc v1.0.0
-	github.com/containerd/ttrpc v1.0.2
+	github.com/containerd/ttrpc v1.1.0
 	github.com/containerd/typeurl v1.0.2
 	github.com/coreos/go-systemd/v22 v22.3.2
 	github.com/godbus/dbus/v5 v5.0.5
@@ -25,7 +25,7 @@ require (
 
 require (
 	github.com/Microsoft/go-winio v0.5.0 // indirect
-	github.com/Microsoft/hcsshim v0.9.0 // indirect
+	github.com/Microsoft/hcsshim v0.9.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.1.1 // indirect
 	github.com/cilium/ebpf v0.7.0 // indirect
 	github.com/containerd/console v1.0.3 // indirect

@@ -24,7 +24,7 @@ jobs:
         with:
           path: src/github.com/containerd/containerd
           repository: containerd/containerd
-          ref: v1.6.0-beta.1
+          ref: main
       - name: Install gotestsum
         run: go install gotest.tools/gotestsum@latest
       - name: Install required packages
@@ -38,7 +38,7 @@ jobs:
             for i in *; do sudo mv $i $(command -v $i); done
             sudo systemctl start containerd
         env:
-          VERSION: 1.6.0-beta.1
+          VERSION: 1.6.0-beta.2
       - name: install
         run: |
           make build
