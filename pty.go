@@ -108,6 +108,11 @@ func ttyHandshake() error {
 }
 
 func (p *process) ResizePTY(ctx context.Context, width, height int) error {
+	if !p.Terminal {
+		// This mimics what the runc shim does, and what the containerd integration tests expect
+		return nil
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
