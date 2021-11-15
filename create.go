@@ -19,6 +19,7 @@ import (
 	"github.com/containerd/containerd/runtime/linux/runctypes"
 	v2runcopts "github.com/containerd/containerd/runtime/v2/runc/options"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
+	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
@@ -333,7 +334,7 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 			} else {
 				ps = p.SetState(ctx, ps)
 			}
-			return 0, fmt.Errorf("failed to start runc init, systemd startup status: %s, process status: %s", status, ps)
+			return 0, fmt.Errorf("failed to start runc init: %s", status)
 		}
 	}
 
@@ -357,6 +358,7 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	defer func() {
 		if retErr != nil {
 			span.SetStatus(codes.Error, retErr.Error())
+			p.runc.Delete(ctx, runcName(p.ns, p.id), &runc.DeleteOpts{Force: true})
 		}
 		span.End()
 	}()
