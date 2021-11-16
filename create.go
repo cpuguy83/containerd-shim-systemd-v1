@@ -379,6 +379,9 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	}()
 
 	if p.checkpoint != "" {
+		if p.opts.CriuWorkPath == "" {
+			p.opts.CriuWorkPath = filepath.Join(p.root, "criu-work")
+		}
 		// We seem to be missing Terminal info when doing a restore, so get that from the spec.
 		data, err := os.ReadFile(filepath.Join(p.Bundle, "config.json"))
 		if err != nil {

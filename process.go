@@ -289,7 +289,7 @@ func (p *initProcess) restore(ctx context.Context) (pid uint32, retErr error) {
 	execStart := []string{
 		"restore",
 		"--image-path=" + p.checkpoint,
-		"--work-path=" + p.root,
+		"--work-path=" + p.opts.CriuWorkPath,
 		"--bundle=" + p.Bundle,
 		"--no-pivot=" + strconv.FormatBool(p.opts.NoPivotRoot),
 		"--no-subreaper",
@@ -352,14 +352,22 @@ func (p *initProcess) Checkpoint(ctx context.Context, r *ptypes.Any) error {
 		}
 	}
 
+	if opts.WorkDir == "" {
+		workDir := filepath.Join(p.root, "criu-work")
+		if err := os.MkdirAll(workDir, 0700); err != nil {
+			return fmt.Errorf("error making criu work dir: %w", err)
+		}
+		opts.WorkDir = workDir
+	}
+
 	var actions []runc.CheckpointAction
 	if !exit {
 		actions = append(actions, runc.LeaveRunning)
 	}
 
 	if err := p.runc.Checkpoint(ctx, runcName(p.ns, p.id), &opts, actions...); err != nil {
-		f, err := os.ReadFile(filepath.Join(opts.WorkDir, "dump.log"))
-		if err == nil {
+		f, err2 := os.ReadFile(filepath.Join(opts.WorkDir, "dump.log"))
+		if err2 == nil {
 			err = fmt.Errorf("%w: %s", err, string(f))
 		}
 		return err
