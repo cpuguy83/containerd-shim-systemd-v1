@@ -366,9 +366,11 @@ func (p *initProcess) Checkpoint(ctx context.Context, r *ptypes.Any) error {
 	}
 
 	if err := p.runc.Checkpoint(ctx, runcName(p.ns, p.id), &opts, actions...); err != nil {
-		f, err2 := os.ReadFile(filepath.Join(opts.WorkDir, "dump.log"))
-		if err2 == nil {
-			err = fmt.Errorf("%w: %s", err, string(f))
+		if p.runc.Debug {
+			f, err2 := os.ReadFile(filepath.Join(opts.WorkDir, "dump.log"))
+			if err2 == nil {
+				err = fmt.Errorf("%w: %s", err, string(f))
+			}
 		}
 		return err
 	}
