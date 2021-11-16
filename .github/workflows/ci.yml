@@ -47,7 +47,7 @@ jobs:
         run: |
           make build
           sudo make install
-          sudo $(command -v containerd-shim-systemd-v1) install
+          sudo $(command -v containerd-shim-systemd-v1) install --debug
       - name: test
         run: |
           export GOPATH=${GITHUB_WORKSPACE}
