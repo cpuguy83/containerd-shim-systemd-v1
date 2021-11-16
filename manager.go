@@ -255,14 +255,14 @@ func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (_ *ptypes.E
 	if r.ExecID != "" {
 		ep := p.(*initProcess).execs.Get(r.ExecID)
 		if ep == nil {
-			return nil, fmt.Errorf("exec %s: %w", r.ExecID, errdefs.ErrNotFound)
+			return nil, fmt.Errorf("exec process %s: %w", r.ExecID, errdefs.ErrNotFound)
 		}
 		if err := ep.Kill(ctx, int(r.Signal), r.All); err != nil {
-			return nil, errdefs.ToGRPC(err)
+			return nil, err
 		}
 	} else {
 		if err := p.Kill(ctx, int(r.Signal), r.All); err != nil {
-			return nil, errdefs.ToGRPC(err)
+			return nil, err
 		}
 	}
 	return &ptypes.Empty{}, nil

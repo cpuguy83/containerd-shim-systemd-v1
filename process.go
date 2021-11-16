@@ -223,6 +223,13 @@ func (p *process) runcCmd(cmd []string) ([]string, error) {
 }
 
 func (p *process) Kill(ctx context.Context, sig int, all bool) error {
+	p.mu.Lock()
+	if p.deleted {
+		p.mu.Unlock()
+		return errdefs.ErrNotFound
+	}
+	p.mu.Unlock()
+
 	who := systemd.Main
 	if all {
 		who = systemd.All
