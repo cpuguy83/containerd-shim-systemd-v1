@@ -284,6 +284,12 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		return p.restore(ctx)
 	}
 	if err := p.runc.Start(ctx, runcName(p.ns, p.id)); err != nil {
+		if p.runc.Debug {
+			debug, err2 := os.ReadFile(filepath.Join(p.root, p.id+"-runc-debug.log"))
+			if err2 == nil {
+				err = fmt.Errorf("%w: %s", err, string(debug))
+			}
+		}
 		return 0, fmt.Errorf("runc start: %w", err)
 	}
 	p.mu.Lock()
