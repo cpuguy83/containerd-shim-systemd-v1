@@ -14,9 +14,13 @@ import (
 
 	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types"
+	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/runtime/linux/runctypes"
+	v2runcopts "github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/containerd/go-runc"
+	"github.com/containerd/typeurl"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	ptypes "github.com/gogo/protobuf/types"
 	"go.opentelemetry.io/otel/attribute"
@@ -311,6 +315,77 @@ func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 		})
 	}
 	return st
+}
+
+func (p *initProcess) Checkpoint(ctx context.Context, r *ptypes.Any) error {
+	var opts runc.CheckpointOpts
+	var exit bool
+	if r != nil {
+		v, err := typeurl.UnmarshalAny(r)
+		if err != nil {
+			log.G(ctx).WithError(err).WithField("typeurl", r.TypeUrl).Debug("error unmarshalling *Any")
+			return err
+		}
+		switch vv := v.(type) {
+		case *v2runcopts.CheckpointOptions:
+			exit = vv.Exit
+			opts.AllowOpenTCP = vv.OpenTcp
+			opts.AllowExternalUnixSockets = vv.ExternalUnixSockets
+			opts.AllowTerminal = vv.Terminal
+			opts.FileLocks = vv.FileLocks
+			opts.EmptyNamespaces = vv.EmptyNamespaces
+			opts.Cgroups = runc.CgroupMode(vv.CgroupsMode)
+			opts.ImagePath = vv.ImagePath
+			opts.WorkDir = vv.WorkPath
+		case *runctypes.CheckpointOptions:
+			exit = vv.Exit
+			opts.AllowOpenTCP = vv.OpenTcp
+			opts.AllowExternalUnixSockets = vv.ExternalUnixSockets
+			opts.AllowTerminal = vv.Terminal
+			opts.FileLocks = vv.FileLocks
+			opts.EmptyNamespaces = vv.EmptyNamespaces
+			opts.Cgroups = runc.CgroupMode(vv.CgroupsMode)
+			opts.ImagePath = vv.ImagePath
+			opts.WorkDir = vv.WorkPath
+		default:
+			return fmt.Errorf("unknown checkpoint options type: %w", errdefs.ErrInvalidArgument)
+		}
+	}
+
+	var actions []runc.CheckpointAction
+	if !exit {
+		actions = append(actions, runc.LeaveRunning)
+	}
+
+	if err := p.runc.Checkpoint(ctx, runcName(p.ns, p.id), &opts, actions...); err != nil {
+		f, err := os.ReadFile(filepath.Join(opts.WorkDir, "dump.log"))
+		if err == nil {
+			err = fmt.Errorf("%w: %s", err, string(f))
+		}
+		return err
+	}
+	return nil
+}
+
+func (p *initProcess) Pause(ctx context.Context) error {
+	return p.runc.Pause(ctx, runcName(p.ns, p.id))
+}
+
+func (p *initProcess) Resume(ctx context.Context) error {
+	return p.runc.Resume(ctx, runcName(p.ns, p.id))
+}
+
+func (p *initProcess) Pids(ctx context.Context) ([]*task.ProcessInfo, error) {
+	ls, err := p.runc.Ps(ctx, runcName(p.ns, p.id))
+	if err != nil {
+		return nil, err
+	}
+
+	procs := make([]*task.ProcessInfo, 0, len(ls))
+	for _, p := range ls {
+		procs = append(procs, &task.ProcessInfo{Pid: uint32(p)})
+	}
+	return procs, nil
 }
 
 type execProcess struct {

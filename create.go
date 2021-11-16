@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	eventsapi "github.com/containerd/containerd/api/events"
@@ -104,9 +105,15 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			Stderr:   r.Stderr,
 			Terminal: r.Terminal,
 			systemd:  s.conn,
-			runc:     s.runc,
-			exe:      s.exe,
-			root:     root,
+			runc: &runc.Runc{
+				Debug:         s.debug,
+				Command:       s.runcBin,
+				SystemdCgroup: false,
+				PdeathSignal:  syscall.SIGKILL,
+				Root:          filepath.Join(s.root, "runc"),
+			},
+			exe:  s.exe,
+			root: root,
 		},
 		Bundle:           r.Bundle,
 		Rootfs:           r.Rootfs,
@@ -203,7 +210,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 			Stderr:   r.Stderr,
 			Terminal: r.Terminal,
 			systemd:  s.conn,
-			runc:     s.runc,
+			runc:     pInit.runc,
 			exe:      s.exe,
 			opts:     CreateOptions{LogMode: s.defaultLogMode.String()},
 		}}

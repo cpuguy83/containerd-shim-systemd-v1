@@ -7,21 +7,16 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/containerd/cgroups"
 	cgroupsv2 "github.com/containerd/cgroups/v2"
 	eventsapi "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/runtime/linux/runctypes"
-	v2runcopts "github.com/containerd/containerd/runtime/v2/runc/options"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
@@ -81,18 +76,15 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		defaultLogMode: cfg.LogMode,
 		processes:      &processManager{ls: make(map[string]Process)},
 		units:          newUnitManager(conn),
-		runc: &runc.Runc{
-			Debug:         debug,
-			Command:       runcPath,
-			SystemdCgroup: false,
-			PdeathSignal:  syscall.SIGKILL,
-			Root:          runcRoot,
-		}}, nil
+		runcBin:        runcPath,
+		debug:          debug,
+	}, nil
 }
 
 type Service struct {
 	conn       *systemd.Conn
-	runc       *runc.Runc
+	runcBin    string
+	debug      bool
 	root       string
 	publisher  events.Publisher
 	events     chan eventEnvelope
@@ -200,7 +192,12 @@ func (s *Service) Pause(ctx context.Context, r *taskapi.PauseRequest) (_ *ptypes
 		span.End()
 	}()
 
-	err = s.runc.Pause(ctx, runcName(ns, r.ID))
+	p := s.processes.Get(path.Join(ns, r.ID))
+	if p == nil {
+		return nil, fmt.Errorf("%w: %s", errdefs.ErrNotFound, r.ID)
+	}
+
+	err = p.(*initProcess).Pause(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +220,12 @@ func (s *Service) Resume(ctx context.Context, r *taskapi.ResumeRequest) (_ *ptyp
 		span.End()
 	}()
 
-	if err := s.runc.Resume(ctx, runcName(ns, r.ID)); err != nil {
+	p := s.processes.Get(path.Join(ns, r.ID))
+	if p == nil {
+		return nil, fmt.Errorf("%w: %s", errdefs.ErrNotFound, r.ID)
+	}
+
+	if err := p.(*initProcess).Resume(ctx); err != nil {
 		return nil, err
 	}
 	return &ptypes.Empty{}, nil
@@ -282,15 +284,14 @@ func (s *Service) Pids(ctx context.Context, r *taskapi.PidsRequest) (_ *taskapi.
 		span.End()
 	}()
 
-	ls, err := s.runc.Ps(ctx, runcName(ns, r.ID))
-	if err != nil {
-		return nil, err
+	p := s.processes.Get(path.Join(ns, r.ID))
+	if p == nil {
+		return nil, fmt.Errorf("%w: %s", errdefs.ErrNotFound, r.ID)
 	}
 
-	procs := make([]*task.ProcessInfo, 0, len(ls))
-
-	for _, p := range ls {
-		procs = append(procs, &task.ProcessInfo{Pid: uint32(p)})
+	procs, err := p.(*initProcess).Pids(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	return &taskapi.PidsResponse{
@@ -320,49 +321,9 @@ func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskReque
 		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
-	var opts runc.CheckpointOpts
-	var exit bool
-	if r.Options != nil {
-		v, err := typeurl.UnmarshalAny(r.Options)
-		if err != nil {
-			log.G(ctx).WithError(err).WithField("typeurl", r.Options.TypeUrl).Debug("error unmarshalling *Any")
-			return nil, err
-		}
-		switch vv := v.(type) {
-		case *v2runcopts.CheckpointOptions:
-			exit = vv.Exit
-			opts.AllowOpenTCP = vv.OpenTcp
-			opts.AllowExternalUnixSockets = vv.ExternalUnixSockets
-			opts.AllowTerminal = vv.Terminal
-			opts.FileLocks = vv.FileLocks
-			opts.EmptyNamespaces = vv.EmptyNamespaces
-			opts.Cgroups = runc.CgroupMode(vv.CgroupsMode)
-			opts.ImagePath = vv.ImagePath
-			opts.WorkDir = vv.WorkPath
-		case *runctypes.CheckpointOptions:
-			exit = vv.Exit
-			opts.AllowOpenTCP = vv.OpenTcp
-			opts.AllowExternalUnixSockets = vv.ExternalUnixSockets
-			opts.AllowTerminal = vv.Terminal
-			opts.FileLocks = vv.FileLocks
-			opts.EmptyNamespaces = vv.EmptyNamespaces
-			opts.Cgroups = runc.CgroupMode(vv.CgroupsMode)
-			opts.ImagePath = vv.ImagePath
-			opts.WorkDir = vv.WorkPath
-		default:
-			return nil, fmt.Errorf("unknown checkpoint options type: %w", errdefs.ErrInvalidArgument)
-		}
-	}
-
-	var actions []runc.CheckpointAction
-	if !exit {
-		actions = append(actions, runc.LeaveRunning)
-	}
-	err = s.runc.Checkpoint(ctx, runcName(ns, r.ID), &opts, actions...)
-	if err != nil {
+	if err := p.(*initProcess).Checkpoint(ctx, r.Options); err != nil {
 		return nil, err
 	}
-
 	return &ptypes.Empty{}, nil
 }
 
