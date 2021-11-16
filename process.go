@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -237,7 +238,15 @@ func (p *process) Kill(ctx context.Context, sig int, all bool) error {
 	if p.Pid() == 0 {
 		return fmt.Errorf("not started: %w", errdefs.ErrFailedPrecondition)
 	}
+	if p.ProcessState().Exited() {
+		// per upstream integration tests, this should return not found
+		return errdefs.ErrNotFound
+	}
+
 	if err := p.systemd.KillUnitWithTarget(ctx, unitName(p.ns, p.id), who, int32(sig)); err != nil {
+		if _, err2 := p.runc.State(ctx, runcName(p.ns, p.id)); err2 != nil && strings.Contains(err2.Error(), "not found") {
+			return errdefs.ErrNotFound
+		}
 		units, e := p.systemd.ListUnitsByNamesContext(ctx, []string{p.Name()})
 		if err != nil {
 			log.G(ctx).WithError(e).Errorf("Failed to list units")
