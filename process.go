@@ -210,7 +210,12 @@ func (p *process) runcCmd(cmd []string) ([]string, error) {
 		return nil, err
 	}
 
-	return append([]string{runcPath, "--debug=" + strconv.FormatBool(p.runc.Debug), "--systemd-cgroup=" + strconv.FormatBool(p.opts.SystemdCgroup), "--root", p.runc.Root}, cmd...), nil
+	root := []string{runcPath, "--debug=" + strconv.FormatBool(p.runc.Debug), "--systemd-cgroup=" + strconv.FormatBool(p.opts.SystemdCgroup), "--root", p.runc.Root}
+	if p.runc.Debug {
+		root = append(root, "--log="+filepath.Join(p.root, p.id+"-runc-debug.log"))
+	}
+
+	return append(root, cmd...), nil
 }
 
 func (p *process) Kill(ctx context.Context, sig int, all bool) error {

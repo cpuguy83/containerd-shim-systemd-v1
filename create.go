@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path"
@@ -333,6 +334,13 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 				log.G(ctx).WithError(err).Warn("Error getting unit state")
 			} else {
 				ps = p.SetState(ctx, ps)
+			}
+			if p.runc.Debug {
+				if logF, err := os.Open(filepath.Join(p.root, p.id+"-runc-debug.log")); err == nil {
+					io.Copy(log.G(ctx).Writer(), logF)
+				} else {
+					log.G(ctx).WithError(err).Warn("Error opening runc debug log")
+				}
 			}
 			return 0, fmt.Errorf("failed to start runc init: %s", status)
 		}
