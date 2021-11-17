@@ -199,7 +199,9 @@ func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_
 
 // CloseIO of a process
 func (s *Service) CloseIO(ctx context.Context, r *taskapi.CloseIORequest) (_ *ptypes.Empty, retErr error) {
-	return nil, errdefs.ErrNotImplemented
+	// TODO: I'm not sure what we should do here since we aren't really doing anything with container I/O
+	// Potentially we should signal the tty handler to stop copying stdio?
+	return &ptypes.Empty{}, nil
 }
 
 // This is pretty standard stuff but I copied this from github.com/containerd/go-runc, with some minor changes.
