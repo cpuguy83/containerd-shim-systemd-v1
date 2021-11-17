@@ -101,7 +101,7 @@ func main() {
 		publishBin string
 		root       string
 		bundle     string
-		ttrpcAddr  = defaults.DefaultAddress + ".ttrpc"
+		ttrpcAddr  = address + ".ttrpc"
 		logMode    = defaultLogMode
 	)
 
@@ -115,6 +115,7 @@ func main() {
 	rootFlags.StringVar(&bundle, "bundle", "", "path to the bundle directory")
 	rootFlags.StringVar(&namespace, "namespace", "", "namespace of container")
 	rootFlags.BoolVar(&debug, "debug", debug, "enable debug output in the shim")
+	rootFlags.StringVar(&ttrpcAddr, "ttrpc-address", ttrpcAddr, "address to containerd ttrpc socket")
 
 	if err := rootFlags.Parse(os.Args[1:]); err != nil {
 		fmt.Println(os.Args)

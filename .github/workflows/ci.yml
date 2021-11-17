@@ -47,17 +47,19 @@ jobs:
         run: |
           make build
           sudo make install
-          sudo $(command -v containerd-shim-systemd-v1) install --debug
+          sudo $(command -v containerd-shim-systemd-v1) --address=/run/containerd-test/containerd.sock --ttrpc-address=/run/containerd-test/containerd.sock.ttrpc install --debug
       - name: test
         run: |
+          set -e -x
           export GOPATH=${GITHUB_WORKSPACE}
           cd "${GITHUB_WORKSPACE}/src/github.com/containerd/containerd"
-          sudo -E PATH=${PATH} make integration EXTRA_TESTFLAGS=${EXTRA_TESTFLAGS} GOTEST="gotestsum --"
+          sudo -E PATH=${PATH} make integration EXTRA_TESTFLAGS="${EXTRA_TESTFLAGS}" GOTEST="${GOTEST}"
         env:
           TEST_RUNTIME: io.containerd.systemd.v1
           RUNC_FLAVOR: runc
           GOTESTSUM_JUNITFILE: ${{github.workspace}}/junit.xml
-          EXTRA_TESTFLAGS: "--no-daemon"
+          # EXTRA_TESTFLAGS: "--no-daemon --address=/run/containerd/containerd.sock"
+          GOTEST: gotestsum --
       - name: Publish Test Report
         uses: mikepenz/action-junit-report@v2
         if: always() # always run even if the previous step fails
