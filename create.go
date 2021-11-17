@@ -271,10 +271,10 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 		defer func() {
 			if retErr != nil {
 				if _, err := p.systemd.StopUnitContext(ctx, ttyUnit, "replace", nil); err != nil {
-					log.G(ctx).WithError(err).WithField("unit", ttyUnit).Error("failed to stop tty unit unit")
+					log.G(ctx).WithError(err).WithField("unit", ttyUnit).Debug("failed to stop tty unit unit")
 				}
 				if err := p.systemd.ResetFailedUnitContext(ctx, ttyUnit); err != nil {
-					log.G(ctx).WithError(err).WithField("unit", ttyUnit).Warn("Error reseting tty unit")
+					log.G(ctx).WithError(err).WithField("unit", ttyUnit).Debug("Error reseting tty unit")
 				}
 			}
 		}()
@@ -343,9 +343,10 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 			}
 			ret := fmt.Errorf("failed to start runc init: %s", status)
 			if p.runc.Debug {
+				ret = fmt.Errorf("%w: %v", ret, execStart)
 				debug, err := os.ReadFile(filepath.Join(p.root, p.id+"-runc-debug.log"))
 				if err == nil {
-					ret = fmt.Errorf("%w: %s", ret, string(debug))
+					ret = fmt.Errorf("%w:\n%s", ret, string(debug))
 				} else {
 					log.G(ctx).WithError(err).Warn("Error opening runc debug log")
 				}

@@ -132,7 +132,6 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	ctx, span := StartSpan(ctx, "ExecProcess.Delete")
 	defer func() {
 		if retErr != nil {
-			retErr = fmt.Errorf("delete: %w", retErr)
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.SetAttributes(
@@ -144,7 +143,7 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 		span.End()
 	}()
 
-	if !p.ProcessState().Exited() && !p.parent.ProcessState().Exited() {
+	if p.Pid() != 0 && !p.ProcessState().Exited() && !p.parent.ProcessState().Exited() {
 		return pState{}, fmt.Errorf("exec has not exited: %w", errdefs.ErrFailedPrecondition)
 	}
 
@@ -155,6 +154,14 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 		p.systemd.KillUnitWithTarget(ctx, ttyName, dbus.Main, 9)
 	}
 
+	var ps pState
+	if p.Pid() > 0 {
+		var err error
+		ps, err = p.waitForExit(ctx)
+		if err != nil {
+			return pState{}, err
+		}
+	}
 	p.mu.Lock()
 	p.deleted = true
 	p.cond.Broadcast()
@@ -162,5 +169,5 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 
 	p.parent.execs.Delete(p.execID)
 
-	return p.ProcessState(), nil
+	return ps, nil
 }
