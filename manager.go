@@ -422,10 +422,24 @@ func (s *Service) Stats(ctx context.Context, r *taskapi.StatsRequest) (_ *taskap
 }
 
 // Update the live container
-func (s *Service) Update(ctx context.Context, r *taskapi.UpdateTaskRequest) (*ptypes.Empty, error) {
-	p := s.processes.Get(r.ID)
+func (s *Service) Update(ctx context.Context, r *taskapi.UpdateTaskRequest) (_ *ptypes.Empty, retErr error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
+
+	ctx, span := StartSpan(ctx, "service.Update")
+	defer func() {
+		if retErr != nil {
+			span.SetStatus(codes.Error, retErr.Error())
+			retErr = errdefs.ToGRPCf(retErr, "update")
+		}
+		span.End()
+	}()
+
+	p := s.processes.Get(path.Join(ns, r.ID))
 	if p == nil {
-		return nil, errdefs.ErrNotFound
+		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
 	var res specs.LinuxResources
