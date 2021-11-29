@@ -93,16 +93,17 @@ func main() {
 	}
 
 	var (
-		debug      bool
-		socket     = defaultAddress
-		address    = defaults.DefaultAddress
-		namespace  string
-		id         string
-		publishBin string
-		root       string
-		bundle     string
-		ttrpcAddr  = address + ".ttrpc"
-		logMode    = defaultLogMode
+		debug          bool
+		socket         = defaultAddress
+		address        = defaults.DefaultAddress
+		namespace      string
+		id             string
+		publishBin     string
+		root           string
+		bundle         string
+		ttrpcAddr      = address + ".ttrpc"
+		logMode        = defaultLogMode
+		noNewNamespace bool
 	)
 
 	rootFlags := flag.NewFlagSet(filepath.Base(os.Args[0]), flag.ContinueOnError)
@@ -130,19 +131,21 @@ func main() {
 	}
 
 	flags := flag.NewFlagSet(rootFlags.Name()+" "+rootFlags.Arg(0), flag.ContinueOnError)
+	flags.BoolVar(&noNewNamespace, "no-new-namespace", noNewNamespace, "mount container rootfs in host namespace")
 
 	traceCfg := TraceFlags(flags)
 
 	commands := map[string]func(context.Context) error{
 		"install": func(ctx context.Context) error {
 			cfg := installConfig{
-				Root:      root,
-				Addr:      address,
-				TTRPCAddr: ttrpcAddr,
-				Debug:     debug,
-				Socket:    socket,
-				LogMode:   options.LogMode(options.LogMode_value[strings.ToUpper(logMode)]),
-				Trace:     *traceCfg,
+				Root:           root,
+				Addr:           address,
+				TTRPCAddr:      ttrpcAddr,
+				Debug:          debug,
+				Socket:         socket,
+				LogMode:        options.LogMode(options.LogMode_value[strings.ToUpper(logMode)]),
+				Trace:          *traceCfg,
+				NoNewNamespace: noNewNamespace,
 			}
 			return install(ctx, cfg)
 		},
@@ -216,6 +219,7 @@ func main() {
 			if err := proto.Unmarshal(data, &create); err != nil {
 				return fmt.Errorf("error unmarshaling task config data")
 			}
+
 			if len(create.Rootfs) > 0 {
 				// This is pretty much the whole reason we have this special subcommand.
 				// We want to prevent this mount from escaping to the host mount namespace.
@@ -229,27 +233,9 @@ func main() {
 					return err
 				}
 
-				var mounts []mount.Mount
-				for _, m := range create.Rootfs {
-					mounts = append(mounts, mount.Mount{
-						Type:    m.Type,
-						Source:  m.Source,
-						Options: m.Options,
-					})
+				if _, err := mountFS(create.Rootfs, create.Bundle); err != nil {
+					return err
 				}
-
-				rootfs := filepath.Join(create.Bundle, "rootfs")
-				if err := os.Mkdir(rootfs, 0700); err != nil && !os.IsExist(err) {
-					return fmt.Errorf("error creating rootfs dir: %w", err)
-				}
-				if err := mount.All(mounts, rootfs); err != nil {
-					return fmt.Errorf("error mounting rootfs: %w", err)
-				}
-				defer func() {
-					if retErr != nil {
-						mount.UnmountAll(rootfs, 0)
-					}
-				}()
 			}
 
 			return syscall.Exec(os.Args[2], os.Args[2:], nil)

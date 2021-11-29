@@ -275,6 +275,8 @@ type initProcess struct {
 	checkpoint       string
 	parentCheckpoint string
 
+	noNewNamespace bool
+
 	execs *processManager
 
 	sendEvent func(ctx context.Context, ns string, evt interface{})

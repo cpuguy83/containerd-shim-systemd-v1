@@ -36,9 +36,10 @@ var (
 )
 
 type Config struct {
-	Root      string
-	Publisher events.Publisher
-	LogMode   options.LogMode
+	Root           string
+	Publisher      events.Publisher
+	LogMode        options.LogMode
+	NoNewNamespace bool
 }
 
 func New(ctx context.Context, cfg Config) (*Service, error) {
@@ -72,6 +73,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		conn:           conn,
 		exe:            exe,
 		root:           cfg.Root,
+		noNewNamespace: cfg.NoNewNamespace,
 		publisher:      cfg.Publisher,
 		events:         make(chan eventEnvelope, 128),
 		waitEvents:     make(chan struct{}),
@@ -84,13 +86,14 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 }
 
 type Service struct {
-	conn       *systemd.Conn
-	runcBin    string
-	debug      bool
-	root       string
-	publisher  events.Publisher
-	events     chan eventEnvelope
-	waitEvents chan struct{}
+	conn           *systemd.Conn
+	runcBin        string
+	debug          bool
+	root           string
+	noNewNamespace bool
+	publisher      events.Publisher
+	events         chan eventEnvelope
+	waitEvents     chan struct{}
 
 	processes *processManager
 	units     *unitManager

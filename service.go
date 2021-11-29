@@ -56,7 +56,7 @@ Description=containerd shim service that uses systemd to manage containers
 
 [Service]
 Type=notify
-ExecStart=` + exe + ` --address=` + cfg.Addr + ` serve` + ` --ttrpc-address=` + cfg.TTRPCAddr + ` --debug=` + strconv.FormatBool(cfg.Debug) + ` --root=` + cfg.Root + ` --log-mode=` + strings.ToLower(cfg.LogMode.String()) + ` ` + cfg.Trace.StringFlags() + `
+ExecStart=` + exe + ` --address=` + cfg.Addr + ` serve` + ` --ttrpc-address=` + cfg.TTRPCAddr + ` --debug=` + strconv.FormatBool(cfg.Debug) + ` --root=` + cfg.Root + ` --log-mode=` + strings.ToLower(cfg.LogMode.String()) + ` ` + cfg.Trace.StringFlags() + ` --no-new-namespace=` + strconv.FormatBool(cfg.NoNewNamespace) + `
 `
 }
 
@@ -77,13 +77,14 @@ PassSecurity=yes
 }
 
 type installConfig struct {
-	Trace     TraceConfig
-	Root      string
-	Addr      string
-	TTRPCAddr string
-	Debug     bool
-	LogMode   options.LogMode
-	Socket    string
+	Trace          TraceConfig
+	Root           string
+	Addr           string
+	TTRPCAddr      string
+	Debug          bool
+	LogMode        options.LogMode
+	Socket         string
+	NoNewNamespace bool
 }
 
 func install(ctx context.Context, cfg installConfig) error {

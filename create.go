@@ -16,6 +16,7 @@ import (
 	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/runtime/linux/runctypes"
 	v2runcopts "github.com/containerd/containerd/runtime/v2/runc/options"
@@ -116,6 +117,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		},
 		Bundle:           r.Bundle,
 		Rootfs:           r.Rootfs,
+		noNewNamespace:   s.noNewNamespace,
 		checkpoint:       r.Checkpoint,
 		parentCheckpoint: r.ParentCheckpoint,
 		sendEvent:        s.send,
@@ -424,5 +426,25 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	}
 
 	pidFile := filepath.Join(p.root, "pid")
-	return p.startUnit(ctx, []string{p.exe, "create"}, execStart, pidFile, runcName(p.ns, p.id), []string{"CREATE_TASK_CONFIG=" + f.Name()})
+
+	var prefix []string
+	if len(p.Rootfs) > 0 {
+		if p.noNewNamespace {
+			rootfs, err := mountFS(p.Rootfs, p.Bundle)
+			if err != nil {
+				return 0, err
+			}
+			defer func() {
+				if retErr != nil {
+					if err := mount.UnmountAll(rootfs, 0); err != nil {
+						log.G(ctx).WithError(err).Warn("Error unmounting rootfs")
+					}
+				}
+			}()
+		} else {
+			prefix = []string{p.exe, "create"}
+		}
+	}
+
+	return p.startUnit(ctx, prefix, execStart, pidFile, runcName(p.ns, p.id), []string{"CREATE_TASK_CONFIG=" + f.Name()})
 }
