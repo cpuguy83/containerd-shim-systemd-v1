@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ import (
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	ptypes "github.com/gogo/protobuf/types"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -421,5 +423,18 @@ func (s *Service) Stats(ctx context.Context, r *taskapi.StatsRequest) (_ *taskap
 
 // Update the live container
 func (s *Service) Update(ctx context.Context, r *taskapi.UpdateTaskRequest) (*ptypes.Empty, error) {
-	return nil, errdefs.ErrNotImplemented
+	p := s.processes.Get(r.ID)
+	if p == nil {
+		return nil, errdefs.ErrNotFound
+	}
+
+	var res specs.LinuxResources
+	if err := json.Unmarshal(r.Resources.Value, &res); err != nil {
+		return nil, err
+	}
+
+	if err := p.(*initProcess).Update(ctx, res); err != nil {
+		return nil, err
+	}
+	return &ptypes.Empty{}, nil
 }

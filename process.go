@@ -24,6 +24,7 @@ import (
 	"github.com/containerd/typeurl"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	ptypes "github.com/gogo/protobuf/types"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 )
@@ -418,6 +419,10 @@ func (p *initProcess) Pids(ctx context.Context) ([]*task.ProcessInfo, error) {
 		procs = append(procs, &task.ProcessInfo{Pid: uint32(p)})
 	}
 	return procs, nil
+}
+
+func (p *initProcess) Update(ctx context.Context, res specs.LinuxResources) error {
+	return p.runc.Update(ctx, runcName(p.ns, p.id), &res)
 }
 
 type execProcess struct {
