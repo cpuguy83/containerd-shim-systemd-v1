@@ -47,7 +47,7 @@ jobs:
         run: |
           make build
           sudo make install
-          sudo $(command -v containerd-shim-systemd-v1) --address=/run/containerd-test/containerd.sock --ttrpc-address=/run/containerd-test/containerd.sock.ttrpc install --debug
+          sudo $(command -v containerd-shim-systemd-v1) --address=/run/containerd-test/containerd.sock --ttrpc-address=/run/containerd-test/containerd.sock.ttrpc install --debug --no-new-namespace
       - name: test
         run: |
           set -e -x
