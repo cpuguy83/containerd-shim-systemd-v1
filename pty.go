@@ -298,7 +298,7 @@ func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
 	select {
 	case <-ctx.Done():
 	case status := <-chTTY:
-		span.SetAttributes(attribute.String("tty-unit-stats", status))
+		span.SetAttributes(attribute.String("tty-unit-status", status))
 		if status != "done" {
 			return "", "", fmt.Errorf("failed to start tty service: %s", status)
 		}
