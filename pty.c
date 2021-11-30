@@ -147,7 +147,7 @@ void *handle_tty_ops(void *args)
         return 0;
     }
 
-    fprintf(stderr, "ready for tty clients\n");
+    fprintf(stderr, "Ready for tty clients\n");
 
     while (1)
     {
@@ -206,6 +206,7 @@ void handle_pty(void)
 
     close(sock_fd);
 
+    fprintf(stderr, "Exiting\n");
     exit(0);
 }
 

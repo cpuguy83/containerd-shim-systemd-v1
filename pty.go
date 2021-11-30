@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"os"
 	"path"
@@ -28,7 +29,13 @@ const (
 	ttyHandshakeEnv = "_TTY_HANDSHAKE"
 )
 
-func ttyHandshake() error {
+func ttyHandshake() (retErr error) {
+	fmt.Fprintln(os.Stderr, "TTY handshake phase 1")
+	defer func() {
+		if retErr != nil {
+			daemon.SdNotify(false, daemon.SdNotifyStopping)
+		}
+	}()
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -49,20 +56,22 @@ func ttyHandshake() error {
 		return fmt.Errorf("error listening on sock path: %w", err)
 	}
 
-	if _, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
-		return fmt.Errorf("error notifying that the tty handler is ready")
-	}
+	daemon.SdNotify(false, daemon.SdNotifyReady)
 
+	fmt.Fprintln(os.Stderr, "Waiting for init client")
 	conn, err := l.Accept()
 	if err != nil {
 		return fmt.Errorf("error accepting connection to tty handler: %w", err)
 	}
 	defer conn.Close()
 
+	fmt.Fprintln(os.Stderr, "Waiting for TTY handshake")
 	console, err := recvFd(conn.(*net.UnixConn))
 	if err != nil {
 		return fmt.Errorf("error receiving console fd from tty handler: %w", err)
 	}
+
+	fmt.Fprintln(os.Stderr, "Received console fd")
 
 	if console != 100 {
 		err = unix.Dup2(console, 100)
@@ -122,8 +131,11 @@ func (p *process) ResizePTY(ctx context.Context, width, height int) error {
 	if conn == nil {
 		noRetry = true
 
-		var err error
-		conn, err = net.Dial("unix", p.ttySockPath())
+		s, err := p.ttySockPath()
+		if err != nil {
+			return fmt.Errorf("error getting tty sock path: %w", err)
+		}
+		conn, err = net.Dial("unix", s)
 		if err != nil {
 			return fmt.Errorf("could not dial tty sock: %w", err)
 		}
@@ -245,8 +257,28 @@ func recvFd(socket *net.UnixConn) (int, error) {
 	return fds[0], nil
 }
 
-func (p *process) ttySockPath() string {
-	return filepath.Join(p.root, p.id+"-tty.sock")
+func (p *process) ttySockPath() (string, error) {
+	sockInfoPath := filepath.Join(p.root, p.id+"-tty.sock")
+	b, err := os.ReadFile(sockInfoPath)
+	if err == nil {
+		return string(b), nil
+	}
+
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	tmp, err := ioutil.TempDir(os.Getenv("XDG_RUNTIME_DIR"), "pty")
+	if err != nil {
+		return "", err
+	}
+	s := filepath.Join(tmp, "s")
+	if err := ioutil.WriteFile(sockInfoPath, []byte(s), 0600); err != nil {
+		os.RemoveAll(tmp)
+		return "", err
+	}
+
+	return s, nil
 }
 
 func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
@@ -258,26 +290,39 @@ func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
 		span.End()
 	}()
 
-	sockPath := p.ttySockPath()
+	sockPath, err := p.ttySockPath()
+	if err != nil {
+		return "", "", fmt.Errorf("error getting tty sock path: %w", err)
+	}
 
+	logPath := filepath.Join(p.root, p.id+"-tty.log")
+	defer func() {
+		if retErr != nil {
+			logData, err := ioutil.ReadFile(logPath)
+			if err != nil {
+				log.G(ctx).WithError(err).Info("Could not read tty error log")
+			} else {
+				retErr = fmt.Errorf("%w: %s", retErr, string(logData))
+			}
+		}
+	}()
 	properties := []systemd.Property{
 		systemd.PropType("notify"),
-		systemd.PropExecStart([]string{p.exe}, false),
-		systemd.PropDescription("TTY Handshake for containerd-" + p.Name()),
+		systemd.PropExecStart([]string{p.exe, "tty-handshake"}, false),
+		systemd.PropDescription("TTY Handshake for " + p.Name()),
 		{Name: "Environment", Value: dbus.MakeVariant([]string{
 			ttyHandshakeEnv + "=1",
 			ttySockPathEnv + "=" + sockPath,
 		})},
 		{Name: "StandardInputFile", Value: dbus.MakeVariant(p.Stdin)},
 		{Name: "StandardOutputFile", Value: dbus.MakeVariant(p.Stdout)},
-		{Name: "StandardError", Value: dbus.MakeVariant("journal")},
+		{Name: "StandardErrorFile", Value: dbus.MakeVariant(logPath)},
 	}
 
 	ttyUnit := unitName(p.ns, p.id+"-tty")
 	defer func() {
 		if retErr != nil {
 			p.systemd.StopUnitContext(ctx, ttyUnit, "replace", nil)
-			p.systemd.ResetFailedUnitContext(ctx, ttyUnit)
 		}
 	}()
 

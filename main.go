@@ -201,9 +201,10 @@ func main() {
 			}
 
 			opts := Config{
-				Root:      root,
-				Publisher: publisher,
-				LogMode:   options.LogMode(options.LogMode_value[strings.ToUpper(logMode)]),
+				Root:           root,
+				Publisher:      publisher,
+				LogMode:        options.LogMode(options.LogMode_value[strings.ToUpper(logMode)]),
+				NoNewNamespace: noNewNamespace,
 			}
 			return serve(ctx, opts)
 		},

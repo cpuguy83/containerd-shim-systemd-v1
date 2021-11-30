@@ -94,7 +94,10 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		opts.LogMode = s.defaultLogMode.String()
 	}
 
-	root := filepath.Join(s.root, ns, r.ID)
+	var logPath string
+	if s.debug {
+		logPath = filepath.Join(r.Bundle, "init-runc-debug.log")
+	}
 	p := &initProcess{
 		process: &process{
 			ns:       ns,
@@ -111,9 +114,10 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 				SystemdCgroup: false,
 				PdeathSignal:  syscall.SIGKILL,
 				Root:          filepath.Join(s.root, "runc"),
+				Log:           logPath,
 			},
 			exe:  s.exe,
-			root: root,
+			root: r.Bundle,
 		},
 		Bundle:           r.Bundle,
 		Rootfs:           r.Rootfs,
@@ -141,16 +145,6 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			if _, err := p.Delete(ctx); err != nil {
 				log.G(ctx).WithError(err).Error("error cleaning up failed process")
 			}
-		}
-	}()
-
-	if err := os.MkdirAll(root, 0700); err != nil {
-		return nil, fmt.Errorf("error creating state dir: %w", err)
-	}
-
-	defer func() {
-		if retErr != nil {
-			os.RemoveAll(root)
 		}
 	}()
 
@@ -197,7 +191,15 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 	}
 	pInit := p.(*initProcess)
 
+	if r.Terminal {
+		r.Stderr = ""
+	}
+
 	// TODO: In order to support shim restarts we need to persist this.
+	var logPath string
+	if s.debug {
+		logPath = filepath.Join(pInit.Bundle, r.ExecID+"-runc-debug.log")
+	}
 	ep := &execProcess{
 		Spec:   r.Spec,
 		parent: pInit,
@@ -205,15 +207,22 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 		process: &process{
 			ns:       ns,
 			root:     pInit.root,
-			id:       r.ID + "-" + r.ExecID,
+			id:       r.ExecID,
 			Stdin:    r.Stdin,
 			Stdout:   r.Stdout,
 			Stderr:   r.Stderr,
 			Terminal: r.Terminal,
 			systemd:  s.conn,
-			runc:     pInit.runc,
 			exe:      s.exe,
 			opts:     CreateOptions{LogMode: s.defaultLogMode.String()},
+			runc: &runc.Runc{
+				Debug:         s.debug,
+				Command:       s.runcBin,
+				SystemdCgroup: pInit.runc.SystemdCgroup,
+				PdeathSignal:  syscall.SIGKILL,
+				Root:          pInit.runc.Root,
+				Log:           logPath,
+			},
 		}}
 	ep.process.cond = sync.NewCond(&ep.process.mu)
 	err = pInit.execs.Add(r.ExecID, ep)
@@ -287,16 +296,32 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 
 	if p.Stdin != "" {
 		properties = append(properties, systemd.Property{Name: "StandardInputFile", Value: dbus.MakeVariant(p.Stdin)})
+		f, err := os.OpenFile(p.Stdin, os.O_RDWR, 0)
+		if err != nil {
+			return 0, fmt.Errorf("error opening stdin: %w", err)
+		}
+		defer f.Close()
 	}
 
 	// TODO: journald+tty?
 	switch options.LogMode(options.LogMode_value[p.opts.LogMode]) {
 	case options.LogMode_STDIO:
+		// In case the client doesn't have the fifo's open yet, open them here while booting things up to not block runc or the tty handler.
 		if p.Stdout != "" {
 			properties = append(properties, systemd.Property{Name: "StandardOutputFile", Value: dbus.MakeVariant(p.Stdout)})
+			f, err := os.OpenFile(p.Stdout, os.O_RDWR, 0)
+			if err != nil {
+				return 0, fmt.Errorf("error opening stdout: %w", err)
+			}
+			defer f.Close()
 		}
 		if p.Stderr != "" {
 			properties = append(properties, systemd.Property{Name: "StandardErrorFile", Value: dbus.MakeVariant(p.Stderr)})
+			f, err := os.OpenFile(p.Stderr, os.O_RDWR, 0)
+			if err != nil {
+				return 0, fmt.Errorf("error opening stderr: %w", err)
+			}
+			defer f.Close()
 		}
 	case options.LogMode_NULL:
 		properties = append(properties, systemd.Property{Name: "StandardOutput", Value: dbus.MakeVariant("null")})
@@ -346,7 +371,7 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 			ret := fmt.Errorf("failed to start runc init: %s", status)
 			if p.runc.Debug {
 				ret = fmt.Errorf("%w: %v", ret, execStart)
-				debug, err := os.ReadFile(filepath.Join(p.root, p.id+"-runc-debug.log"))
+				debug, err := os.ReadFile(p.runc.Log)
 				if err == nil {
 					ret = fmt.Errorf("%w:\n%s", ret, string(debug))
 				} else {

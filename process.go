@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -218,7 +219,7 @@ func (p *process) runcCmd(cmd []string) ([]string, error) {
 
 	root := []string{runcPath, "--debug=" + strconv.FormatBool(p.runc.Debug), "--systemd-cgroup=" + strconv.FormatBool(p.opts.SystemdCgroup), "--root", p.runc.Root}
 	if p.runc.Debug {
-		root = append(root, "--log="+filepath.Join(p.root, p.id+"-runc-debug.log"))
+		root = append(root, "--log="+p.runc.Log)
 	}
 
 	return append(root, cmd...), nil
@@ -297,7 +298,7 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	}
 	if err := p.runc.Start(ctx, runcName(p.ns, p.id)); err != nil {
 		if p.runc.Debug {
-			debug, err2 := os.ReadFile(filepath.Join(p.root, p.id+"-runc-debug.log"))
+			debug, err2 := os.ReadFile(p.runc.Log)
 			if err2 == nil {
 				err = fmt.Errorf("%w: %s", err, string(debug))
 			}
@@ -449,7 +450,23 @@ func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		return 0, fmt.Errorf("error creating process.json file: %w", err)
 	}
 
-	if _, err := f.Write(p.Spec.Value); err != nil {
+	v := p.Spec.Value
+
+	if p.Terminal || p.opts.Terminal {
+		// In some cases the process spec may not have `Terminal` set even though it should be.
+		var ps specs.Process
+		if err := json.Unmarshal(v, &ps); err != nil {
+			return 0, fmt.Errorf("error unmarshalling process spec: %w", err)
+		}
+		ps.Terminal = true
+
+		v, err = json.Marshal(ps)
+		if err != nil {
+			return 0, fmt.Errorf("error marshalling process spec: %w", err)
+		}
+	}
+
+	if _, err := f.Write(v); err != nil {
 		return 0, fmt.Errorf("error writing process.json: %w", err)
 	}
 	f.Close()
@@ -463,8 +480,8 @@ func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 
 	pid, err = p.startUnit(ctx, nil, execStart, pidFile, runcName(p.ns, p.parent.id), nil)
 	if err != nil {
-		if _, err := p.Delete(ctx); err != nil {
-			log.G(ctx).WithError(err).Warn("Error cleaning up after failed exec start")
+		if _, err2 := p.Delete(ctx); err2 != nil {
+			log.G(ctx).WithError(err2).Warn("Error cleaning up after failed exec start")
 		}
 		return 0, err
 	}
