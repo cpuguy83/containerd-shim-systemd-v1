@@ -319,9 +319,13 @@ func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFil
 			properties = append(properties, systemd.Property{Name: "StandardErrorFile", Value: dbus.MakeVariant(p.Stderr)})
 			f, err := os.OpenFile(p.Stderr, os.O_RDWR, 0)
 			if err != nil {
-				return 0, fmt.Errorf("error opening stderr: %w", err)
+				if !p.Terminal && !p.opts.Terminal {
+					// There is no point in in returning an error here since we aren't expected to have stderr anyway.
+					return 0, fmt.Errorf("error opening stderr: %w", err)
+				}
+			} else {
+				defer f.Close()
 			}
-			defer f.Close()
 		}
 	case options.LogMode_NULL:
 		properties = append(properties, systemd.Property{Name: "StandardOutput", Value: dbus.MakeVariant("null")})
