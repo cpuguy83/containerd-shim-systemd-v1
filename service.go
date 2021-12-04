@@ -56,7 +56,9 @@ Description=containerd shim service that uses systemd to manage containers
 
 [Service]
 Type=notify
+Environment=UNIT_NAME=%n
 ExecStart=` + exe + ` --address=` + cfg.Addr + ` serve` + ` --ttrpc-address=` + cfg.TTRPCAddr + ` --debug=` + strconv.FormatBool(cfg.Debug) + ` --root=` + cfg.Root + ` --log-mode=` + strings.ToLower(cfg.LogMode.String()) + ` ` + cfg.Trace.StringFlags() + ` --no-new-namespace=` + strconv.FormatBool(cfg.NoNewNamespace) + `
+ExecReload=kill -HUP $MAINPID
 `
 }
 

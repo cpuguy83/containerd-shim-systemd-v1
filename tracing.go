@@ -108,6 +108,8 @@ func UnaryServerInterceptor(ctx context.Context, u ttrpc.Unmarshaler, info *ttrp
 		trace.WithAttributes(RPCSystemAttr),
 	)
 
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("ttrpc.method", info.FullMethod))
+
 	span.AddEvent("sent")
 	resp, err := m(ctx, u)
 	if err != nil {

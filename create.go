@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -16,16 +17,13 @@ import (
 	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/runtime/linux/runctypes"
 	v2runcopts "github.com/containerd/containerd/runtime/v2/runc/options"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
-	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
-	dbus "github.com/godbus/dbus/v5"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/proto"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -98,6 +96,25 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	if s.debug {
 		logPath = filepath.Join(r.Bundle, "init-runc-debug.log")
 	}
+
+	specData, err := ioutil.ReadFile(filepath.Join(r.Bundle, "config.json"))
+	if err != nil {
+		return nil, fmt.Errorf("error reading spec: %w", err)
+	}
+	noNewNamespace := s.noNewNamespace
+
+	if !noNewNamespace {
+		// If the container rootfs is set to shared propagation we must not create use a private namespace.
+		// Otherwise this could prevent the container from legitimately propoagating mounts to the host.
+		var spec specs.Spec
+		if err := json.Unmarshal(specData, &spec); err != nil {
+			return nil, fmt.Errorf("error unmarshalling spec: %w", err)
+		}
+		if spec.Linux.RootfsPropagation == "shared" {
+			noNewNamespace = true
+		}
+	}
+
 	p := &initProcess{
 		process: &process{
 			ns:       ns,
@@ -121,7 +138,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		},
 		Bundle:           r.Bundle,
 		Rootfs:           r.Rootfs,
-		noNewNamespace:   s.noNewNamespace,
+		noNewNamespace:   noNewNamespace,
 		checkpoint:       r.Checkpoint,
 		parentCheckpoint: r.ParentCheckpoint,
 		sendEvent:        s.send,
@@ -166,6 +183,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		Checkpoint: r.Checkpoint,
 		Pid:        pid,
 	})
+
 	return &taskapi.CreateTaskResponse{Pid: pid}, nil
 }
 
@@ -229,7 +247,13 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 	if err != nil {
 		return nil, fmt.Errorf("process %s: %w", r.ExecID, err)
 	}
+
 	s.units.Add(ep)
+	if err := ep.Create(ctx); err != nil {
+		s.units.Delete(ep)
+		pInit.execs.Delete(r.ExecID)
+		return nil, err
+	}
 
 	s.send(ctx, ns, &eventsapi.TaskExecAdded{
 		ContainerID: pInit.id,
@@ -238,242 +262,283 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 	return &ptypes.Empty{}, nil
 }
 
-func (p *process) startUnit(ctx context.Context, prefixCmd, cmd []string, pidFile, id string, extraEnvs []string) (_ uint32, retErr error) {
-	ctx, span := StartSpan(ctx, "process.StartUnit")
+func (p *execProcess) pidFile() string {
+	return filepath.Join(p.root, p.id+".pid")
+}
+
+func (p *execProcess) Create(ctx context.Context) error {
+	pJson := p.processFilePath()
+	if err := os.MkdirAll(filepath.Dir(pJson), 0700); err != nil {
+		return err
+	}
+
+	v := p.Spec.Value
+	if p.Terminal || p.opts.Terminal {
+		var spec specs.Process
+		if err := json.Unmarshal(p.Spec.Value, &spec); err != nil {
+			return fmt.Errorf("error unmarshaling spec: %w", err)
+		}
+		spec.Terminal = true
+
+		var err error
+		v, err = json.Marshal(spec)
+		if err != nil {
+			return fmt.Errorf("error marshaling spec: %w", err)
+		}
+	}
+
+	if err := os.WriteFile(pJson, v, 0600); err != nil {
+		return err
+	}
+
+	opts, err := p.startOptions()
+	if err != nil {
+		return err
+	}
+
+	if err := writeUnit(p.Name(), opts); err != nil {
+		return err
+	}
+	if err := p.systemd.ReloadContext(ctx); err != nil {
+		log.G(ctx).WithError(err).Warn("failed to reload systemd")
+	}
+	return nil
+}
+
+func (p *execProcess) processFilePath() string {
+	return filepath.Join(filepath.Join(p.root, "execs", p.id+"-process.json"))
+}
+
+func (p *initProcess) mountConfigPath() string {
+	return filepath.Join(p.Bundle, "mounts.pb")
+}
+
+func (p *initProcess) writeMountConfig() error {
+	req := taskapi.CreateTaskRequest{Bundle: p.Bundle, Rootfs: p.Rootfs}
+	data, err := proto.Marshal(&req)
+	if err != nil {
+		return fmt.Errorf("error marshaling task create config")
+	}
+
+	if err := os.WriteFile(p.mountConfigPath(), data, 0600); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *initProcess) createRestore(ctx context.Context) error {
+	if p.opts.CriuWorkPath == "" {
+		p.opts.CriuWorkPath = filepath.Join(p.root, "criu-work")
+	}
+	// We seem to be missing Terminal info when doing a restore, so get that from the spec.
+	data, err := os.ReadFile(filepath.Join(p.Bundle, "config.json"))
+	if err != nil {
+		return fmt.Errorf("could not read config.json: %w", err)
+	}
+	var spec specs.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return fmt.Errorf("error unmarshalling config.json")
+	}
+	p.Terminal = spec.Process.Terminal
+
+	execStart := []string{
+		"restore",
+		"--image-path=" + p.checkpoint,
+		"--work-path=" + p.opts.CriuWorkPath,
+		"--bundle=" + p.Bundle,
+		"--no-pivot=" + strconv.FormatBool(p.opts.NoPivotRoot),
+		"--no-subreaper",
+	}
+
+	if p.Terminal || p.opts.Terminal {
+		execStart = append(execStart, "--detach")
+		s, err := p.ttySockPath()
+		if err != nil {
+			return err
+		}
+		execStart = append(execStart, "--console-socket="+s)
+		p.opts.ExternalUnixSockets = true
+	}
+	execStart = append(execStart, p.opts.RestoreArgs()...)
+
+	unitOpts, err := p.startOptions(execStart)
+	if err != nil {
+		return err
+	}
+
+	if err := writeUnit(p.Name(), unitOpts); err != nil {
+		return err
+	}
+	if err := p.systemd.ReloadContext(ctx); err != nil {
+		log.G(ctx).WithError(err).Warn("Error reloading systemd")
+	}
+
+	return nil
+}
+
+// For init processes we start a unit immediately.
+// runc will hold a process open in the background and wait for the caller to setup namespaces and so on.
+// Then once that is complete the caller will call "start", which we will just call `runc start`.
+func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
+	ctx, span := StartSpan(ctx, "InitProcess.Create")
 	defer func() {
 		if retErr != nil {
 			span.SetStatus(codes.Error, retErr.Error())
+			p.runc.Delete(ctx, p.Name(), &runc.DeleteOpts{Force: true})
 		}
 		span.End()
 	}()
 
-	execStart, err := p.runcCmd(cmd)
+	if err := p.writeMountConfig(); err != nil {
+		return 0, err
+	}
+
+	if p.checkpoint != "" {
+		return 0, p.createRestore(ctx)
+
+	}
+
+	rcmd := []string{
+		"create",
+		"--bundle=" + p.Bundle,
+		"--no-pivot=" + strconv.FormatBool(p.opts.NoPivotRoot),
+		"--no-new-keyring=" + strconv.FormatBool(p.opts.NoNewKeyring),
+		"--pid-file=" + p.pidFile(),
+	}
+	if p.Terminal || p.opts.Terminal {
+		s, err := p.ttySockPath()
+		if err != nil {
+			return 0, err
+		}
+		rcmd = append(rcmd, "--console-socket="+s)
+	}
+
+	unitOpts, err := p.startOptions(rcmd)
 	if err != nil {
 		return 0, err
 	}
-	if len(prefixCmd) > 0 {
-		execStart = append(prefixCmd, execStart...)
-	}
-	var properties []systemd.Property
-	if p.opts.SdNotifyEnable {
-		properties = []systemd.Property{systemd.PropType("notify")}
-	} else {
-		if pidFile != "" {
-			execStart = append(execStart, "--pid-file="+pidFile)
-			properties = []systemd.Property{
-				systemd.PropType("forking"),
-				{Name: "PIDFile", Value: dbus.MakeVariant(pidFile)},
-			}
-		}
-	}
-
-	properties = append(properties, systemd.Property{Name: "Delegate", Value: dbus.MakeVariant(true)})
-	if len(extraEnvs) > 0 {
-		properties = append(properties, systemd.Property{Name: "Environment", Value: dbus.MakeVariant(extraEnvs)})
-	}
 
 	if p.Terminal || p.opts.Terminal {
-		// TODO: We need to bind the pty copier to the container's lifecycle
-		// This would ensure that once the container exits, the pty copier exits
-		ttyUnit, sockPath, err := p.makePty(ctx)
+		u, _, err := p.makePty(ctx)
 		if err != nil {
-			return 0, fmt.Errorf("error setting up tty handler: %w", err)
+			return 0, err
 		}
+
 		defer func() {
 			if retErr != nil {
-				if _, err := p.systemd.StopUnitContext(ctx, ttyUnit, "replace", nil); err != nil {
-					log.G(ctx).WithError(err).WithField("unit", ttyUnit).Debug("failed to stop tty unit unit")
-				}
-				if err := p.systemd.ResetFailedUnitContext(ctx, ttyUnit); err != nil {
-					log.G(ctx).WithError(err).WithField("unit", ttyUnit).Debug("Error reseting tty unit")
-				}
+				p.systemd.KillUnitContext(ctx, u, int32(syscall.SIGKILL))
 			}
 		}()
-
-		// Add the console socket option to runc's exec-start
-		execStart = append(execStart, "--console-socket", sockPath)
 	}
 
+	if err := writeUnit(p.Name(), unitOpts); err != nil {
+		return 0, err
+	}
+	if err := p.systemd.ReloadContext(ctx); err != nil {
+		log.G(ctx).WithError(err).Warn("Error reloading systemd")
+	}
+	return p.startUnit(ctx)
+}
+
+func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 	if p.Stdin != "" {
-		properties = append(properties, systemd.Property{Name: "StandardInputFile", Value: dbus.MakeVariant(p.Stdin)})
 		f, err := os.OpenFile(p.Stdin, os.O_RDWR, 0)
-		if err != nil {
-			return 0, fmt.Errorf("error opening stdin: %w", err)
-		}
-		defer f.Close()
-	}
-
-	// TODO: journald+tty?
-	switch options.LogMode(options.LogMode_value[p.opts.LogMode]) {
-	case options.LogMode_STDIO:
-		// In case the client doesn't have the fifo's open yet, open them here while booting things up to not block runc or the tty handler.
-		if p.Stdout != "" {
-			properties = append(properties, systemd.Property{Name: "StandardOutputFile", Value: dbus.MakeVariant(p.Stdout)})
-			f, err := os.OpenFile(p.Stdout, os.O_RDWR, 0)
-			if err != nil {
-				return 0, fmt.Errorf("error opening stdout: %w", err)
-			}
+		if err == nil {
 			defer f.Close()
 		}
-		if p.Stderr != "" {
-			properties = append(properties, systemd.Property{Name: "StandardErrorFile", Value: dbus.MakeVariant(p.Stderr)})
-			f, err := os.OpenFile(p.Stderr, os.O_RDWR, 0)
-			if err != nil {
-				if !p.Terminal && !p.opts.Terminal {
-					// There is no point in in returning an error here since we aren't expected to have stderr anyway.
-					return 0, fmt.Errorf("error opening stderr: %w", err)
-				}
-			} else {
-				defer f.Close()
-			}
-		}
-	case options.LogMode_NULL:
-		properties = append(properties, systemd.Property{Name: "StandardOutput", Value: dbus.MakeVariant("null")})
-		properties = append(properties, systemd.Property{Name: "StandardError", Value: dbus.MakeVariant("null")})
-	case options.LogMode_JOURNALD:
-	default:
-		return 0, fmt.Errorf("%w: invalid log mode: %s", errdefs.ErrInvalidArgument, p.opts.LogMode)
 	}
 
-	name := p.Name()
-	defer func() {
-		if retErr != nil {
-			p.systemd.StopUnitContext(ctx, name, "replace", nil)
-			p.systemd.ResetFailedUnitContext(ctx, name)
+	if p.Stdout != "" {
+		f, err := os.OpenFile(p.Stdout, os.O_RDWR, 0)
+		if err == nil {
+			defer f.Close()
 		}
-	}()
+	}
 
-	properties = append(properties, systemd.PropExecStart(append(execStart, id), false))
-
-	chMain := make(chan string, 1)
-	_, err = p.systemd.StartTransientUnitContext(ctx, name, "replace", properties, chMain)
-	if err != nil {
-		if e := p.systemd.ResetFailedUnitContext(ctx, name); e == nil {
-			chMain = make(chan string, 1)
-			_, err2 := p.systemd.StartTransientUnitContext(ctx, name, "replace", properties, chMain)
-			if err2 == nil {
-				err = nil
-			}
-		} else {
-			log.G(ctx).WithField("unit", name).WithError(e).Warn("Error reseting failed unit")
+	if p.Stderr != "" {
+		f, err := os.OpenFile(p.Stderr, os.O_RDWR, 0)
+		if err == nil {
+			defer f.Close()
 		}
-		if err != nil {
-			return 0, fmt.Errorf("error starting systemd runc unit: %w", err)
+	}
+
+	uName := p.Name()
+	ch := make(chan string, 1)
+	if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
+		if err := p.runc.Delete(ctx, p.Name(), &runc.DeleteOpts{Force: true}); err != nil && !strings.Contains(err.Error(), "not found") {
+			log.G(ctx).WithError(err).Info("Error deleting container in runc")
+		}
+		if err := p.systemd.ResetFailedUnitContext(ctx, uName); err != nil {
+			log.G(ctx).WithError(err).Info("Error resetting failed unit")
+		}
+
+		ch = make(chan string, 1)
+		if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
+			return 0, fmt.Errorf("error starting unit: %w", err)
 		}
 	}
 
 	select {
 	case <-ctx.Done():
-	case status := <-chMain:
+		p.Kill(ctx, int(syscall.SIGKILL), true)
+		// TODO: Delete?
+		return 0, ctx.Err()
+	case status := <-ch:
 		if status != "done" {
-			var ps pState
-			if err := getUnitState(ctx, p.systemd, name, &ps); err != nil {
-				log.G(ctx).WithError(err).Warn("Error getting unit state")
-			} else {
-				ps = p.SetState(ctx, ps)
+			pid, _ := p.readPidFile()
+			if pid > 0 {
+				// In some cases the unit may be marked as failed because it exited immediately.
+				// This isn't neccessarily a real failure... e.g. `/bin/sh -c "exit 1"`
+				// In this case the unit will have failed to start, but if you add a sleep before exit it will succeed.
+				// If we have a pid from runc, we know the container started.
+				return pid, nil
 			}
-			ret := fmt.Errorf("failed to start runc init: %s", status)
+
+			ret := fmt.Errorf("error starting systemd unit: %s", status)
 			if p.runc.Debug {
-				ret = fmt.Errorf("%w: %v", ret, execStart)
-				debug, err := os.ReadFile(p.runc.Log)
+				unitData, err := os.ReadFile("/run/systemd/system/" + uName)
 				if err == nil {
-					ret = fmt.Errorf("%w:\n%s", ret, string(debug))
-				} else {
-					log.G(ctx).WithError(err).Warn("Error opening runc debug log")
+					ret = fmt.Errorf("%w:\n%s", ret, string(unitData))
+				}
+				logData, err := os.ReadFile(p.runc.Log)
+				if err == nil {
+					ret = fmt.Errorf("%w\n%s", ret, string(logData))
 				}
 			}
 			return 0, ret
 		}
 	}
 
-	pid, err := p.systemd.GetServicePropertyContext(ctx, name, "MainPID")
+	pid, err := p.readPidFile()
+	if err != nil {
+		var ps pState
+		if err := getUnitState(ctx, p.systemd, uName, &ps); err != nil {
+			return 0, err
+		}
+		if ps.Pid == 0 {
+			return 0, fmt.Errorf("error reading pid file: %w", err)
+		}
+		pid = ps.Pid
+	}
+
+	p.mu.Lock()
+	if p.state.Pid == 0 {
+		p.state.Pid = uint32(pid)
+	}
+	p.mu.Unlock()
+	return uint32(pid), nil
+}
+
+func (p *initProcess) readPidFile() (uint32, error) {
+	pidData, err := os.ReadFile(p.pidFile())
 	if err != nil {
 		return 0, err
 	}
 
-	ps := pState{Pid: pid.Value.Value().(uint32)}
-	p.SetState(ctx, ps)
-	return ps.Pid, nil
-}
-
-// For init processes we start a unit immediately.
-// runc will hold a process open in the background and wait for the caller to setup namespaces and so on.
-// Then once that is complete the caller will call "start", which we will just call `runc start`.
-//
-// TODO: checkpoint support
-func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
-	ctx, span := StartSpan(ctx, "InitProcess.Create")
-	defer func() {
-		if retErr != nil {
-			span.SetStatus(codes.Error, retErr.Error())
-			p.runc.Delete(ctx, runcName(p.ns, p.id), &runc.DeleteOpts{Force: true})
-		}
-		span.End()
-	}()
-
-	if p.checkpoint != "" {
-		if p.opts.CriuWorkPath == "" {
-			p.opts.CriuWorkPath = filepath.Join(p.root, "criu-work")
-		}
-		// We seem to be missing Terminal info when doing a restore, so get that from the spec.
-		data, err := os.ReadFile(filepath.Join(p.Bundle, "config.json"))
-		if err != nil {
-			return 0, fmt.Errorf("could not read config.json: %w", err)
-		}
-		var spec specs.Spec
-		if err := json.Unmarshal(data, &spec); err != nil {
-			return 0, fmt.Errorf("error unmarshalling config.json")
-		}
-		p.Terminal = spec.Process.Terminal
-		return 0, nil
-	}
-
-	execStart := []string{
-		"create",
-		"--bundle=" + p.Bundle,
-		"--no-pivot=" + strconv.FormatBool(p.opts.NoPivotRoot),
-		"--no-new-keyring=" + strconv.FormatBool(p.opts.NoNewKeyring),
-	}
-
-	f, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), p.id+"-task-config")
+	pid, err := strconv.Atoi(string(pidData))
 	if err != nil {
-		return 0, fmt.Errorf("error creating task config temp file: %w", err)
-	}
-	defer func() {
-		f.Close()
-		os.RemoveAll(f.Name())
-	}()
-
-	req := taskapi.CreateTaskRequest{Bundle: p.Bundle, Rootfs: p.Rootfs}
-	data, err := proto.Marshal(&req)
-	if err != nil {
-		return 0, fmt.Errorf("error marshaling task create config")
+		return 0, fmt.Errorf("error parsing pid file: %w", err)
 	}
 
-	if _, err := f.Write(data); err != nil {
-		return 0, fmt.Errorf("error writing task create config to file")
-	}
-
-	pidFile := filepath.Join(p.root, "pid")
-
-	var prefix []string
-	if len(p.Rootfs) > 0 {
-		if p.noNewNamespace {
-			rootfs, err := mountFS(p.Rootfs, p.Bundle)
-			if err != nil {
-				return 0, err
-			}
-			defer func() {
-				if retErr != nil {
-					if err := mount.UnmountAll(rootfs, 0); err != nil {
-						log.G(ctx).WithError(err).Warn("Error unmounting rootfs")
-					}
-				}
-			}()
-		} else {
-			prefix = []string{p.exe, "create"}
-		}
-	}
-
-	return p.startUnit(ctx, prefix, execStart, pidFile, runcName(p.ns, p.id), []string{"CREATE_TASK_CONFIG=" + f.Name()})
+	return uint32(pid), nil
 }

@@ -5,7 +5,7 @@ INSTALL ?= install
 GO ?= go
 prog = containerd-shim-systemd-v1
 
-NO_NEW_NAMESPACE ?= true
+NO_NEW_NAMESPACE ?= false
 
 build:
 	$(GO) build -o bin/ .

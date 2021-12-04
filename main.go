@@ -11,6 +11,7 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -135,6 +136,24 @@ func main() {
 
 	traceCfg := TraceFlags(flags)
 
+	doMount := func(ctx context.Context) error {
+		cfgData, err := os.ReadFile(flags.Arg(0))
+		if err != nil {
+			return err
+		}
+
+		var cfg taskapi.CreateTaskRequest
+		if err := proto.Unmarshal(cfgData, &cfg); err != nil {
+			return fmt.Errorf("error unmarshalling task create: %w", err)
+		}
+
+		target, err := mountFS(cfg.Rootfs, cfg.Bundle)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "Mounted rootfs to", target)
+		return err
+	}
 	commands := map[string]func(context.Context) error{
 		"install": func(ctx context.Context) error {
 			cfg := installConfig{
@@ -189,6 +208,7 @@ func main() {
 			return err
 		},
 		"serve": func(ctx context.Context) error {
+			log.G(ctx).Infof("Starting with unit name %s", os.Getenv("UNIT_NAME"))
 			done, err := ConfigureTracing(ctx, traceCfg)
 			if err != nil {
 				return err
@@ -208,38 +228,33 @@ func main() {
 			}
 			return serve(ctx, opts)
 		},
-		"create": func(ctx context.Context) (retErr error) {
-			runtime.LockOSThread()
-
-			data, err := os.ReadFile(os.Getenv("CREATE_TASK_CONFIG"))
+		"mount": func(ctx context.Context) error {
+			if flags.NArg() != 1 {
+				return errors.New("mount requires exactly one argument")
+			}
+			return doMount(ctx)
+		},
+		"unmount": func(ctx context.Context) error {
+			return mount.UnmountAll(flags.Arg(0), 0)
+		},
+		"create": func(ctx context.Context) error {
+			if err := doMount(ctx); err != nil {
+				return err
+			}
+			fmt.Fprintln(os.Stderr, os.Args[2], os.Args[2:])
+			return syscall.Exec(os.Args[3], os.Args[3:], nil)
+		},
+		"notify": func(ctx context.Context) error {
+			f, err := os.OpenFile(flags.Arg(0), os.O_RDWR, 0)
 			if err != nil {
-				return fmt.Errorf("error reading task config stream")
+				return err
 			}
+			defer f.Close()
 
-			var create taskapi.CreateTaskRequest
-			if err := proto.Unmarshal(data, &create); err != nil {
-				return fmt.Errorf("error unmarshaling task config data")
+			if _, err := f.Write([]byte{0}); err != nil {
+				return err
 			}
-
-			if len(create.Rootfs) > 0 {
-				// This is pretty much the whole reason we have this special subcommand.
-				// We want to prevent this mount from escaping to the host mount namespace.
-				// First, create a new mount ns, then we remount the host rootfs with our own propagation.
-				if err := unix.Unshare(unix.CLONE_NEWNS); err != nil {
-					return err
-				}
-
-				// Note: Do not use private mount propagation here, otherwise we'll prevent unmounts for stuff we don't care about on the host.
-				if err := unix.Mount("", "/", "", unix.MS_SLAVE|unix.MS_REC, ""); err != nil {
-					return err
-				}
-
-				if _, err := mountFS(create.Rootfs, create.Bundle); err != nil {
-					return err
-				}
-			}
-
-			return syscall.Exec(os.Args[2], os.Args[2:], nil)
+			return nil
 		},
 	}
 
@@ -309,7 +324,9 @@ func main() {
 		errOut(fmt.Errorf("unknown command %v", action))
 	}
 
-	errOut(cmd(ctx))
+	if err := cmd(ctx); err != nil {
+		errOut(fmt.Errorf("%s: %w", action, err))
+	}
 }
 
 func serve(ctx context.Context, cfg Config) error {

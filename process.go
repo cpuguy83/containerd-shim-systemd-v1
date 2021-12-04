@@ -2,12 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -26,8 +23,6 @@ import (
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 )
 
 type processManager struct {
@@ -161,7 +156,8 @@ type process struct {
 	id   string
 	root string
 
-	exe string
+	exe        string
+	notifyFifo string
 
 	Stdin    string
 	Stdout   string
@@ -200,8 +196,12 @@ func (p *process) SetState(ctx context.Context, state pState) pState {
 	return state
 }
 
-func (p *process) Name() string {
-	return unitName(p.ns, p.id)
+func (p *execProcess) Name() string {
+	return unitName(p.ns, p.parent.id+"-"+p.id, "exec")
+}
+
+func (p *initProcess) Name() string {
+	return unitName(p.ns, p.id, "init")
 }
 
 func (p *process) Pid() uint32 {
@@ -211,28 +211,11 @@ func (p *process) Pid() uint32 {
 	return pid
 }
 
-func (p *process) runcCmd(cmd []string) ([]string, error) {
-	runcPath, err := exec.LookPath("runc")
-	if err != nil {
-		return nil, err
-	}
-
-	root := []string{runcPath, "--debug=" + strconv.FormatBool(p.runc.Debug), "--systemd-cgroup=" + strconv.FormatBool(p.opts.SystemdCgroup), "--root", p.runc.Root}
-	if p.runc.Debug {
-		root = append(root, "--log="+p.runc.Log)
-	}
-
-	return append(root, cmd...), nil
+func (p *execProcess) Kill(ctx context.Context, sig int, all bool) error {
+	return p.systemd.KillUnitWithTarget(ctx, p.Name(), systemd.Main, int32(sig))
 }
 
-func (p *process) Kill(ctx context.Context, sig int, all bool) error {
-	p.mu.Lock()
-	if p.deleted {
-		p.mu.Unlock()
-		return errdefs.ErrNotFound
-	}
-	p.mu.Unlock()
-
+func (p *initProcess) Kill(ctx context.Context, sig int, all bool) error {
 	who := systemd.Main
 	if all {
 		who = systemd.All
@@ -242,12 +225,12 @@ func (p *process) Kill(ctx context.Context, sig int, all bool) error {
 	}
 	if p.ProcessState().Exited() {
 		// per upstream integration tests, this should return not found
-		return errdefs.ErrNotFound
+		return fmt.Errorf("process has already exited: %w", errdefs.ErrNotFound)
 	}
 
-	if err := p.systemd.KillUnitWithTarget(ctx, unitName(p.ns, p.id), who, int32(sig)); err != nil {
-		if _, err2 := p.runc.State(ctx, runcName(p.ns, p.id)); err2 != nil && strings.Contains(err2.Error(), "not found") {
-			return errdefs.ErrNotFound
+	if err := p.systemd.KillUnitWithTarget(ctx, p.Name(), who, int32(sig)); err != nil {
+		if _, err2 := p.runc.State(ctx, p.Name()); err2 != nil && strings.Contains(err2.Error(), "not found") {
+			return fmt.Errorf("could not get runc state: %w", errdefs.ErrNotFound)
 		}
 		units, e := p.systemd.ListUnitsByNamesContext(ctx, []string{p.Name()})
 		if err != nil {
@@ -283,50 +266,8 @@ type initProcess struct {
 	sendEvent func(ctx context.Context, ns string, evt interface{})
 }
 
-func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
-	ctx, span := StartSpan(ctx, "InitProcess.Start")
-	defer func() {
-		if retErr != nil {
-			span.SetStatus(codes.Error, retErr.Error())
-		}
-		span.SetAttributes(attribute.Int("pid", int(pid)))
-		span.End()
-	}()
-
-	if p.checkpoint != "" {
-		return p.restore(ctx)
-	}
-	if err := p.runc.Start(ctx, runcName(p.ns, p.id)); err != nil {
-		if p.runc.Debug {
-			debug, err2 := os.ReadFile(p.runc.Log)
-			if err2 == nil {
-				err = fmt.Errorf("%w: %s", err, string(debug))
-			}
-		}
-		return 0, fmt.Errorf("runc start: %w", err)
-	}
-	p.mu.Lock()
-	pid = p.state.Pid
-	p.mu.Unlock()
-	return pid, nil
-}
-
-func (p *initProcess) restore(ctx context.Context) (pid uint32, retErr error) {
-	execStart := []string{
-		"restore",
-		"--image-path=" + p.checkpoint,
-		"--work-path=" + p.opts.CriuWorkPath,
-		"--bundle=" + p.Bundle,
-		"--no-pivot=" + strconv.FormatBool(p.opts.NoPivotRoot),
-		"--no-subreaper",
-	}
-
-	if p.Terminal || p.opts.Terminal {
-		execStart = append(execStart, "--detach")
-	}
-
-	execStart = append(execStart, p.opts.RestoreArgs()...)
-	return p.startUnit(ctx, nil, execStart, filepath.Join(p.root, "pid"), runcName(p.ns, p.id), nil)
+func (p *initProcess) pidFile() string {
+	return filepath.Join(p.root, p.id+".pid")
 }
 
 func (p *initProcess) SetState(ctx context.Context, state pState) pState {
@@ -391,7 +332,7 @@ func (p *initProcess) Checkpoint(ctx context.Context, r *ptypes.Any) error {
 		actions = append(actions, runc.LeaveRunning)
 	}
 
-	if err := p.runc.Checkpoint(ctx, runcName(p.ns, p.id), &opts, actions...); err != nil {
+	if err := p.runc.Checkpoint(ctx, p.Name(), &opts, actions...); err != nil {
 		if p.runc.Debug {
 			f, err2 := os.ReadFile(filepath.Join(opts.WorkDir, "dump.log"))
 			if err2 == nil {
@@ -404,15 +345,15 @@ func (p *initProcess) Checkpoint(ctx context.Context, r *ptypes.Any) error {
 }
 
 func (p *initProcess) Pause(ctx context.Context) error {
-	return p.runc.Pause(ctx, runcName(p.ns, p.id))
+	return p.runc.Pause(ctx, p.Name())
 }
 
 func (p *initProcess) Resume(ctx context.Context) error {
-	return p.runc.Resume(ctx, runcName(p.ns, p.id))
+	return p.runc.Resume(ctx, p.Name())
 }
 
 func (p *initProcess) Pids(ctx context.Context) ([]*task.ProcessInfo, error) {
-	ls, err := p.runc.Ps(ctx, runcName(p.ns, p.id))
+	ls, err := p.runc.Ps(ctx, p.Name())
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +366,7 @@ func (p *initProcess) Pids(ctx context.Context) ([]*task.ProcessInfo, error) {
 }
 
 func (p *initProcess) Update(ctx context.Context, res specs.LinuxResources) error {
-	return p.runc.Update(ctx, runcName(p.ns, p.id), &res)
+	return p.runc.Update(ctx, p.Name(), &res)
 }
 
 type execProcess struct {
@@ -435,57 +376,30 @@ type execProcess struct {
 	execID string
 }
 
-func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
-	ctx, span := StartSpan(ctx, "ExecProcess.Start")
-	defer func() {
-		if retErr != nil {
-			span.SetStatus(codes.Error, retErr.Error())
-		}
-		span.SetAttributes(attribute.Int("pid", int(pid)))
-		span.End()
-	}()
+func (p *execProcess) getPid(ctx context.Context) (uint32, error) {
+	if pid := p.ProcessState().Pid; pid > 0 {
+		return pid, nil
+	}
 
-	f, err := ioutil.TempFile(os.Getenv("XDG_RUNTIME_DIR"), p.id+"process-json")
+	var st pState
+	if err := getUnitState(ctx, p.systemd, p.Name(), &st); err == nil {
+		if st.Pid > 0 {
+			return st.Pid, nil
+		}
+	} else {
+		log.G(ctx).WithError(err).Warn("failed to get unit state")
+	}
+
+	pidData, err := os.ReadFile(p.pidFile())
 	if err != nil {
-		return 0, fmt.Errorf("error creating process.json file: %w", err)
+		return 0, fmt.Errorf("could not get pid of process: %w", err)
 	}
 
-	v := p.Spec.Value
-
-	if p.Terminal || p.opts.Terminal {
-		// In some cases the process spec may not have `Terminal` set even though it should be.
-		var ps specs.Process
-		if err := json.Unmarshal(v, &ps); err != nil {
-			return 0, fmt.Errorf("error unmarshalling process spec: %w", err)
-		}
-		ps.Terminal = true
-
-		v, err = json.Marshal(ps)
-		if err != nil {
-			return 0, fmt.Errorf("error marshalling process spec: %w", err)
-		}
-	}
-
-	if _, err := f.Write(v); err != nil {
-		return 0, fmt.Errorf("error writing process.json: %w", err)
-	}
-	f.Close()
-
-	execStart := []string{"exec", "--process", f.Name(), "-d"}
-
-	pidFile := filepath.Join(p.root, p.id+"-pid")
-	if p.Terminal {
-		execStart = append(execStart, "-t")
-	}
-
-	pid, err = p.startUnit(ctx, nil, execStart, pidFile, runcName(p.ns, p.parent.id), nil)
+	pid, err := strconv.Atoi(string(pidData))
 	if err != nil {
-		if _, err2 := p.Delete(ctx); err2 != nil {
-			log.G(ctx).WithError(err2).Warn("Error cleaning up after failed exec start")
-		}
-		return 0, err
+		return 0, fmt.Errorf("error parsing pid: %w", err)
 	}
-	return pid, nil
+	return uint32(pid), nil
 }
 
 func (p *execProcess) SetState(ctx context.Context, state pState) pState {

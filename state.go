@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
 	"path"
+	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/api/types/task"
@@ -28,6 +31,17 @@ func (m *unitManager) Watch(ctx context.Context) {
 	}
 
 	var st pState
+
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+
+	if !timer.Stop() {
+		<-timer.C
+	}
+
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
 
 	for {
 		m.mu.Lock()
@@ -58,7 +72,7 @@ func (m *unitManager) Watch(ctx context.Context) {
 		for _, unit := range units {
 			p := m.Get(unit.Name)
 			if p == nil {
-				log.G(ctx).Debugf("Skipping unit status update for unknown unit: %s", p)
+				log.G(ctx).Debugf("Skipping unit status update for unknown unit: %+v", unit)
 				continue
 			}
 
@@ -66,12 +80,10 @@ func (m *unitManager) Watch(ctx context.Context) {
 			if state.Status == "running" && unit.SubState == "running" {
 				continue
 			}
-			if state.Pid == 0 {
-				continue
-			}
 
 			if state.Exited() {
 				// Process is already exited, we don't care about state updates on this unit anymore
+				log.G(ctx).Debug("Skipped unit status update for exited process")
 				continue
 			}
 
@@ -86,11 +98,17 @@ func (m *unitManager) Watch(ctx context.Context) {
 			st.Reset()
 		}
 
+		timer.Reset(time.Second)
 		select {
 		case <-ctx.Done():
 			log.G(ctx).WithError(ctx.Err()).Info("Exiting unit watch loop")
 			return
-		case <-time.After(time.Second):
+		case <-hup:
+			log.G(ctx).Debug("Received SIGHUP, reloading units")
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
 		}
 	}
 }
@@ -154,7 +172,8 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 	}
 
 	return &taskapi.StateResponse{
-		ID:         st.ID,
+		ID:         r.ID,
+		ExecID:     r.ExecID,
 		Bundle:     st.Bundle,
 		Pid:        st.State.Pid,
 		ExitStatus: st.State.ExitCode,
@@ -232,15 +251,15 @@ func (p *execProcess) State(ctx context.Context) (*State, error) {
 
 func toStatus(s string) task.Status {
 	switch s {
-	case "created":
+	case "created", "start-pre":
 		return task.StatusCreated
-	case "running":
+	case "running", "start-post":
 		return task.StatusRunning
 	case "pausing":
 		return task.StatusPausing
 	case "paused":
 		return task.StatusPaused
-	case "stopped", "dead", "failed":
+	case "stopped", "dead", "failed", "stop-post":
 		return task.StatusStopped
 	default:
 		return task.StatusUnknown

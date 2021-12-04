@@ -12,7 +12,6 @@ import (
 
 	"github.com/containerd/cgroups"
 	cgroupsv2 "github.com/containerd/cgroups/v2"
-	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/containerd/log"
@@ -109,70 +108,12 @@ func (s *Service) Cleanup(ctx context.Context) (*taskapi.DeleteResponse, error) 
 	return &taskapi.DeleteResponse{}, nil
 }
 
-func unitName(ns, id string) string {
-	return "containerd-" + ns + "-" + id + ".service"
-}
-
-func runcName(ns, id string) string {
-	return ns + "-" + id
-}
-
-// Start the primary user process inside the container
-func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskapi.StartResponse, retErr error) {
-	ns, err := namespaces.NamespaceRequired(ctx)
-	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+func unitName(ns, id, mod string) string {
+	n := "io-containerd-systemd-" + ns + "-" + id
+	if mod != "" {
+		n += "-" + mod
 	}
-
-	ctx, span := StartSpan(ctx, "service.Start", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
-	defer func() {
-		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "start")
-			span.SetStatus(codes.Error, retErr.Error())
-		}
-		span.End()
-	}()
-
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns).WithField("execID", r.ExecID))
-
-	p := s.processes.Get(path.Join(ns, r.ID))
-	if p == nil {
-		return nil, fmt.Errorf("%w: %s", errdefs.ErrNotFound, r.ID)
-	}
-
-	defer func() {
-		if retErr != nil {
-			p.SetState(ctx, pState{ExitCode: 139, ExitedAt: time.Now(), Status: "failed"})
-		}
-	}()
-
-	var pid uint32
-	if r.ExecID != "" {
-		ep := p.(*initProcess).execs.Get(r.ExecID)
-		if ep == nil {
-			return nil, fmt.Errorf("exec %s: %w", r.ExecID, errdefs.ErrNotFound)
-		}
-		pid, err = ep.Start(ctx)
-		if err != nil {
-			return nil, err
-		}
-		s.send(ctx, ns, &eventsapi.TaskExecStarted{
-			ContainerID: r.ID,
-			ExecID:      r.ExecID,
-			Pid:         pid,
-		})
-	} else {
-		pid, err = p.Start(ctx)
-		if err != nil {
-			return nil, err
-		}
-		s.send(ctx, ns, &eventsapi.TaskStart{
-			ContainerID: r.ID,
-			Pid:         pid,
-		})
-	}
-
-	return &taskapi.StartResponse{Pid: pid}, nil
+	return n + ".service"
 }
 
 func (s *Service) Close() {
@@ -238,6 +179,7 @@ func (s *Service) Resume(ctx context.Context, r *taskapi.ResumeRequest) (_ *ptyp
 
 // Kill a process
 func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (_ *ptypes.Empty, retErr error) {
+	log.G(ctx).Debug("KILL")
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
@@ -248,6 +190,7 @@ func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (_ *ptypes.E
 		if retErr != nil {
 			retErr = errdefs.ToGRPCf(retErr, "kill")
 			span.SetStatus(codes.Error, retErr.Error())
+			log.G(ctx).WithError(retErr).Error("kill failed")
 		}
 		span.End()
 	}()

@@ -281,6 +281,10 @@ func (p *process) ttySockPath() (string, error) {
 	return s, nil
 }
 
+func (p *process) ttyUnitName() string {
+	return unitName(p.ns, p.id, "tty")
+}
+
 func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
 	ctx, span := StartSpan(ctx, "process.StartTTY")
 	defer func() {
@@ -309,7 +313,6 @@ func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
 	properties := []systemd.Property{
 		systemd.PropType("notify"),
 		systemd.PropExecStart([]string{p.exe, "tty-handshake"}, false),
-		systemd.PropDescription("TTY Handshake for " + p.Name()),
 		{Name: "Environment", Value: dbus.MakeVariant([]string{
 			ttyHandshakeEnv + "=1",
 			ttySockPathEnv + "=" + sockPath,
@@ -319,7 +322,7 @@ func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
 		{Name: "StandardErrorFile", Value: dbus.MakeVariant(logPath)},
 	}
 
-	ttyUnit := unitName(p.ns, p.id+"-tty")
+	ttyUnit := p.ttyUnitName()
 	defer func() {
 		if retErr != nil {
 			p.systemd.StopUnitContext(ctx, ttyUnit, "replace", nil)

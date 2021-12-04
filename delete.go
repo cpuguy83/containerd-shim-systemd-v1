@@ -60,6 +60,12 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 		if err != nil {
 			return nil, err
 		}
+
+		p.(*initProcess).execs.mu.Lock()
+		for _, ep := range p.(*initProcess).execs.ls {
+			s.units.Delete(ep)
+		}
+		p.(*initProcess).execs.mu.Unlock()
 		s.processes.Delete(path.Join(ns, r.ID))
 		s.units.Delete(p)
 	}
@@ -100,7 +106,7 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		}
 	}()
 
-	if err := p.runc.Delete(ctx, runcName(p.ns, p.id), &runc.DeleteOpts{Force: true}); err != nil {
+	if err := p.runc.Delete(ctx, p.Name(), &runc.DeleteOpts{Force: true}); err != nil {
 		return pState{}, err
 	}
 
@@ -114,7 +120,14 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 	}
 
 	if p.Terminal {
-		p.systemd.KillUnitContext(ctx, unitName(p.ns, p.id+"-tty"), 9)
+		p.systemd.KillUnitContext(ctx, unitName(p.ns, p.id, "tty"), 9)
+	}
+
+	if err := os.Remove("/run/systemd/system/" + p.Name()); err != nil {
+		return pState{}, err
+	}
+	if err := p.systemd.ReloadContext(ctx); err != nil {
+		log.G(ctx).WithError(err).Error("systemd reload failed")
 	}
 
 	p.mu.Lock()
@@ -150,7 +163,7 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	p.systemd.KillUnitWithTarget(ctx, p.Name(), dbus.Main, 9)
 
 	if p.Terminal {
-		ttyName := unitName(p.ns, p.id+"-tty")
+		ttyName := unitName(p.ns, p.id, "tty")
 		p.systemd.KillUnitWithTarget(ctx, ttyName, dbus.Main, 9)
 	}
 
@@ -168,6 +181,12 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	p.mu.Unlock()
 
 	p.parent.execs.Delete(p.execID)
+	if err := os.Remove("/run/systemd/system/" + p.Name()); err != nil {
+		log.G(ctx).WithError(err).Debug("Failed to remove exec unit")
+	}
+	if err := p.systemd.ReloadContext(ctx); err != nil {
+		log.G(ctx).WithError(err).Error("systemd reload failed")
+	}
 
 	return ps, nil
 }

@@ -58,7 +58,7 @@ jobs:
           TEST_RUNTIME: io.containerd.systemd.v1
           RUNC_FLAVOR: runc
           GOTESTSUM_JUNITFILE: ${{github.workspace}}/junit.xml
-          # EXTRA_TESTFLAGS: "--no-daemon --address=/run/containerd/containerd.sock"
+          EXTRA_TESTFLAGS: "-no-criu"
           GOTEST: gotestsum --format=standard-verbose --
       - name: Publish Test Report
         uses: mikepenz/action-junit-report@v2
