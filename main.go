@@ -249,18 +249,6 @@ func main() {
 			fmt.Fprintln(os.Stderr, os.Args[2], os.Args[2:])
 			return syscall.Exec(os.Args[3], os.Args[3:], nil)
 		},
-		"notify": func(ctx context.Context) error {
-			f, err := os.OpenFile(flags.Arg(0), os.O_RDWR, 0)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-
-			if _, err := f.Write([]byte{0}); err != nil {
-				return err
-			}
-			return nil
-		},
 	}
 
 	if _, ok := commands[rootFlags.Arg(0)]; !ok {
