@@ -204,7 +204,12 @@ func main() {
 			return err
 		},
 		"start": func(ctx context.Context) error {
-			_, err := os.Stdout.WriteString("unix:///" + socket)
+			addr := "unix://" + socket
+
+			if err := shim.WriteAddress("address", addr); err != nil {
+				return err
+			}
+			_, err := os.Stdout.WriteString(addr)
 			return err
 		},
 		"serve": func(ctx context.Context) error {
