@@ -90,8 +90,13 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		span.End()
 	}()
 
-	if !p.ProcessState().ExitedAt.After(timeZero) {
-		return pState{}, fmt.Errorf("container has not exited: %w", errdefs.ErrFailedPrecondition)
+	if !p.ProcessState().Exited() {
+		var st pState
+		if err := getUnitState(ctx, p.systemd, p.Name(), &st); err == nil {
+			if !st.Exited() {
+				return pState{}, fmt.Errorf("container has not exited: %w, %s", errdefs.ErrFailedPrecondition, p.ProcessState())
+			}
+		}
 	}
 
 	defer func() {

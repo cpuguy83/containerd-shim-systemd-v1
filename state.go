@@ -281,10 +281,16 @@ func (s *pState) Reset() {
 }
 
 func (s pState) Exited() bool {
-	return s.Pid > 0 && s.ExitedAt.After(timeZero)
+	if s.Status == "exited" || s.Status == "dead" || s.Status == "failed" {
+		return true
+	}
+	return s.ExitedAt.After(timeZero)
 }
 
 func (s pState) String() string {
+	if !s.ExitedAt.After(timeZero) {
+		return fmt.Sprintf("pid: %d, code: %d, status: %s", s.Pid, s.ExitCode, s.Status)
+	}
 	return fmt.Sprintf("pid: %d, code: %d, exitedAt: %s, status: %s", s.Pid, s.ExitCode, s.ExitedAt, s.Status)
 }
 
