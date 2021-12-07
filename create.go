@@ -57,6 +57,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			log.G(ctx).WithError(err).WithField("typeurl", r.Options.TypeUrl).Debug("invalid create options")
 			return nil, fmt.Errorf("error unmarshalling options: %w", err)
 		}
+
 		switch vv := v.(type) {
 		case *options.CreateOptions:
 			opts.LogMode = vv.LogMode.String()
@@ -86,6 +87,10 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			opts.EmptyNamespaces = vv.EmptyNamespaces
 		}
 		log.G(ctx).WithField("typeurl", r.Options.TypeUrl).Debug("Decoding create options")
+	}
+
+	if opts.Root == "" {
+		opts.Root = filepath.Join(s.root, "runc")
 	}
 
 	if opts.LogMode == "" {
@@ -128,9 +133,9 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			runc: &runc.Runc{
 				Debug:         s.debug,
 				Command:       s.runcBin,
-				SystemdCgroup: false,
+				SystemdCgroup: opts.SystemdCgroup,
 				PdeathSignal:  syscall.SIGKILL,
-				Root:          filepath.Join(s.root, "runc"),
+				Root:          filepath.Join(opts.Root, ns),
 				Log:           logPath,
 			},
 			exe:  s.exe,
@@ -384,7 +389,7 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	defer func() {
 		if retErr != nil {
 			span.SetStatus(codes.Error, retErr.Error())
-			p.runc.Delete(ctx, p.Name(), &runc.DeleteOpts{Force: true})
+			p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true})
 		}
 		span.End()
 	}()
@@ -465,7 +470,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 	uName := p.Name()
 	ch := make(chan string, 1)
 	if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
-		if err := p.runc.Delete(ctx, p.Name(), &runc.DeleteOpts{Force: true}); err != nil && !strings.Contains(err.Error(), "not found") {
+		if err := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil && !strings.Contains(err.Error(), "not found") {
 			log.G(ctx).WithError(err).Info("Error deleting container in runc")
 		}
 		if err := p.systemd.ResetFailedUnitContext(ctx, uName); err != nil {

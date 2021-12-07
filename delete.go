@@ -5,11 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
@@ -81,7 +79,6 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 	ctx, span := StartSpan(ctx, "InitProcess.Delete")
 	defer func() {
 		if retErr != nil {
-			retErr = fmt.Errorf("delete: %w", retErr)
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.SetAttributes(
@@ -98,15 +95,14 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 	}
 
 	defer func() {
-		if err := mount.UnmountAll(filepath.Join(p.Bundle, "rootfs"), 0); err != nil {
-			log.G(ctx).WithError(err).Error("failed to cleanup rootfs mount")
-		}
-		if err := os.RemoveAll(p.root); err != nil {
-			log.G(ctx).WithError(err).Error("Error removing container root directory")
+		if retErr != nil {
+			if err := os.RemoveAll(p.root); err != nil {
+				log.G(ctx).WithError(err).Error("Error removing container root directory")
+			}
 		}
 	}()
 
-	if err := p.runc.Delete(ctx, p.Name(), &runc.DeleteOpts{Force: true}); err != nil {
+	if err := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil {
 		return pState{}, err
 	}
 
@@ -163,8 +159,7 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	p.systemd.KillUnitWithTarget(ctx, p.Name(), dbus.Main, 9)
 
 	if p.Terminal {
-		ttyName := unitName(p.ns, p.id, "tty")
-		p.systemd.KillUnitWithTarget(ctx, ttyName, dbus.Main, 9)
+		p.systemd.KillUnitWithTarget(ctx, p.ttyUnitName(), dbus.Main, 9)
 	}
 
 	var ps pState

@@ -115,7 +115,7 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		return nil, err
 	}
 
-	deleteCmd, err := p.runcCmd([]string{"delete", p.Name()})
+	deleteCmd, err := p.runcCmd([]string{"delete", p.id})
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +145,7 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		opts = append(opts, unit.NewUnitOption("Service", "ExecStopPost", "-"+sysctl+" stop "+p.ttyUnitName()))
 	}
 
-	execStart, err := p.runcCmd(append(rcmd, p.Name()))
+	execStart, err := p.runcCmd(append(rcmd, p.id))
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +196,7 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 		cmd = append(cmd, "--console-socket="+s)
 	}
 
-	execStart, err := p.runcCmd(append(cmd, p.parent.Name()))
+	execStart, err := p.runcCmd(append(cmd, p.parent.id))
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +237,7 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	if p.checkpoint != "" {
 		return p.restore(ctx)
 	}
-	if err := p.runc.Start(ctx, p.Name()); err != nil {
+	if err := p.runc.Start(ctx, p.id); err != nil {
 		ret := fmt.Errorf("failed runc start: %w", err)
 		if p.runc.Debug {
 			unitData, err := os.ReadFile("/run/systemd/system/" + p.Name())

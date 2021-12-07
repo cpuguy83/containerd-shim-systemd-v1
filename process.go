@@ -223,19 +223,18 @@ func (p *initProcess) Kill(ctx context.Context, sig int, all bool) error {
 	if p.Pid() == 0 {
 		return fmt.Errorf("not started: %w", errdefs.ErrFailedPrecondition)
 	}
-	if p.ProcessState().Exited() {
-		// per upstream integration tests, this should return not found
-		return fmt.Errorf("process has already exited: %w", errdefs.ErrNotFound)
-	}
 
 	if err := p.systemd.KillUnitWithTarget(ctx, p.Name(), who, int32(sig)); err != nil {
-		if _, err2 := p.runc.State(ctx, p.Name()); err2 != nil && strings.Contains(err2.Error(), "not found") {
+		if _, err2 := p.runc.State(ctx, p.id); err2 != nil && strings.Contains(err2.Error(), "does not exist") {
 			return fmt.Errorf("could not get runc state: %w", errdefs.ErrNotFound)
 		}
 		units, e := p.systemd.ListUnitsByNamesContext(ctx, []string{p.Name()})
 		if err != nil {
 			log.G(ctx).WithError(e).Errorf("Failed to list units")
 		} else {
+			if len(units) == 0 {
+				return errdefs.ErrNotFound
+			}
 			for _, u := range units {
 				if u.Name != p.Name() {
 					continue
@@ -247,6 +246,7 @@ func (p *initProcess) Kill(ctx context.Context, sig int, all bool) error {
 		}
 		return err
 	}
+
 	return nil
 }
 
@@ -332,7 +332,7 @@ func (p *initProcess) Checkpoint(ctx context.Context, r *ptypes.Any) error {
 		actions = append(actions, runc.LeaveRunning)
 	}
 
-	if err := p.runc.Checkpoint(ctx, p.Name(), &opts, actions...); err != nil {
+	if err := p.runc.Checkpoint(ctx, p.id, &opts, actions...); err != nil {
 		if p.runc.Debug {
 			f, err2 := os.ReadFile(filepath.Join(opts.WorkDir, "dump.log"))
 			if err2 == nil {
@@ -345,15 +345,15 @@ func (p *initProcess) Checkpoint(ctx context.Context, r *ptypes.Any) error {
 }
 
 func (p *initProcess) Pause(ctx context.Context) error {
-	return p.runc.Pause(ctx, p.Name())
+	return p.runc.Pause(ctx, p.id)
 }
 
 func (p *initProcess) Resume(ctx context.Context) error {
-	return p.runc.Resume(ctx, p.Name())
+	return p.runc.Resume(ctx, p.id)
 }
 
 func (p *initProcess) Pids(ctx context.Context) ([]*task.ProcessInfo, error) {
-	ls, err := p.runc.Ps(ctx, p.Name())
+	ls, err := p.runc.Ps(ctx, p.id)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +366,7 @@ func (p *initProcess) Pids(ctx context.Context) ([]*task.ProcessInfo, error) {
 }
 
 func (p *initProcess) Update(ctx context.Context, res specs.LinuxResources) error {
-	return p.runc.Update(ctx, p.Name(), &res)
+	return p.runc.Update(ctx, p.id, &res)
 }
 
 type execProcess struct {
