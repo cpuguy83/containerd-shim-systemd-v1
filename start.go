@@ -115,17 +115,11 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		return nil, err
 	}
 
-	deleteCmd, err := p.runcCmd([]string{"delete", p.id})
-	if err != nil {
-		return nil, err
-	}
-
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", p.unitType()),
 		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
 		unit.NewUnitOption(svc, "ExecStopPost", "-"+sysctl+" reload "+os.Getenv("UNIT_NAME")),
-		unit.NewUnitOption(svc, "ExecStopPost", "-"+strings.Join(deleteCmd, " ")),
 	}
 
 	var prefix []string
@@ -326,6 +320,7 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 				p.state.Pid = uint32(pid)
 				p.state.ExitedAt = time.Now()
 				p.state.ExitCode = 139
+				p.cond.Broadcast()
 				p.mu.Unlock()
 				return uint32(pid), nil
 			} else {

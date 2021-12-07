@@ -390,6 +390,10 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 		if retErr != nil {
 			span.SetStatus(codes.Error, retErr.Error())
 			p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true})
+			p.mu.Lock()
+			p.deleted = true
+			p.cond.Broadcast()
+			p.mu.Unlock()
 		}
 		span.End()
 	}()

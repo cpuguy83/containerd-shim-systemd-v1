@@ -46,7 +46,7 @@ type unitManager struct {
 func (m *unitManager) Add(p Process) {
 	m.mu.Lock()
 	m.idx[p.Name()] = p
-	m.cond.Signal()
+	m.cond.Broadcast()
 	m.mu.Unlock()
 }
 
