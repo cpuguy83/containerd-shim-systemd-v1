@@ -34,7 +34,6 @@ import (
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/runtime/v2/shim"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/go-runc"
 	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	"github.com/gogo/protobuf/proto"
@@ -172,36 +171,38 @@ func main() {
 		"delete": func(ctx context.Context) error {
 			var (
 				resp *taskapi.DeleteResponse
-				err  error
 			)
 			if bundle != "" {
+				if namespace == "" {
+					namespace = filepath.Base(filepath.Dir(bundle))
+				}
 				defer func() {
 					mount.UnmountAll(filepath.Join(bundle, "rootfs"), unix.MNT_DETACH)
 					os.RemoveAll(bundle)
 				}()
 
 				svc, err := New(ctx, Config{Root: root})
-				if err == nil {
-					ctx = namespaces.WithNamespace(ctx, namespace)
-					resp, err = svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
-				} else {
-					(&runc.Runc{}).Delete(ctx, id, &runc.DeleteOpts{Force: true})
-					resp, err = svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
+				if err != nil {
+					return err
 				}
+
+				ctx = namespaces.WithNamespace(ctx, namespace)
+				resp, err = svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
 				if err != nil && !errdefs.IsNotFound(errdefs.FromGRPC(err)) {
 					return err
 				}
-			}
 
-			if resp == nil {
-				resp = &taskapi.DeleteResponse{}
-			}
-			data, err := proto.Marshal(resp)
-			if err != nil {
+				if resp == nil {
+					resp = &taskapi.DeleteResponse{}
+				}
+				data, err := proto.Marshal(resp)
+				if err != nil {
+					return err
+				}
+				_, err = os.Stdout.Write(data)
 				return err
 			}
-			_, err = os.Stdout.Write(data)
-			return err
+			return nil
 		},
 		"start": func(ctx context.Context) error {
 			addr := "unix://" + socket
