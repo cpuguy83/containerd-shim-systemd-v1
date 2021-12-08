@@ -320,6 +320,7 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 				p.state.Pid = uint32(pid)
 				p.state.ExitedAt = time.Now()
 				p.state.ExitCode = 139
+				log.G(ctx).WithField("status", status).Debug("Set status to failed")
 				p.cond.Broadcast()
 				p.mu.Unlock()
 				return uint32(pid), nil

@@ -162,6 +162,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	defer func() {
 		if retErr != nil {
 			p.SetState(ctx, pState{ExitCode: 139, ExitedAt: time.Now(), Status: "failed"})
+			log.G(ctx).WithError(retErr).Debug("Set state to failed")
 			s.processes.Delete(path.Join(ns, r.ID))
 			s.units.Delete(p)
 			if _, err := p.Delete(ctx); err != nil {
@@ -307,6 +308,10 @@ func (p *execProcess) Create(ctx context.Context) error {
 	if err := p.systemd.ReloadContext(ctx); err != nil {
 		log.G(ctx).WithError(err).Warn("failed to reload systemd")
 	}
+	// Make sure we don't have some old state from a past run.
+	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to reset systemd unit")
+	}
 	return nil
 }
 
@@ -446,6 +451,11 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	if err := p.systemd.ReloadContext(ctx); err != nil {
 		log.G(ctx).WithError(err).Warn("Error reloading systemd")
 	}
+	// Make sure we don't have some old state from a past run.
+	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil && !strings.Contains(err.Error(), "not loaded") {
+		log.G(ctx).WithError(err).Warn("Failed to reset systemd unit")
+	}
+
 	return p.startUnit(ctx)
 }
 

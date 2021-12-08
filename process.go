@@ -187,7 +187,7 @@ func (p *process) ProcessState() pState {
 func (p *process) SetState(ctx context.Context, state pState) pState {
 	p.mu.Lock()
 	state.CopyTo(&p.state)
-	if p.state.Pid > 0 && p.state.Status == "dead" && !p.state.Exited() {
+	if p.state.ExitCode > 0 && !p.state.Exited() {
 		p.state.ExitedAt = time.Now()
 	}
 	p.state.CopyTo(&state)
@@ -224,7 +224,14 @@ func (p *initProcess) Kill(ctx context.Context, sig int, all bool) error {
 		return fmt.Errorf("not started: %w", errdefs.ErrFailedPrecondition)
 	}
 
+	if p.ProcessState().Exited() {
+		return errdefs.ErrNotFound
+	}
+
 	if err := p.systemd.KillUnitWithTarget(ctx, p.Name(), who, int32(sig)); err != nil {
+		if strings.Contains(err.Error(), "no main process") {
+			return errdefs.ErrNotFound
+		}
 		if _, err2 := p.runc.State(ctx, p.id); err2 != nil && strings.Contains(err2.Error(), "does not exist") {
 			return fmt.Errorf("could not get runc state: %w", errdefs.ErrNotFound)
 		}

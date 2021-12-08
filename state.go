@@ -94,6 +94,8 @@ func (m *unitManager) Watch(ctx context.Context) {
 				continue
 			}
 
+			log.G(ctx).WithField("unit", unit.Name).Debug(st)
+
 			p.SetState(ctx, st)
 			st.Reset()
 		}
@@ -281,7 +283,10 @@ func (s *pState) Reset() {
 }
 
 func (s pState) Exited() bool {
-	if s.Status == "exited" || s.Status == "dead" || s.Status == "failed" {
+	if s.ExitCode > 0 {
+		return true
+	}
+	if s.Status == "exited" || s.Status == "failed" {
 		return true
 	}
 	return s.ExitedAt.After(timeZero)

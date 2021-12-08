@@ -78,16 +78,12 @@ func (p *process) waitForExit(ctx context.Context) (pState, error) {
 			log.G(ctx).Debug("wait: deleted")
 			break
 		}
-		if p.state.Status == "dead" {
-			log.G(ctx).Debug("wait: dead")
-			break
-		}
-		if p.state.ExitCode > 0 || p.state.Exited() {
-			log.G(ctx).Debug("wait: exited")
+		if p.state.Exited() {
+			log.G(ctx).Debugf("wait: exited: %s", p.state.ExitedAt)
 			break
 		}
 
-		log.G(ctx).Debugf("%+v", p.state)
+		log.G(ctx).Debugf("%+s", p.state)
 
 		select {
 		case <-ctx.Done():

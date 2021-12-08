@@ -131,6 +131,10 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		log.G(ctx).WithError(err).Error("systemd reload failed")
 	}
 
+	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to reset systemd unit")
+	}
+
 	p.mu.Lock()
 	p.deleted = true
 	p.cond.Broadcast()
@@ -184,8 +188,13 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	if err := os.Remove("/run/systemd/system/" + p.Name()); err != nil {
 		log.G(ctx).WithError(err).Debug("Failed to remove exec unit")
 	}
+
 	if err := p.systemd.ReloadContext(ctx); err != nil {
 		log.G(ctx).WithError(err).Error("systemd reload failed")
+	}
+
+	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to reset systemd unit")
 	}
 
 	return ps, nil
