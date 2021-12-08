@@ -482,70 +482,83 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 	}
 
 	uName := p.Name()
-	ch := make(chan string, 1)
-	if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
-		if err := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil && !strings.Contains(err.Error(), "not found") {
-			log.G(ctx).WithError(err).Info("Error deleting container in runc")
-		}
-		if err := p.systemd.ResetFailedUnitContext(ctx, uName); err != nil {
-			log.G(ctx).WithError(err).Info("Error resetting failed unit")
-		}
 
-		ch = make(chan string, 1)
+	do := func() error {
+		ch := make(chan string, 1)
 		if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
-			return 0, fmt.Errorf("error starting unit: %w", err)
-		}
-	}
-
-	select {
-	case <-ctx.Done():
-		p.Kill(ctx, int(syscall.SIGKILL), true)
-		// TODO: Delete?
-		return 0, ctx.Err()
-	case status := <-ch:
-		if status != "done" {
-			pid, _ := p.readPidFile()
-			if pid > 0 {
-				// In some cases the unit may be marked as failed because it exited immediately.
-				// This isn't neccessarily a real failure... e.g. `/bin/sh -c "exit 1"`
-				// In this case the unit will have failed to start, but if you add a sleep before exit it will succeed.
-				// If we have a pid from runc, we know the container started.
-				return pid, nil
+			if err := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil && !strings.Contains(err.Error(), "not found") {
+				log.G(ctx).WithError(err).Info("Error deleting container in runc")
+			}
+			if err := p.systemd.ResetFailedUnitContext(ctx, uName); err != nil {
+				log.G(ctx).WithError(err).Info("Error resetting failed unit")
 			}
 
-			ret := fmt.Errorf("error starting systemd unit: %s", status)
-			if p.runc.Debug {
-				unitData, err := os.ReadFile("/run/systemd/system/" + uName)
-				if err == nil {
-					ret = fmt.Errorf("%w:\n%s", ret, string(unitData))
-				}
-				logData, err := os.ReadFile(p.runc.Log)
-				if err == nil {
-					ret = fmt.Errorf("%w\n%s", ret, string(logData))
-				}
+			ch = make(chan string, 1)
+			if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
+				return fmt.Errorf("error starting unit: %w", err)
 			}
-			return 0, ret
 		}
+
+		select {
+		case <-ctx.Done():
+			p.Kill(ctx, int(syscall.SIGKILL), true)
+			return ctx.Err()
+		case status := <-ch:
+			if status != "done" {
+				ret := fmt.Errorf("error starting systemd unit: %s", status)
+				if p.runc.Debug {
+					unitData, err := os.ReadFile("/run/systemd/system/" + uName)
+					if err == nil {
+						ret = fmt.Errorf("%w:\n%s", ret, string(unitData))
+					}
+					logData, err := os.ReadFile(p.runc.Log)
+					if err == nil {
+						ret = fmt.Errorf("%w\n%s", ret, string(logData))
+					}
+				}
+				return ret
+			}
+		}
+
+		return nil
 	}
 
-	pid, err := p.readPidFile()
-	if err != nil {
-		var ps pState
-		if err := getUnitState(ctx, p.systemd, uName, &ps); err != nil {
+	handlePid := func() (uint32, error) {
+		pid, err := p.readPidFile()
+		if err != nil {
+			var ps pState
+			if err := getUnitState(ctx, p.systemd, uName, &ps); err != nil {
+				return 0, err
+			}
+			if ps.Pid == 0 {
+				return 0, fmt.Errorf("error reading pid file: %w", err)
+			}
+			pid = ps.Pid
+		}
+
+		p.mu.Lock()
+		if p.state.Pid == 0 {
+			p.state.Pid = uint32(pid)
+		}
+		p.mu.Unlock()
+		return uint32(pid), nil
+	}
+
+	if err := do(); err != nil {
+		if pid, err := handlePid(); err == nil {
+			return pid, nil
+		}
+
+		// Clean up old state and try again
+		if err2 := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err2 != nil {
 			return 0, err
 		}
-		if ps.Pid == 0 {
-			return 0, fmt.Errorf("error reading pid file: %w", err)
+		if err := do(); err != nil {
+			return 0, err
 		}
-		pid = ps.Pid
 	}
 
-	p.mu.Lock()
-	if p.state.Pid == 0 {
-		p.state.Pid = uint32(pid)
-	}
-	p.mu.Unlock()
-	return uint32(pid), nil
+	return handlePid()
 }
 
 func (p *initProcess) readPidFile() (uint32, error) {
