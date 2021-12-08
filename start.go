@@ -47,12 +47,6 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 		return nil, fmt.Errorf("%w: %s", errdefs.ErrNotFound, r.ID)
 	}
 
-	defer func() {
-		if retErr != nil {
-			p.SetState(ctx, pState{ExitCode: 139, ExitedAt: time.Now(), Status: "failed"})
-		}
-	}()
-
 	var pid uint32
 	if r.ExecID != "" {
 		ep := p.(*initProcess).execs.Get(r.ExecID)
@@ -325,7 +319,7 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 				p.mu.Unlock()
 				return uint32(pid), nil
 			} else {
-				log.G(ctx).WithError(err).Warn("Error reading pid file")
+				log.G(ctx).WithError(err).Debug("Error reading pid file")
 			}
 
 			ret := fmt.Errorf("exec failed to start: %s", status)
