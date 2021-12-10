@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"syscall"
@@ -40,6 +41,8 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 	if p == nil {
 		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
+
+	ctx = WithShimLog(ctx, p.LogWriter())
 
 	var st pState
 	if r.ExecID != "" {
@@ -79,6 +82,9 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error) {
 	ctx, span := StartSpan(ctx, "InitProcess.Delete")
 	defer func() {
+		if cl, ok := p.shimLog.(io.Closer); ok {
+			cl.Close()
+		}
 		if retErr != nil {
 			span.SetStatus(codes.Error, retErr.Error())
 		}

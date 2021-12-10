@@ -49,6 +49,8 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	}()
 
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("id", r.ID).WithField("ns", ns))
+	shimLog := OpenShimLog(ctx, r.Bundle)
+	ctx = WithShimLog(ctx, shimLog)
 
 	var opts CreateOptions
 	if r.Options != nil && r.Options.TypeUrl != "" {
@@ -150,6 +152,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		execs: &processManager{
 			ls: make(map[string]Process),
 		},
+		shimLog: shimLog,
 	}
 	p.process.cond = sync.NewCond(&p.process.mu)
 
@@ -212,6 +215,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 	if p == nil {
 		return nil, fmt.Errorf("%w: process %s does not exist", errdefs.ErrNotFound, r.ID)
 	}
+	ctx = WithShimLog(ctx, p.LogWriter())
 	pInit := p.(*initProcess)
 
 	if r.Terminal {

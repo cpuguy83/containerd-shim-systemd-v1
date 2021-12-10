@@ -47,6 +47,8 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 		return nil, fmt.Errorf("%w: %s", errdefs.ErrNotFound, r.ID)
 	}
 
+	ctx = WithShimLog(ctx, p.LogWriter())
+
 	var pid uint32
 	if r.ExecID != "" {
 		ep := p.(*initProcess).execs.Get(r.ExecID)

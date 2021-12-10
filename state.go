@@ -145,6 +145,8 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
+	ctx = WithShimLog(ctx, p.LogWriter())
+
 	var st *State
 	if r.ExecID != "" {
 		ep := p.(*initProcess).execs.Get(r.ExecID)

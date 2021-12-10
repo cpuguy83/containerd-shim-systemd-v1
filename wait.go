@@ -50,6 +50,8 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 
 	p := s.processes.Get(path.Join(ns, r.ID))
 
+	ctx = WithShimLog(ctx, p.LogWriter())
+
 	if r.ExecID != "" {
 		p = p.(*initProcess).execs.Get(r.ExecID)
 		if p == nil {

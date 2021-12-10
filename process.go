@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -101,6 +102,7 @@ type Process interface {
 	LoadState(context.Context) error
 	SetState(context.Context, pState) pState
 	ProcessState() pState
+	LogWriter() io.Writer
 }
 
 type CreateOptions struct {
@@ -272,6 +274,11 @@ type initProcess struct {
 	execs *processManager
 
 	sendEvent func(ctx context.Context, ns string, evt interface{})
+	shimLog   io.Writer
+}
+
+func (p *initProcess) LogWriter() io.Writer {
+	return p.shimLog
 }
 
 func (p *initProcess) pidFile() string {
@@ -383,6 +390,10 @@ type execProcess struct {
 	Spec   *ptypes.Any
 	parent *initProcess
 	execID string
+}
+
+func (p *execProcess) LogWriter() io.Writer {
+	return p.parent.shimLog
 }
 
 func (p *execProcess) getPid(ctx context.Context) (uint32, error) {

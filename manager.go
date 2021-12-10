@@ -142,6 +142,7 @@ func (s *Service) Pause(ctx context.Context, r *taskapi.PauseRequest) (_ *ptypes
 	if p == nil {
 		return nil, fmt.Errorf("%w: %s", errdefs.ErrNotFound, r.ID)
 	}
+	ctx = WithShimLog(ctx, p.LogWriter())
 
 	err = p.(*initProcess).Pause(ctx)
 	if err != nil {
@@ -171,6 +172,8 @@ func (s *Service) Resume(ctx context.Context, r *taskapi.ResumeRequest) (_ *ptyp
 		return nil, fmt.Errorf("%w: %s", errdefs.ErrNotFound, r.ID)
 	}
 
+	ctx = WithShimLog(ctx, p.LogWriter())
+
 	if err := p.(*initProcess).Resume(ctx); err != nil {
 		return nil, err
 	}
@@ -199,6 +202,8 @@ func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (_ *ptypes.E
 	if p == nil {
 		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
+
+	ctx = WithShimLog(ctx, p.LogWriter())
 
 	if r.ExecID != "" {
 		ep := p.(*initProcess).execs.Get(r.ExecID)
@@ -237,6 +242,8 @@ func (s *Service) Pids(ctx context.Context, r *taskapi.PidsRequest) (_ *taskapi.
 		return nil, fmt.Errorf("%w: %s", errdefs.ErrNotFound, r.ID)
 	}
 
+	ctx = WithShimLog(ctx, p.LogWriter())
+
 	procs, err := p.(*initProcess).Pids(ctx)
 	if err != nil {
 		return nil, err
@@ -268,6 +275,8 @@ func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskReque
 	if p == nil {
 		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
+
+	ctx = WithShimLog(ctx, p.LogWriter())
 
 	if err := p.(*initProcess).Checkpoint(ctx, r.Options); err != nil {
 		return nil, err
@@ -329,6 +338,8 @@ func (s *Service) Stats(ctx context.Context, r *taskapi.StatsRequest) (_ *taskap
 		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
 
+	ctx = WithShimLog(ctx, p.LogWriter())
+
 	pid := p.Pid()
 
 	var stats interface{}
@@ -387,6 +398,8 @@ func (s *Service) Update(ctx context.Context, r *taskapi.UpdateTaskRequest) (_ *
 	if p == nil {
 		return nil, fmt.Errorf("process %s: %w", r.ID, errdefs.ErrNotFound)
 	}
+
+	ctx = WithShimLog(ctx, p.LogWriter())
 
 	var res specs.LinuxResources
 	if err := json.Unmarshal(r.Resources.Value, &res); err != nil {
