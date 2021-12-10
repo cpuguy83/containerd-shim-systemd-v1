@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"syscall"
 
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
@@ -107,6 +108,20 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		}
 	}()
 
+	ch := make(chan string)
+	if _, err := p.systemd.StopUnitContext(ctx, p.Name(), "replace", ch); err != nil {
+		log.G(ctx).WithError(err).Info("Failed to stop unit")
+	}
+
+	// Try to wait for stop to complete
+	// On context or stop failure we'll use SIGKILL instead.
+	select {
+	case <-ctx.Done():
+	case <-ch:
+	}
+
+	p.systemd.KillUnitContext(ctx, p.Name(), int32(syscall.SIGKILL))
+
 	if err := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil {
 		return pState{}, err
 	}
@@ -132,7 +147,8 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 	}
 
 	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil {
-		log.G(ctx).WithError(err).Warn("Failed to reset systemd unit")
+		// Just a debug message since this is just precautionary and the unit may not even be failed.
+		log.G(ctx).WithError(err).Debug("Failed to reset systemd unit")
 	}
 
 	p.mu.Lock()
@@ -165,8 +181,19 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 		return pState{}, fmt.Errorf("exec has not exited: %w", errdefs.ErrFailedPrecondition)
 	}
 
-	p.systemd.KillUnitWithTarget(ctx, p.Name(), dbus.Main, 9)
+	ch := make(chan string)
+	if _, err := p.systemd.StopUnitContext(ctx, p.Name(), "replace", ch); err != nil {
+		log.G(ctx).WithError(err).Info("Failed to stop unit")
+	}
 
+	// Try to wait for stop to complete
+	// On context or stop failure we'll use SIGKILL instead.
+	select {
+	case <-ctx.Done():
+	case <-ch:
+	}
+
+	p.systemd.KillUnitWithTarget(ctx, p.Name(), dbus.Main, 9)
 	if p.Terminal {
 		p.systemd.KillUnitWithTarget(ctx, p.ttyUnitName(), dbus.Main, 9)
 	}
@@ -192,10 +219,7 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	if err := p.systemd.ReloadContext(ctx); err != nil {
 		log.G(ctx).WithError(err).Error("systemd reload failed")
 	}
-
-	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil {
-		log.G(ctx).WithError(err).Warn("Failed to reset systemd unit")
-	}
+	p.systemd.ResetFailedUnitContext(ctx, p.Name())
 
 	return ps, nil
 }

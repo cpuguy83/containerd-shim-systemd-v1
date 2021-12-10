@@ -63,6 +63,14 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 	}
 	log.G(ctx).Debugf("%+v", st)
 
+	if !st.ExitedAt.After(timeZero) {
+		getUnitState(ctx, s.conn, p.Name(), &st)
+	}
+
+	if !st.ExitedAt.After(timeZero) {
+		log.G(ctx).Error("No exit time set")
+	}
+
 	return &taskapi.WaitResponse{
 		ExitedAt:   st.ExitedAt,
 		ExitStatus: st.ExitCode,

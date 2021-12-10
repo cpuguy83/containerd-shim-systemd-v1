@@ -111,9 +111,10 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", p.unitType()),
+		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
 		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
-		unit.NewUnitOption(svc, "ExecStopPost", "-"+sysctl+" reload "+os.Getenv("UNIT_NAME")),
+		unit.NewUnitOption(svc, "ExecStopPost", p.exe+" --bundle="+p.Bundle+" exit "+os.Getenv("UNIT_NAME")),
 	}
 
 	var prefix []string
@@ -164,10 +165,10 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", p.unitType()),
-		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
+		// unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
+		unit.NewUnitOption(svc, "GuessMainPID", "yes"),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
-		unit.NewUnitOption(svc, "ExecStopPost", "-"+sysctl+" reload "+os.Getenv("UNIT_NAME")),
-		unit.NewUnitOption(svc, "ExecStopPost", "-"+"/bin/cp "+p.pidFile()+" "+p.pidFile()+".exited"),
+		unit.NewUnitOption(svc, "ExecStopPost", p.exe+"--id="+p.id+" --bundle="+p.parent.Bundle+" exit "+os.Getenv("UNIT_NAME")),
 	}
 
 	if p.Terminal || p.opts.Terminal {
@@ -225,8 +226,23 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	if p.checkpoint != "" {
 		return p.restore(ctx)
 	}
+
+	if p.ProcessState().Exited() {
+		return 0, fmt.Errorf("process has already exited")
+	}
 	if err := p.runc.Start(ctx, p.id); err != nil {
 		ret := fmt.Errorf("failed runc start: %w", err)
+
+		var st pState
+		getUnitState(ctx, p.systemd, p.Name(), &st)
+		if !st.ExitedAt.After(timeZero) {
+			st.ExitedAt = time.Now()
+			st.ExitCode = 255
+		}
+
+		p.SetState(ctx, st)
+		p.cond.Broadcast()
+
 		if p.runc.Debug {
 			unitData, err := os.ReadFile("/run/systemd/system/" + p.Name())
 			if err == nil {
@@ -311,9 +327,14 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 					return 0, fmt.Errorf("could not read pid: %w", err)
 				}
 				p.mu.Lock()
-				p.state.Pid = uint32(pid)
-				p.state.ExitedAt = time.Now()
-				p.state.ExitCode = 139
+
+				var st pState
+				getUnitState(ctx, p.systemd, p.Name(), &st)
+				if !st.ExitedAt.After(timeZero) {
+					p.state.Pid = uint32(pid)
+					p.state.ExitedAt = time.Now()
+					p.state.ExitCode = 255
+				}
 				log.G(ctx).WithField("status", status).Debug("Set status to failed")
 				p.cond.Broadcast()
 				p.mu.Unlock()
@@ -323,6 +344,11 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 			}
 
 			ret := fmt.Errorf("exec failed to start: %s", status)
+			var st pState
+			if err := getUnitState(ctx, p.systemd, p.Name(), &st); err == nil {
+				p.SetState(ctx, st)
+				p.cond.Broadcast()
+			}
 			if p.runc.Debug {
 				unitData, err := os.ReadFile("/run/systemd/system/" + p.Name())
 				if err == nil {
@@ -340,7 +366,6 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 				} else {
 					log.G(ctx).WithError(err).Warn("Error opening runc debug log")
 				}
-
 			}
 			return 0, ret
 		}

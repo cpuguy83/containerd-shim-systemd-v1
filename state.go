@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -29,8 +31,6 @@ func (m *unitManager) Watch(ctx context.Context) {
 	filterFn := func(p Process) bool {
 		return p.ProcessState().ExitedAt.After(timeZero)
 	}
-
-	var st pState
 
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
@@ -76,28 +76,17 @@ func (m *unitManager) Watch(ctx context.Context) {
 				continue
 			}
 
-			state := p.ProcessState()
-			if state.Status == "running" && unit.SubState == "running" {
-				continue
-			}
-
-			if state.Exited() {
+			if p.ProcessState().Exited() {
 				// Process is already exited, we don't care about state updates on this unit anymore
 				log.G(ctx).Debug("Skipped unit status update for exited process")
 				continue
 			}
 
 			log.G(ctx).Debugf("Getting unit state for %s", unit.Name)
-			if err := getUnitState(ctx, m.sd, p.Name(), &st); err != nil {
-				log.G(ctx).WithError(err).WithField("unit", p.Name()).Warn("Error getting unit state")
-				st.Reset()
+			if err := p.LoadState(ctx); err != nil {
+				log.G(ctx).WithError(err).Error("Error loading process state")
 				continue
 			}
-
-			log.G(ctx).WithField("unit", unit.Name).Debug(st)
-
-			p.SetState(ctx, st)
-			st.Reset()
 		}
 
 		timer.Reset(time.Second)
@@ -197,15 +186,25 @@ func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState)
 	if p := state["ExecMainPID"]; p != nil {
 		st.Pid = uint32(p.(uint32))
 	}
-	if c := state["ExecMainStatus"]; c != nil {
-		st.ExitCode = uint32(c.(int32))
-	}
-	if ts := state["ExecMainExitTimestamp"]; ts != nil {
-		st.ExitedAt = time.UnixMicro(int64(ts.(uint64)))
-	}
-	if status := state["SubState"]; status != nil {
-		st.Status = status.(string)
-	}
+	// if c := state["ExecMainStatus"]; c != nil {
+	// 	st.ExitCode = uint32(c.(int32))
+	// }
+	// if ts := state["ExecMainExitTimestamp"]; ts != nil {
+	// 	st.ExitedAt = time.UnixMicro(int64(ts.(uint64)))
+	// 	if !st.ExitedAt.After(timeZero) {
+	// 		code, t := readExecStatusExit(state["ExecStart"].([][]interface{})[0])
+	// 		if t.After(timeZero) {
+	// 			st.ExitedAt = t
+	// 			if code > 0 {
+	// 				st.ExitCode = uint32(code)
+	// 			}
+	// 		}
+	// 	}
+	// }
+	// if status := state["SubState"]; status != nil {
+	// 	st.Status = status.(string)
+	// }
+
 	return nil
 }
 
@@ -232,6 +231,60 @@ func (p *initProcess) State(ctx context.Context) (*State, error) {
 	p.mu.Unlock()
 
 	return resp, nil
+}
+
+func (p *initProcess) LoadState(ctx context.Context) error {
+	var st pState
+	if err := p.readExitState(&st); err == nil {
+		p.SetState(ctx, st)
+		return nil
+	}
+
+	st.Reset()
+	if err := getUnitState(ctx, p.systemd, p.Name(), &st); err != nil {
+		return err
+	}
+	p.SetState(ctx, st)
+	return nil
+}
+
+func (p *execProcess) LoadState(ctx context.Context) error {
+	var st pState
+	if err := p.readExitState(&st); err == nil {
+		p.SetState(ctx, st)
+		return nil
+	}
+
+	st.Reset()
+	if err := getUnitState(ctx, p.systemd, p.Name(), &st); err != nil {
+		return err
+	}
+	p.SetState(ctx, st)
+	return nil
+}
+
+func (p *execProcess) exitStatePath() string {
+	return filepath.Join(p.parent.Bundle, p.id+"_exit_status.json")
+}
+
+func (p *execProcess) readExitState(st *pState) error {
+	data, err := os.ReadFile(p.exitStatePath())
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, st)
+}
+
+func (p *initProcess) exitStatePath() string {
+	return filepath.Join(p.Bundle, "init_exit_status.json")
+}
+
+func (p *initProcess) readExitState(st *pState) error {
+	data, err := os.ReadFile(p.exitStatePath())
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, st)
 }
 
 func (p *execProcess) State(ctx context.Context) (*State, error) {
@@ -286,9 +339,9 @@ func (s pState) Exited() bool {
 	if s.ExitCode > 0 {
 		return true
 	}
-	if s.Status == "exited" || s.Status == "failed" {
-		return true
-	}
+	// if s.Status == "exited" || s.Status == "failed" || s.Status == "dead" {
+	// 	return true
+	// }
 	return s.ExitedAt.After(timeZero)
 }
 
@@ -303,8 +356,14 @@ func (s pState) String() string {
 // It does not override non-zero values (except "Status") in the destination.
 // This is to ensure we don't override real information in the state w/, for instance, state info for a deleted unit.
 func (s *pState) CopyTo(other *pState) {
+	if s.Pid == 0 {
+		return
+	}
 	if !other.ExitedAt.After(timeZero) {
-		other.ExitedAt = s.ExitedAt
+		// systemd seems to have a habbit of keeping old data around...
+		if s.Status == "dead" || s.Status == "failed" || s.Status == "exited" || s.Status != "stop-post" {
+			other.ExitedAt = s.ExitedAt
+		}
 	}
 	if other.ExitCode == 0 {
 		other.ExitCode = s.ExitCode
@@ -317,7 +376,16 @@ func (s *pState) CopyTo(other *pState) {
 	}
 }
 
-type execStartState struct {
+// exitStatus is used on process exit to write the status to a file so we don't need to rely on systemd for this data
+// Mainly systemd can be a problem because it can give some inconsistent state... which it still could here but we have some more control over it.
+type exitStatus struct {
+	Pid      uint32
+	Code     uint32
+	Status   string
+	ExitedAt time.Time
+}
+
+type execState struct {
 	Path       string
 	Started    time.Time
 	Exited     time.Time
@@ -327,7 +395,11 @@ type execStartState struct {
 	StatusCode uint32 // This is the systemd status (e.g. "exited")
 }
 
-func parseExecStartStatus(ii [][]interface{}, st *execStartState) error {
+func readExecStatusExit(i []interface{}) (uint32, time.Time) {
+	return uint32(i[9].(int32)), time.UnixMicro(int64(i[5].(uint64)))
+}
+
+func parseExecStartStatus(ii [][]interface{}, st *execState) error {
 	if len(ii) == 0 {
 		return errdefs.ErrNotFound
 	}

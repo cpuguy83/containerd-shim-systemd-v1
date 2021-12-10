@@ -151,17 +151,15 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			ls: make(map[string]Process),
 		},
 	}
-	log.G(ctx).Debugf("%+v", p)
 	p.process.cond = sync.NewCond(&p.process.mu)
 
 	if err := s.processes.Add(path.Join(ns, r.ID), p); err != nil {
 		return nil, err
 	}
-	s.units.Add(p)
 
 	defer func() {
 		if retErr != nil {
-			p.SetState(ctx, pState{ExitCode: 139, ExitedAt: time.Now(), Status: "failed"})
+			p.SetState(ctx, pState{ExitCode: 255, ExitedAt: time.Now(), Status: "failed"})
 			log.G(ctx).WithError(retErr).Debug("Set state to failed")
 			s.processes.Delete(path.Join(ns, r.ID))
 			s.units.Delete(p)
@@ -175,6 +173,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	if err != nil {
 		return nil, err
 	}
+	s.units.Add(p)
 
 	s.send(ctx, ns, &eventsapi.TaskCreate{
 		ContainerID: r.ID,
@@ -485,6 +484,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 
 	do := func() error {
 		ch := make(chan string, 1)
+		p.systemd.ResetFailedUnitContext(ctx, p.Name())
 		if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
 			if err := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil && !strings.Contains(err.Error(), "not found") {
 				log.G(ctx).WithError(err).Info("Error deleting container in runc")
@@ -505,18 +505,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 			return ctx.Err()
 		case status := <-ch:
 			if status != "done" {
-				ret := fmt.Errorf("error starting systemd unit: %s", status)
-				if p.runc.Debug {
-					unitData, err := os.ReadFile("/run/systemd/system/" + uName)
-					if err == nil {
-						ret = fmt.Errorf("%w:\n%s", ret, string(unitData))
-					}
-					logData, err := os.ReadFile(p.runc.Log)
-					if err == nil {
-						ret = fmt.Errorf("%w\n%s", ret, string(logData))
-					}
-				}
-				return ret
+				return fmt.Errorf("error starting systemd unit: %s", status)
 			}
 		}
 
@@ -541,20 +530,56 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 			p.state.Pid = uint32(pid)
 		}
 		p.mu.Unlock()
+		if pid > 0 {
+			var st pState
+			if err := getUnitState(ctx, p.systemd, p.Name(), &st); err != nil {
+				return 0, err
+			}
+			if st.ExitedAt.After(timeZero) {
+				p.SetState(ctx, st)
+				p.cond.Broadcast()
+			}
+		}
 		return uint32(pid), nil
 	}
 
 	if err := do(); err != nil {
 		if pid, err := handlePid(); err == nil {
 			return pid, nil
+		} else {
+			log.G(ctx).WithError(err).Error("Error getting pid")
+		}
+
+		ch := make(chan string, 1)
+		if _, err := p.systemd.StopUnitContext(ctx, p.Name(), "replace", ch); err != nil {
+			log.G(ctx).WithError(err).Info("Error stopping unit")
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-ch:
 		}
 
 		// Clean up old state and try again
 		if err2 := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err2 != nil {
-			return 0, err
+			log.G(ctx).WithError(err2).Info("Error deleting container in runc")
 		}
 		if err := do(); err != nil {
-			return 0, err
+			ret := err
+			if p.runc.Debug {
+				unitData, err := os.ReadFile("/run/systemd/system/" + uName)
+				if err == nil {
+					ret = fmt.Errorf("%w:\n%s", ret, string(unitData))
+				}
+				logData, err := os.ReadFile(p.runc.Log)
+				if err == nil {
+					ret = fmt.Errorf("%w\n%s", ret, string(logData))
+				}
+			}
+			if err2 := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err2 != nil {
+				log.G(ctx).WithError(err2).Debug("Error deleting container in runc")
+			}
+			return 0, ret
 		}
 	}
 

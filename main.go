@@ -11,6 +11,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -24,8 +25,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/errdefs"
@@ -35,6 +38,7 @@ import (
 	"github.com/containerd/containerd/runtime/v2/shim"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/coreos/go-systemd/v22/activation"
+	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	"github.com/gogo/protobuf/proto"
 	"github.com/sirupsen/logrus"
@@ -249,6 +253,65 @@ func main() {
 			}
 			fmt.Fprintln(os.Stderr, os.Args[2], os.Args[2:])
 			return syscall.Exec(os.Args[3], os.Args[3:], nil)
+		},
+		"exit": func(ctx context.Context) error {
+			code, err := strconv.Atoi(os.Getenv("EXIT_STATUS"))
+			if err == nil {
+				code = 255
+			} else {
+				log.G(ctx).WithError(err).Error("Error reading exit status")
+			}
+
+			pidData, err := ioutil.ReadFile(os.Getenv("PIDFILE"))
+			var pid uint32
+			if err == nil {
+				p, err := strconv.Atoi(string(pidData))
+				if err != nil {
+					log.G(ctx).WithError(err).Error("Error reading pid data")
+				} else {
+					pid = uint32(p)
+				}
+			} else {
+				log.G(ctx).WithError(err).Error("Error reading pid file")
+			}
+
+			// "code" in systemd parlance is really a status string referring to the unit state
+			// "status" in systemd parlance is the exit status of the process
+			// This is super confusing but we turn that into a "Status" string here and an exit code.
+			s := exitStatus{
+				Pid:      pid,
+				Status:   os.Getenv("EXIT_CODE"),
+				Code:     uint32(code),
+				ExitedAt: time.Now(),
+			}
+			data, err := json.Marshal(s)
+			if err != nil {
+				return err
+			}
+			conn, err := systemd.NewSystemdConnectionContext(ctx)
+			if err != nil {
+				return err
+			}
+			var p string
+			// TODO: this whole bit is kind of messy.
+			// Everything from how we specify the id/bundle for this subcommand to how we get paths, etc.
+			if id == "" {
+				proc := &initProcess{Bundle: bundle}
+				p = proc.exitStatePath()
+			} else {
+				proc := &execProcess{execID: id, parent: &initProcess{Bundle: bundle}}
+				p = proc.exitStatePath()
+			}
+			if err := os.WriteFile(p, data, 0600); err != nil {
+				return err
+			}
+
+			// Should this wait for the reload job to complete?
+			// e.g. by passing in a channel instead of nil and waiting on the channel
+			if _, err := conn.ReloadUnitContext(ctx, flags.Arg(0), "replace", nil); err != nil {
+				return err
+			}
+			return nil
 		},
 	}
 

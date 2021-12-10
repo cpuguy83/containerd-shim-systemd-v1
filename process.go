@@ -98,6 +98,7 @@ type Process interface {
 	Kill(context.Context, int, bool) error
 	Pid() uint32
 	Name() string
+	LoadState(context.Context) error
 	SetState(context.Context, pState) pState
 	ProcessState() pState
 }
@@ -280,6 +281,7 @@ func (p *initProcess) pidFile() string {
 func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 	st := p.process.SetState(ctx, state)
 	if st.Exited() {
+		log.G(ctx).Debugf("EXITED: %s", st)
 		p.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
 			ContainerID: p.id,
 			ID:          p.id,
