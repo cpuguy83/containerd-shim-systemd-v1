@@ -571,6 +571,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 		if err := do(); err != nil {
 			ret := err
 			if p.runc.Debug {
+				ret = fmt.Errorf("%w:\n%s", err, p.Name())
 				unitData, err := os.ReadFile("/run/systemd/system/" + uName)
 				if err == nil {
 					ret = fmt.Errorf("%w:\n%s", ret, string(unitData))
