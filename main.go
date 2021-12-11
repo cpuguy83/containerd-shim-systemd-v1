@@ -264,11 +264,13 @@ func main() {
 				if err != nil {
 					return err
 				}
-				defer unix.Close(f)
 
 				if err := unix.Dup2(f, 0); err != nil {
+					unix.Close(f)
 					return err
 				}
+			} else {
+				log.G(ctx).Debug("No stdin pipe")
 			}
 
 			if p := os.Getenv("STDOUT_FIFO"); p != "" {
@@ -276,23 +278,13 @@ func main() {
 				if err != nil {
 					return err
 				}
-				defer unix.Close(f)
 
 				if err := unix.Dup2(f, 1); err != nil {
+					unix.Close(f)
 					return err
 				}
-			}
-
-			if p := os.Getenv("STDOUT_FIFO"); p != "" {
-				f, err := unix.Open(p, os.O_RDWR, 0)
-				if err != nil {
-					return err
-				}
-				defer unix.Close(f)
-
-				if err := unix.Dup2(f, 1); err != nil {
-					return err
-				}
+			} else {
+				log.G(ctx).Debug("No stdout pipe")
 			}
 
 			if p := os.Getenv("STDERR_FIFO"); p != "" {
@@ -304,12 +296,14 @@ func main() {
 					if !tty {
 						return err
 					}
+				} else {
+					if err := unix.Dup2(f, 2); err != nil {
+						unix.Close(f)
+						return err
+					}
 				}
-				defer unix.Close(f)
-
-				if err := unix.Dup2(f, 2); err != nil {
-					return err
-				}
+			} else {
+				log.G(ctx).Debug("No stderr pipe")
 			}
 
 			fmt.Fprintln(os.Stderr, flags.Arg(0), flags.Args())
