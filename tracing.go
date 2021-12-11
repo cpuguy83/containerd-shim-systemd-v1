@@ -49,12 +49,10 @@ func WithShimLog(ctx context.Context, w io.Writer) context.Context {
 	l.SetLevel(e.Logger.GetLevel())
 	l.SetOutput(io.MultiWriter(e.Logger.Out, w))
 	l.Hooks = e.Logger.Hooks
+	l.SetReportCaller(e.Logger.ReportCaller)
 
-	e2 := logrus.NewEntry(l)
-	e2.Data = e.Data
-	e2.Caller = e.Caller
-	e2.Context = ctx
-	e2.Level = e.Level
+	e2 := e.Dup()
+	e2.Logger = l
 
 	return log.WithLogger(ctx, e2)
 }
@@ -71,11 +69,9 @@ func (c TraceConfig) StringFlags() string {
 
 func TraceFlags(fl *flag.FlagSet) *TraceConfig {
 	var cfg TraceConfig
-
 	fl.StringVar(&cfg.Endpoint, "trace-endpoint", "", "set the otlp endpoint for the agent to send trace data to")
 	fl.Float64Var(&cfg.SampleRate, "trace-sample-rate", 1.0, "set the sampling rate for the trace exporter")
 	fl.BoolVar(&cfg.Insecure, "trace-insecure", false, "allow traces to be sent to insecure endpoint")
-
 	return &cfg
 }
 
