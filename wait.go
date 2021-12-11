@@ -49,6 +49,9 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 	}()
 
 	p := s.processes.Get(path.Join(ns, r.ID))
+	if p == nil {
+		return nil, errdefs.ErrNotFound
+	}
 
 	ctx = WithShimLog(ctx, p.LogWriter())
 
@@ -84,6 +87,13 @@ func (p *process) waitForExit(ctx context.Context) (pState, error) {
 	defer p.mu.Unlock()
 
 	for {
+		select {
+		case <-ctx.Done():
+			log.G(ctx).Debug("wait: cancelled")
+			return pState{}, ctx.Err()
+		default:
+		}
+
 		if p.deleted {
 			log.G(ctx).Debug("wait: deleted")
 			break
@@ -94,13 +104,6 @@ func (p *process) waitForExit(ctx context.Context) (pState, error) {
 		}
 
 		log.G(ctx).Debugf("%+s", p.state)
-
-		select {
-		case <-ctx.Done():
-			log.G(ctx).Debug("wait: cancelled")
-			return pState{}, ctx.Err()
-		default:
-		}
 
 		p.cond.Wait()
 	}
