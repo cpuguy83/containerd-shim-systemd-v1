@@ -116,10 +116,17 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
 		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
-		unit.NewUnitOption(svc, "ExecStopPost", p.exe+" --bundle="+p.Bundle+" exit "+os.Getenv("UNIT_NAME")),
+		unit.NewUnitOption(svc, "ExecStopPost", "-"+p.exe+" --bundle="+p.Bundle+" exit "+os.Getenv("UNIT_NAME")),
+		// Set this as env vars here because we only want these fifos to be used for the container stdio, not the other commands we run.
+		// Otherwise we can run into interesting cases like the client has closeed the fifo and our Pre/Post commands hang
+		// We already had to open these fifos in process to prevent such hangs with `ExecStart`, now instead it'll open them just before
+		// executing runc.
+		unit.NewUnitOption(svc, "Environment", "STDIN_FIFO="+p.Stdin),
+		unit.NewUnitOption(svc, "Environment", "STDOUT_FIFO="+p.Stdout),
+		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
 	}
 
-	var prefix []string
+	prefix := []string{p.exe, "create"}
 	if len(p.Rootfs) > 0 {
 		if p.noNewNamespace {
 			opts = append(opts, unit.NewUnitOption(svc, "ExecStartPre", p.exe+" mount "+p.mountConfigPath()))
@@ -128,12 +135,13 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 			// Unfortunately with PrivateMounts we can't use `ExecStartPre` to mount the rootfs b/c it does not share a mount namespace
 			// with the main process. Instead we re-exec with `create` subcommand which will mount and exec the main process.
 			opts = append(opts, unit.NewUnitOption(svc, "PrivateMounts", "yes"))
-			prefix = []string{p.exe, "create", p.mountConfigPath()}
+			prefix = append(prefix, "--mounts="+p.mountConfigPath())
 		}
 	}
 
 	if p.Terminal || p.opts.Terminal {
 		opts = append(opts, unit.NewUnitOption("Service", "ExecStopPost", "-"+sysctl+" stop "+p.ttyUnitName()))
+		prefix = append(prefix, "--tty")
 	}
 
 	execStart, err := p.runcCmd(append(rcmd, p.id))
@@ -141,18 +149,6 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		return nil, err
 	}
 	opts = append(opts, unit.NewUnitOption(svc, "ExecStart", strings.Join(append(prefix, execStart...), " ")))
-
-	if p.Stdin != "" {
-		opts = append(opts, unit.NewUnitOption(svc, "StandardInput", "file:"+p.Stdin))
-	}
-	if p.Stdout != "" {
-		opts = append(opts, unit.NewUnitOption(svc, "StandardOutput", "file:"+p.Stdout))
-	}
-	if !p.Terminal && !p.opts.Terminal && p.Stderr != "" {
-		opts = append(opts, unit.NewUnitOption(svc, "StandardError", "file:"+p.Stderr))
-	} else {
-		opts = append(opts, unit.NewUnitOption(svc, "StandardError", "journal"))
-	}
 
 	return opts, nil
 }
@@ -167,16 +163,21 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", p.unitType()),
-		// unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
-		unit.NewUnitOption(svc, "GuessMainPID", "yes"),
+		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
+		unit.NewUnitOption(svc, "GuessMainPID", "no"),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
-		unit.NewUnitOption(svc, "ExecStopPost", p.exe+"--id="+p.id+" --bundle="+p.parent.Bundle+" exit "+os.Getenv("UNIT_NAME")),
+		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
+		unit.NewUnitOption(svc, "ExecStopPost", "-"+p.exe+" --id="+p.id+" --bundle="+p.parent.Bundle+" exit "+os.Getenv("UNIT_NAME")),
+		// Set this as env vars here because we only want these fifos to be used for the container stdio, not the other commands we run.
+		// Otherwise we can run into interesting cases like the client has closeed the fifo and our Pre/Post commands hang
+		// We already had to open these fifos in process to prevent such hangs with `ExecStart`, now instead it'll open them just before
+		// executing runc.
+		unit.NewUnitOption(svc, "Environment", "STDIN_FIFO="+p.Stdin),
+		unit.NewUnitOption(svc, "Environment", "STDOUT_FIFO="+p.Stdout),
+		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
 	}
 
-	if p.Terminal || p.opts.Terminal {
-		opts = append(opts, unit.NewUnitOption("Service", "ExecStopPost", "-"+sysctl+" stop "+p.ttyUnitName()))
-	}
-
+	prefix := []string{p.exe, "create"}
 	cmd := []string{"exec", "--process=" + p.processFilePath(), "--pid-file=" + p.pidFile(), "--detach"}
 	if p.Terminal || p.opts.Terminal {
 		s, err := p.ttySockPath()
@@ -185,25 +186,16 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 		}
 		cmd = append(cmd, "-t")
 		cmd = append(cmd, "--console-socket="+s)
+		opts = append(opts, unit.NewUnitOption(svc, "ExecStopPost", "-"+sysctl+" stop "+p.ttyUnitName()))
+		prefix = append(prefix, "--tty")
 	}
 
 	execStart, err := p.runcCmd(append(cmd, p.parent.id))
 	if err != nil {
 		return nil, err
 	}
+	execStart = append(prefix, execStart...)
 	opts = append(opts, unit.NewUnitOption(svc, "ExecStart", strings.Join(execStart, " ")))
-
-	if p.Stdin != "" {
-		opts = append(opts, unit.NewUnitOption(svc, "StandardInput", "file:"+p.Stdin))
-	}
-	if p.Stdout != "" {
-		opts = append(opts, unit.NewUnitOption(svc, "StandardOutput", "file:"+p.Stdout))
-	}
-	if !p.Terminal && !p.opts.Terminal && p.Stderr != "" {
-		opts = append(opts, unit.NewUnitOption(svc, "StandardError", "file:"+p.Stderr))
-	} else {
-		opts = append(opts, unit.NewUnitOption(svc, "StandardError", "journal"))
-	}
 
 	return opts, nil
 }

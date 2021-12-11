@@ -87,7 +87,14 @@ func (m *processManager) Delete(id string) {
 	m.mu.Lock()
 	delete(m.ls, id)
 	m.mu.Unlock()
-	log.G(context.TODO()).Debugf("deleted process %s", id)
+}
+
+func (m *processManager) Each(do func(p Process)) {
+	m.mu.Lock()
+	for _, p := range m.ls {
+		do(p)
+	}
+	m.mu.Unlock()
 }
 
 type Process interface {
@@ -289,6 +296,14 @@ func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 	st := p.process.SetState(ctx, state)
 	if st.Exited() {
 		log.G(ctx).Debugf("EXITED: %s", st)
+		p.execs.Each(func(exec Process) {
+			if err := exec.LoadState(ctx); err == nil {
+				log.G(ctx).WithError(err).WithField("exec", p.Name()).Info("Could not load exec state")
+			}
+			if !exec.ProcessState().Exited() {
+				exec.SetState(ctx, pState{ExitedAt: time.Now(), ExitCode: 255})
+			}
+		})
 		p.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
 			ContainerID: p.id,
 			ID:          p.id,
@@ -425,6 +440,7 @@ func (p *execProcess) getPid(ctx context.Context) (uint32, error) {
 func (p *execProcess) SetState(ctx context.Context, state pState) pState {
 	st := p.process.SetState(ctx, state)
 	if st.Exited() {
+		p.cond.Broadcast()
 		p.parent.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
 			ContainerID: p.parent.id,
 			ID:          p.execID,

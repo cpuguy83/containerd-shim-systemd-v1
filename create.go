@@ -463,27 +463,6 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 }
 
 func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
-	if p.Stdin != "" {
-		f, err := os.OpenFile(p.Stdin, os.O_RDWR, 0)
-		if err == nil {
-			defer f.Close()
-		}
-	}
-
-	if p.Stdout != "" {
-		f, err := os.OpenFile(p.Stdout, os.O_RDWR, 0)
-		if err == nil {
-			defer f.Close()
-		}
-	}
-
-	if p.Stderr != "" {
-		f, err := os.OpenFile(p.Stderr, os.O_RDWR, 0)
-		if err == nil {
-			defer f.Close()
-		}
-	}
-
 	uName := p.Name()
 
 	do := func() error {

@@ -108,6 +108,10 @@ func main() {
 		ttrpcAddr      = address + ".ttrpc"
 		logMode        = defaultLogMode
 		noNewNamespace bool
+
+		// create cmd
+		mountCfg string
+		tty      bool
 	)
 
 	rootFlags := flag.NewFlagSet(filepath.Base(os.Args[0]), flag.ContinueOnError)
@@ -139,8 +143,8 @@ func main() {
 
 	traceCfg := TraceFlags(flags)
 
-	doMount := func(ctx context.Context) error {
-		cfgData, err := os.ReadFile(flags.Arg(0))
+	doMount := func(ctx context.Context, p string) error {
+		cfgData, err := os.ReadFile(p)
 		if err != nil {
 			return err
 		}
@@ -157,6 +161,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Mounted rootfs to", target)
 		return err
 	}
+
 	commands := map[string]func(context.Context) error{
 		"install": func(ctx context.Context) error {
 			cfg := installConfig{
@@ -242,17 +247,73 @@ func main() {
 			if flags.NArg() != 1 {
 				return errors.New("mount requires exactly one argument")
 			}
-			return doMount(ctx)
+			return doMount(ctx, flag.Arg(0))
 		},
 		"unmount": func(ctx context.Context) error {
 			return mount.UnmountAll(flags.Arg(0), 0)
 		},
 		"create": func(ctx context.Context) error {
-			if err := doMount(ctx); err != nil {
-				return err
+			if mountCfg != "" {
+				if err := doMount(ctx, mountCfg); err != nil {
+					return err
+				}
 			}
-			fmt.Fprintln(os.Stderr, os.Args[2], os.Args[2:])
-			return syscall.Exec(os.Args[3], os.Args[3:], nil)
+
+			if p := os.Getenv("STDIN_FIFO"); p != "" {
+				f, err := unix.Open(p, os.O_RDWR, 0)
+				if err != nil {
+					return err
+				}
+				defer unix.Close(f)
+
+				if err := unix.Dup2(f, 0); err != nil {
+					return err
+				}
+			}
+
+			if p := os.Getenv("STDOUT_FIFO"); p != "" {
+				f, err := unix.Open(p, os.O_RDWR, 0)
+				if err != nil {
+					return err
+				}
+				defer unix.Close(f)
+
+				if err := unix.Dup2(f, 1); err != nil {
+					return err
+				}
+			}
+
+			if p := os.Getenv("STDOUT_FIFO"); p != "" {
+				f, err := unix.Open(p, os.O_RDWR, 0)
+				if err != nil {
+					return err
+				}
+				defer unix.Close(f)
+
+				if err := unix.Dup2(f, 1); err != nil {
+					return err
+				}
+			}
+
+			if p := os.Getenv("STDERR_FIFO"); p != "" {
+				f, err := unix.Open(p, os.O_RDWR, 0)
+				if err != nil {
+					// Ignore errors on this if we have a TTY
+					// Often we'll get a file path here but no actual fifo is created with TTY's.
+					// Reason being that there is no stderr for TTY.
+					if !tty {
+						return err
+					}
+				}
+				defer unix.Close(f)
+
+				if err := unix.Dup2(f, 2); err != nil {
+					return err
+				}
+			}
+
+			fmt.Fprintln(os.Stderr, flags.Arg(0), flags.Args())
+			return syscall.Exec(flags.Arg(0), flags.Args(), nil)
 		},
 		"exit": func(ctx context.Context) error {
 			code, err := strconv.Atoi(os.Getenv("EXIT_STATUS"))
@@ -335,6 +396,9 @@ func main() {
 	flags.StringVar(&socket, "socket", socket, "socket path to serve")
 
 	flags.StringVar(&logMode, "log-mode", logMode, "sets the default log mode for containers")
+
+	flags.StringVar(&mountCfg, "mounts", mountCfg, "mount config for container")
+	flags.BoolVar(&tty, "tty", tty, "stdio is tty")
 
 	if len(os.Args) < 2 {
 		flags.Usage()
