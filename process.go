@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -416,25 +415,11 @@ func (p *execProcess) getPid(ctx context.Context) (uint32, error) {
 		return pid, nil
 	}
 
-	var st pState
-	if err := getUnitState(ctx, p.systemd, p.Name(), &st); err == nil {
-		if st.Pid > 0 {
-			return st.Pid, nil
-		}
-	} else {
-		log.G(ctx).WithError(err).Warn("failed to get unit state")
+	if err := p.LoadState(ctx); err != nil {
+		return 0, err
 	}
 
-	pidData, err := os.ReadFile(p.pidFile())
-	if err != nil {
-		return 0, fmt.Errorf("could not get pid of process: %w", err)
-	}
-
-	pid, err := strconv.Atoi(string(pidData))
-	if err != nil {
-		return 0, fmt.Errorf("error parsing pid: %w", err)
-	}
-	return uint32(pid), nil
+	return p.ProcessState().Pid, nil
 }
 
 func (p *execProcess) SetState(ctx context.Context, state pState) pState {

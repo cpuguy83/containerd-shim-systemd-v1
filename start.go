@@ -311,39 +311,14 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 		p.systemd.KillUnitContext(ctx, p.Name(), int32(syscall.SIGKILL))
 	case status := <-ch:
 		if status != "done" {
-			pidData, err := os.ReadFile(p.pidFile() + ".exited")
-			if err == nil && len(pidData) > 0 {
-				// TODO: this is a hack to get the pid of the exec process
-				// Unfortuantely if the process exited quickly systemd reports this as a "protocol error"
-				// We also cannot get the correct status code in this case.
-				pid, err := strconv.Atoi(string(pidData))
-				if err != nil {
-					return 0, fmt.Errorf("could not read pid: %w", err)
-				}
-				p.mu.Lock()
-
-				var st pState
-				getUnitState(ctx, p.systemd, p.Name(), &st)
-				if !st.ExitedAt.After(timeZero) {
-					p.state.Pid = uint32(pid)
-					p.state.ExitedAt = time.Now()
-					p.state.ExitCode = 255
-				}
-				log.G(ctx).WithField("status", status).Debug("Set status to failed")
-				p.cond.Broadcast()
-				p.mu.Unlock()
-				return uint32(pid), nil
-			} else {
-				log.G(ctx).WithError(err).Debug("Error reading pid file")
+			pid, err := p.getPid(ctx)
+			if err == nil {
+				return pid, nil
 			}
 
-			ret := fmt.Errorf("exec failed to start: %s", status)
-			var st pState
-			if err := getUnitState(ctx, p.systemd, p.Name(), &st); err == nil {
-				p.SetState(ctx, st)
-				p.cond.Broadcast()
-			}
+			ret := fmt.Errorf("error starting exec process")
 			if p.runc.Debug {
+				ret = fmt.Errorf("%w:\n%s", ret, p.Name())
 				unitData, err := os.ReadFile("/run/systemd/system/" + p.Name())
 				if err == nil {
 					ret = fmt.Errorf("%w:\n%s\n%s", ret, p.Name(), unitData)
