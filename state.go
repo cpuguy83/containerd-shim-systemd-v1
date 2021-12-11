@@ -93,7 +93,7 @@ func (m *unitManager) Watch(ctx context.Context) {
 			log.G(ctx).Debug(p.ProcessState())
 		}
 
-		timer.Reset(time.Second)
+		timer.Reset(time.Minute)
 		select {
 		case <-ctx.Done():
 			log.G(ctx).WithError(ctx.Err()).Info("Exiting unit watch loop")
