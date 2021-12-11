@@ -63,11 +63,9 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 			return nil, err
 		}
 
-		p.(*initProcess).execs.mu.Lock()
-		for _, ep := range p.(*initProcess).execs.ls {
+		p.(*initProcess).execs.Each(func(ep Process) {
 			s.units.Delete(ep)
-		}
-		p.(*initProcess).execs.mu.Unlock()
+		})
 		s.processes.Delete(path.Join(ns, r.ID))
 		s.units.Delete(p)
 	}
