@@ -270,7 +270,7 @@ func (p *execProcess) LoadState(ctx context.Context) error {
 }
 
 func (p *execProcess) exitStatePath() string {
-	return filepath.Join(p.parent.Bundle, p.id+"_exit_status.json")
+	return filepath.Join(p.parent.Bundle, p.execID+"_exit_status.json")
 }
 
 func (p *execProcess) readExitState(st *pState) error {
