@@ -89,6 +89,8 @@ func (m *unitManager) Watch(ctx context.Context) {
 				log.G(ctx).WithError(err).Error("Error loading process state")
 				continue
 			}
+
+			log.G(ctx).Debug(p.ProcessState())
 		}
 
 		timer.Reset(time.Second)
