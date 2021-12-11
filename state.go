@@ -76,6 +76,8 @@ func (m *unitManager) Watch(ctx context.Context) {
 				continue
 			}
 
+			ctx = WithShimLog(ctx, p.LogWriter())
+
 			if p.ProcessState().Exited() {
 				// Process is already exited, we don't care about state updates on this unit anymore
 				log.G(ctx).Debug("Skipped unit status update for exited process")
