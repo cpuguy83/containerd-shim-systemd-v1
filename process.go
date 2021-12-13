@@ -294,7 +294,7 @@ func (p *initProcess) pidFile() string {
 func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 	st := p.process.SetState(ctx, state)
 	if st.Exited() {
-		log.G(ctx).Debugf("EXITED: %s", st)
+		log.G(ctx).Debugf("EXITED: %s %s", p.Name(), st)
 		p.execs.Each(func(exec Process) {
 			if err := exec.LoadState(ctx); err == nil {
 				log.G(ctx).WithError(err).WithField("exec", p.Name()).Info("Could not load exec state")
