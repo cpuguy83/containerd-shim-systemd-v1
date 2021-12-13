@@ -312,7 +312,7 @@ func (p *execProcess) Create(ctx context.Context) error {
 		log.G(ctx).WithError(err).Warn("failed to reload systemd")
 	}
 	// Make sure we don't have some old state from a past run.
-	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil {
+	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil && !strings.Contains(err.Error(), "not loaded") {
 		log.G(ctx).WithError(err).Warn("Failed to reset systemd unit")
 	}
 	return nil

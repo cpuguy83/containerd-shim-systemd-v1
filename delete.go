@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"strings"
 	"syscall"
 
 	"github.com/containerd/containerd/errdefs"
@@ -150,7 +151,7 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		log.G(ctx).WithError(err).Error("systemd reload failed")
 	}
 
-	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil {
+	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil && !strings.Contains(err.Error(), "not loaded") {
 		// Just a debug message since this is just precautionary and the unit may not even be failed.
 		log.G(ctx).WithError(err).Debug("Failed to reset systemd unit")
 	}
