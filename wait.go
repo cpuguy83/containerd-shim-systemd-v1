@@ -103,8 +103,6 @@ func (p *process) waitForExit(ctx context.Context) (pState, error) {
 			break
 		}
 
-		log.G(ctx).Debugf("%+s", p.state)
-
 		p.cond.Wait()
 	}
 
