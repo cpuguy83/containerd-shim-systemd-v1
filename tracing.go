@@ -4,13 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
-	"io/ioutil"
-	"path/filepath"
 
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/tracing"
-	"github.com/containerd/fifo"
 	"github.com/containerd/ttrpc"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
@@ -22,7 +18,6 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 	"go.opentelemetry.io/otel/trace"
-	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 )
 
@@ -31,31 +26,6 @@ const (
 	eIDAttr = "exec.id"
 	nsAttr  = "ns"
 )
-
-func OpenShimLog(ctx context.Context, bundle string) io.Writer {
-	f, err := fifo.OpenFifo(ctx, filepath.Join(bundle, "log"), unix.O_RDWR|unix.O_CREAT|unix.O_NONBLOCK, 0700)
-	if err != nil {
-		log.G(ctx).WithError(err).Warn("Error opening shim log")
-
-		return ioutil.Discard
-	}
-	return f
-}
-
-func WithShimLog(ctx context.Context, w io.Writer) context.Context {
-	e := log.G(ctx)
-
-	l := logrus.New()
-	l.SetLevel(e.Logger.GetLevel())
-	l.SetOutput(io.MultiWriter(e.Logger.Out, w))
-	l.Hooks = e.Logger.Hooks
-	l.SetReportCaller(e.Logger.ReportCaller)
-
-	e2 := e.Dup()
-	e2.Logger = l
-
-	return log.WithLogger(ctx, e2)
-}
 
 type TraceConfig struct {
 	Endpoint   string
