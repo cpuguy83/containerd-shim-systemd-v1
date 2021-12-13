@@ -90,7 +90,7 @@ func (m *unitManager) Watch(ctx context.Context) {
 				continue
 			}
 
-			log.G(ctx).Debug(p.ProcessState())
+			log.G(ctx).WithField("unit", p.Name()).Debugf("Updated unit state: %s", p.ProcessState())
 		}
 
 		timer.Reset(time.Minute)
@@ -192,20 +192,23 @@ func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState)
 	if p := state["ExecMainPID"]; p != nil {
 		st.Pid = uint32(p.(uint32))
 	}
-	// if c := state["ExecMainStatus"]; c != nil {
-	// 	st.ExitCode = uint32(c.(int32))
-	// }
+	if c := state["ExecMainStatus"]; c != nil {
+		st.ExitCode = uint32(c.(int32))
+	}
+
 	// if ts := state["ExecMainExitTimestamp"]; ts != nil {
-	// 	st.ExitedAt = time.UnixMicro(int64(ts.(uint64)))
-	// 	if !st.ExitedAt.After(timeZero) {
-	// 		code, t := readExecStatusExit(state["ExecStart"].([][]interface{})[0])
-	// 		if t.After(timeZero) {
-	// 			st.ExitedAt = t
-	// 			if code > 0 {
-	// 				st.ExitCode = uint32(code)
-	// 			}
-	// 		}
-	// 	}
+	// st.ExitedAt = time.UnixMicro(int64(ts.(uint64)))
+	// if !st.ExitedAt.After(timeZero) {
+	if st.ExitCode == 0 {
+		code, _ := readExecStatusExit(state["ExecStart"].([][]interface{})[0])
+		// if t.After(timeZero) {
+		// st.ExitedAt = t
+		if code > 0 {
+			st.ExitCode = uint32(code)
+		}
+		// }
+	}
+	//}
 	// }
 	// if status := state["SubState"]; status != nil {
 	// 	st.Status = status.(string)
@@ -256,15 +259,19 @@ func (p *initProcess) LoadState(ctx context.Context) error {
 
 func (p *execProcess) LoadState(ctx context.Context) error {
 	var st pState
-	if err := p.readExitState(&st); err == nil {
+	err := p.readExitState(&st)
+	if err == nil {
 		p.SetState(ctx, st)
 		return nil
 	}
+
+	log.G(ctx).WithField("unit", p.Name()).WithError(err).Debug("Error reading exit state file")
 
 	st.Reset()
 	if err := getUnitState(ctx, p.systemd, p.Name(), &st); err != nil {
 		return err
 	}
+	log.G(ctx).WithField("unit", p.Name()).Debugf("Setting unit state from systemd: %s", st)
 	p.SetState(ctx, st)
 	return nil
 }
@@ -371,7 +378,7 @@ func (s *pState) CopyTo(other *pState) {
 			other.ExitedAt = s.ExitedAt
 		}
 	}
-	if other.ExitCode == 0 {
+	if s.ExitCode > 0 && other.ExitCode == 0 {
 		other.ExitCode = s.ExitCode
 	}
 	if other.Pid == 0 {
@@ -380,15 +387,6 @@ func (s *pState) CopyTo(other *pState) {
 	if s.Status != "" {
 		other.Status = s.Status
 	}
-}
-
-// exitStatus is used on process exit to write the status to a file so we don't need to rely on systemd for this data
-// Mainly systemd can be a problem because it can give some inconsistent state... which it still could here but we have some more control over it.
-type exitStatus struct {
-	Pid      uint32
-	Code     uint32
-	Status   string
-	ExitedAt time.Time
 }
 
 type execState struct {

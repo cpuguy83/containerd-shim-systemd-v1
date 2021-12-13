@@ -111,6 +111,11 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		return nil, err
 	}
 
+	stderr := "journal"
+	if f, ok := p.shimLog.(*os.File); ok {
+		stderr = "file:" + f.Name()
+	}
+
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", p.unitType()),
 		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
@@ -124,6 +129,7 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "Environment", "STDIN_FIFO="+p.Stdin),
 		unit.NewUnitOption(svc, "Environment", "STDOUT_FIFO="+p.Stdout),
 		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
+		unit.NewUnitOption(svc, "StandardError", stderr),
 	}
 
 	prefix := []string{p.exe, "create"}
@@ -153,6 +159,20 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 	return opts, nil
 }
 
+func (p *execProcess) fallbackExitCodePath() string {
+	return filepath.Join(p.root, p.execID+"-exit-code")
+}
+
+func (p *execProcess) unitType() string {
+	t := p.process.unitType()
+	if t == "forking" {
+		if !p.Terminal && !p.opts.Terminal {
+			return "simple"
+		}
+	}
+	return t
+}
+
 func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 	const svc = "Service"
 
@@ -161,13 +181,19 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 		return nil, err
 	}
 
+	stderr := "journal"
+	if f, ok := p.parent.shimLog.(*os.File); ok {
+		stderr = "file:" + f.Name()
+	}
+
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", p.unitType()),
 		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
 		unit.NewUnitOption(svc, "GuessMainPID", "no"),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
 		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
-		unit.NewUnitOption(svc, "ExecStopPost", "-"+p.exe+" --id="+p.id+" --bundle="+p.parent.Bundle+" exit "+os.Getenv("UNIT_NAME")),
+		unit.NewUnitOption(svc, "ExecStopPost", "-"+p.exe+" --debug="+strconv.FormatBool(p.runc.Debug)+" --id="+p.id+" --bundle="+p.parent.Bundle+" exit "+os.Getenv("UNIT_NAME")+" "+p.fallbackExitCodePath()),
+
 		// Set this as env vars here because we only want these fifos to be used for the container stdio, not the other commands we run.
 		// Otherwise we can run into interesting cases like the client has closeed the fifo and our Pre/Post commands hang
 		// We already had to open these fifos in process to prevent such hangs with `ExecStart`, now instead it'll open them just before
@@ -175,19 +201,26 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "Environment", "STDIN_FIFO="+p.Stdin),
 		unit.NewUnitOption(svc, "Environment", "STDOUT_FIFO="+p.Stdout),
 		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
+		unit.NewUnitOption(svc, "StandardError", stderr),
 	}
 
-	prefix := []string{p.exe, "create"}
-	cmd := []string{"exec", "--process=" + p.processFilePath(), "--pid-file=" + p.pidFile(), "--detach"}
+	var prefix []string
+	cmd := []string{"exec", "--process=" + p.processFilePath(), "--pid-file=" + p.pidFile()}
 	if p.Terminal || p.opts.Terminal {
 		s, err := p.ttySockPath()
 		if err != nil {
 			return nil, err
 		}
+
 		cmd = append(cmd, "-t")
 		cmd = append(cmd, "--console-socket="+s)
+		cmd = append(cmd, "--detach")
 		opts = append(opts, unit.NewUnitOption(svc, "ExecStopPost", "-"+sysctl+" stop "+p.ttyUnitName()))
-		prefix = append(prefix, "--tty")
+
+		// Used to get exit codes for processes that returned too quickly for systemd to attach
+		// This is needed for when using `--detach`, which is neccessary for tty's, currently
+		opts = append(opts, unit.NewUnitOption(svc, "StandardOutput", "file:"+p.fallbackExitCodePath()))
+		prefix = []string{p.exe, "create", "--tty"}
 	}
 
 	execStart, err := p.runcCmd(append(cmd, p.parent.id))
@@ -311,10 +344,17 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 		p.systemd.KillUnitContext(ctx, p.Name(), int32(syscall.SIGKILL))
 	case status := <-ch:
 		if status != "done" {
+			st, err := p.Wait(ctx)
+			if err == nil {
+				return st.Pid, nil
+			}
+
 			pid, err := p.getPid(ctx)
 			if err == nil {
 				return pid, nil
 			}
+
+			getUnitState(ctx, p.systemd, p.Name(), &st)
 
 			ret := fmt.Errorf("error starting exec process")
 			if p.runc.Debug {

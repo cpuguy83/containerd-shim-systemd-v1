@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
 	"path/filepath"
@@ -259,36 +260,29 @@ func main() {
 				}
 			}
 
+			cmd := exec.Command(flags.Arg(0), flags.Args()[1:]...)
 			if p := os.Getenv("STDIN_FIFO"); p != "" {
-				f, err := unix.Open(p, os.O_RDWR, 0)
+				f, err := os.OpenFile(p, os.O_RDWR, 0)
 				if err != nil {
 					return err
 				}
-
-				if err := unix.Dup2(f, 0); err != nil {
-					unix.Close(f)
-					return err
-				}
+				cmd.Stdin = f
 			} else {
 				log.G(ctx).Debug("No stdin pipe")
 			}
 
 			if p := os.Getenv("STDOUT_FIFO"); p != "" {
-				f, err := unix.Open(p, os.O_RDWR, 0)
+				f, err := os.OpenFile(p, os.O_RDWR, 0)
 				if err != nil {
 					return err
 				}
-
-				if err := unix.Dup2(f, 1); err != nil {
-					unix.Close(f)
-					return err
-				}
+				cmd.Stdout = f
 			} else {
 				log.G(ctx).Debug("No stdout pipe")
 			}
 
 			if p := os.Getenv("STDERR_FIFO"); p != "" {
-				f, err := unix.Open(p, os.O_RDWR, 0)
+				f, err := os.OpenFile(p, os.O_RDWR, 0)
 				if err != nil {
 					// Ignore errors on this if we have a TTY
 					// Often we'll get a file path here but no actual fifo is created with TTY's.
@@ -297,24 +291,50 @@ func main() {
 						return err
 					}
 				} else {
-					if err := unix.Dup2(f, 2); err != nil {
-						unix.Close(f)
-						return err
-					}
+					cmd.Stderr = f
 				}
 			} else {
 				log.G(ctx).Debug("No stderr pipe")
 			}
 
 			fmt.Fprintln(os.Stderr, flags.Arg(0), flags.Args())
-			return syscall.Exec(flags.Arg(0), flags.Args(), nil)
+
+			if err := cmd.Start(); err != nil {
+				return err
+			}
+
+			wait := make(chan int)
+			go func() {
+				cmd.Wait()
+				wait <- cmd.ProcessState.ExitCode()
+			}()
+
+			select {
+			case <-time.After(time.Second):
+			case code := <-wait:
+				os.Stdout.Write([]byte(strconv.Itoa(code)))
+			}
+			return nil
 		},
 		"exit": func(ctx context.Context) error {
 			code, err := strconv.Atoi(os.Getenv("EXIT_STATUS"))
-			if err == nil {
+			if err != nil {
 				code = 255
-			} else {
 				log.G(ctx).WithError(err).Error("Error reading exit status")
+
+				// Fallback to exit status written by our `create` subcommand
+				// This is currently needed for type=forking where the exec'd process exits quickly.
+				exitData, err := os.ReadFile(flags.Arg(1))
+				if err == nil {
+					c, err := strconv.Atoi(string(exitData))
+					if err != nil {
+						log.G(ctx).WithError(err).Warn("Error parsing exit code from file")
+					} else {
+						code = c
+					}
+				} else {
+					log.G(ctx).WithError(err).Warn("Error reading exit code from file")
+				}
 			}
 
 			pidData, err := ioutil.ReadFile(os.Getenv("PIDFILE"))
@@ -333,20 +353,18 @@ func main() {
 			// "code" in systemd parlance is really a status string referring to the unit state
 			// "status" in systemd parlance is the exit status of the process
 			// This is super confusing but we turn that into a "Status" string here and an exit code.
-			s := exitStatus{
+			s := pState{
 				Pid:      pid,
 				Status:   os.Getenv("EXIT_CODE"),
-				Code:     uint32(code),
+				ExitCode: uint32(code),
 				ExitedAt: time.Now(),
 			}
+
 			data, err := json.Marshal(s)
 			if err != nil {
 				return err
 			}
-			conn, err := systemd.NewSystemdConnectionContext(ctx)
-			if err != nil {
-				return err
-			}
+
 			var p string
 			// TODO: this whole bit is kind of messy.
 			// Everything from how we specify the id/bundle for this subcommand to how we get paths, etc.
@@ -358,6 +376,11 @@ func main() {
 				p = proc.exitStatePath()
 			}
 			if err := os.WriteFile(p, data, 0600); err != nil {
+				return err
+			}
+
+			conn, err := systemd.NewSystemdConnectionContext(ctx)
+			if err != nil {
 				return err
 			}
 
