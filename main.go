@@ -275,12 +275,25 @@ func main() {
 			}
 
 			cmd := exec.Command(flags.Arg(0), flags.Args()[1:]...)
+
+			// Open all fifos with O_RDWR first so that we don't block trying to open
+			// Then open with the correct permissions which get passed to runc.
+			// Very important to use the correct open perms so that when one side of the fifo closes the process gets the close notification.
+			//
+			// TODO: Do we need to use O_RDWR? I recall there was some issues early on that we were having so I'm leaving it in for now.
 			if p := os.Getenv("STDIN_FIFO"); p != "" {
 				f, err := os.OpenFile(p, os.O_RDWR, 0)
 				if err != nil {
 					return err
 				}
-				cmd.Stdin = f
+				defer f.Close()
+
+				f2, err := os.OpenFile(p, os.O_RDONLY, 0)
+				if err != nil {
+					return err
+				}
+				defer f2.Close()
+				cmd.Stdin = f2
 			} else {
 				log.G(ctx).Debug("No stdin pipe")
 			}
@@ -290,7 +303,15 @@ func main() {
 				if err != nil {
 					return err
 				}
-				cmd.Stdout = f
+				defer f.Close()
+
+				f2, err := os.OpenFile(p, os.O_WRONLY, 0)
+				if err != nil {
+					return err
+				}
+				defer f2.Close()
+
+				cmd.Stdout = f2
 			} else {
 				log.G(ctx).Debug("No stdout pipe")
 			}
@@ -305,7 +326,14 @@ func main() {
 						return err
 					}
 				} else {
-					cmd.Stderr = f
+					defer f.Close()
+
+					f2, err := os.OpenFile(p, os.O_WRONLY, 0)
+					if err != nil {
+						return err
+					}
+					defer f2.Close()
+					cmd.Stderr = f2
 				}
 			} else {
 				log.G(ctx).Debug("No stderr pipe")
