@@ -496,16 +496,14 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 	}
 
 	handlePid := func() (uint32, error) {
-		pid, err := p.readPidFile()
-		if err != nil {
-			var ps pState
-			if err := getUnitState(ctx, p.systemd, uName, &ps); err != nil {
-				return 0, err
-			}
-			if ps.Pid == 0 {
+		p.LoadState(ctx)
+		pid := p.Pid()
+		if pid == 0 {
+			var err error
+			pid, err = p.readPidFile()
+			if err != nil {
 				return 0, fmt.Errorf("error reading pid file: %w", err)
 			}
-			pid = ps.Pid
 		}
 
 		p.mu.Lock()
@@ -514,12 +512,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 		}
 		p.mu.Unlock()
 		if pid > 0 {
-			var st pState
-			if err := getUnitState(ctx, p.systemd, p.Name(), &st); err != nil {
-				return 0, err
-			}
-			if st.ExitedAt.After(timeZero) {
-				p.SetState(ctx, st)
+			if p.ProcessState().Exited() {
 				p.cond.Broadcast()
 			}
 		}
@@ -530,7 +523,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 		if pid, err := handlePid(); err == nil {
 			return pid, nil
 		} else {
-			log.G(ctx).WithError(err).Error("Error getting pid")
+			log.G(ctx).WithError(err).Debug("Error getting pid")
 		}
 
 		ch := make(chan string, 1)

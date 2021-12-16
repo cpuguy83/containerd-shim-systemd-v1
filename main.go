@@ -268,6 +268,8 @@ func main() {
 			return mount.UnmountAll(flags.Arg(0), 0)
 		},
 		"create": func(ctx context.Context) error {
+			ctx = WithShimLog(ctx, OpenShimLog(ctx, bundle))
+
 			if mountCfg != "" {
 				if err := doMount(ctx, mountCfg); err != nil {
 					return err

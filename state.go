@@ -366,10 +366,11 @@ func (s pState) Exited() bool {
 	if s.ExitCode > 0 {
 		return true
 	}
-	// if s.Status == "exited" || s.Status == "failed" || s.Status == "dead" {
-	// 	return true
-	// }
 	return s.ExitedAt.After(timeZero)
+}
+
+func (s pState) Started() bool {
+	return s.Pid > 0
 }
 
 func (s pState) String() string {

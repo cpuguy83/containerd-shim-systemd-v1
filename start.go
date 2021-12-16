@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sys/unix"
 )
 
 // Start the primary user process inside the container
@@ -239,16 +240,23 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		return 0, fmt.Errorf("process has already exited")
 	}
 	if err := p.runc.Start(ctx, p.id); err != nil {
+		log.G(ctx).WithError(err).Error("Error calling runc start")
 		ret := fmt.Errorf("failed runc start: %w", err)
 
-		var st pState
-		getUnitState(ctx, p.systemd, p.Name(), &st)
-		if !st.ExitedAt.After(timeZero) {
-			st.ExitedAt = time.Now()
-			st.ExitCode = 255
+		if err := p.LoadState(ctx); err != nil {
+			log.G(ctx).WithError(err).Warn("Error loading process state")
 		}
+		if !p.ProcessState().Exited() {
+			log.G(ctx).Debug("runc start failed but process is still running, sending sigkill")
+			p.systemd.KillUnitContext(ctx, p.Name(), int32(unix.SIGKILL))
+			if err := p.LoadState(ctx); err != nil {
+				log.G(ctx).WithError(err).Debug("Error loading process state")
+			}
 
-		p.SetState(ctx, st)
+			if !p.ProcessState().Exited() {
+				p.SetState(ctx, pState{ExitCode: 255, ExitedAt: time.Now()})
+			}
+		}
 		p.cond.Broadcast()
 
 		if p.runc.Debug {
@@ -341,6 +349,12 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 			}
 			return 0, ret
 		}
+	}
+
+	p.LoadState(ctx)
+
+	if p.ProcessState().ExitCode > 0 {
+		return 0, fmt.Errorf("error starting container")
 	}
 
 	pid, err := p.getPid(ctx)
