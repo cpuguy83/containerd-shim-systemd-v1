@@ -229,10 +229,10 @@ func main() {
 			// read the containerd config so we can match log formats defined there.
 			var containerdConfig srvConfig
 			if f, err := toml.LoadFile(containerdConfigPath); err != nil {
-				logrus.WithError(err).Fatal("Failed to load containerd config")
+				logrus.WithError(err).Error("Failed to load containerd config")
 			} else {
 				if err := f.Unmarshal(&containerdConfig); err != nil {
-					logrus.WithError(err).Fatal("Failed to unmarshal conntainerd config")
+					logrus.WithError(err).Error("Failed to unmarshal conntainerd config")
 				}
 			}
 
