@@ -359,6 +359,11 @@ func main() {
 			return nil
 		},
 		"exit": func(ctx context.Context) error {
+			conn, err := systemd.NewSystemdConnectionContext(ctx)
+			if err != nil {
+				return err
+			}
+
 			code, err := strconv.Atoi(os.Getenv("EXIT_STATUS"))
 			if err != nil {
 				code = 255
@@ -366,16 +371,27 @@ func main() {
 
 				// Fallback to exit status written by our `create` subcommand
 				// This is currently needed for type=forking where the exec'd process exits quickly.
-				exitData, err := os.ReadFile(flags.Arg(1))
+				exitData, err := os.ReadFile(flags.Arg(0))
 				if err == nil {
 					c, err := strconv.Atoi(string(exitData))
 					if err != nil {
 						log.G(ctx).WithError(err).Warn("Error parsing exit code from file")
+						code = 255
 					} else {
 						code = c
 					}
 				} else {
 					log.G(ctx).WithError(err).Warn("Error reading exit code from file")
+					code = 255
+				}
+			}
+
+			if code == 255 {
+				log.G(ctx).Debug("Falling back to reading exit status from systemd api")
+				var st pState
+				getUnitState(ctx, conn, os.Getenv("UNIT_NAME"), &st)
+				if st.ExitCode > 0 {
+					code = int(st.ExitCode)
 				}
 			}
 
@@ -421,14 +437,9 @@ func main() {
 				return err
 			}
 
-			conn, err := systemd.NewSystemdConnectionContext(ctx)
-			if err != nil {
-				return err
-			}
-
 			// Should this wait for the reload job to complete?
 			// e.g. by passing in a channel instead of nil and waiting on the channel
-			if _, err := conn.ReloadUnitContext(ctx, flags.Arg(0), "replace", nil); err != nil {
+			if _, err := conn.ReloadUnitContext(ctx, os.Getenv("DAEMON_UNIT_NAME"), "replace", nil); err != nil {
 				return err
 			}
 			return nil

@@ -111,11 +111,6 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		return nil, err
 	}
 
-	stderr := "journal"
-	if f, ok := p.shimLog.(*os.File); ok {
-		stderr = "file:" + f.Name()
-	}
-
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", p.unitType()),
 		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
@@ -129,7 +124,8 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "Environment", "STDIN_FIFO="+p.Stdin),
 		unit.NewUnitOption(svc, "Environment", "STDOUT_FIFO="+p.Stdout),
 		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
-		unit.NewUnitOption(svc, "StandardError", stderr),
+		unit.NewUnitOption(svc, "Environment", "DAEMON_UNIT_NAME="+os.Getenv("UNIT_NAME")),
+		unit.NewUnitOption(svc, "Environment", "UNIT_NAME=%n"), // %n is replaced with the unit name by systemd
 	}
 
 	prefix := []string{p.exe, "create"}
