@@ -70,9 +70,12 @@ func (m *unitManager) Watch(ctx context.Context) {
 		}
 
 		for _, unit := range units {
+			unit := unit
+			ctx := log.WithLogger(ctx, log.G(ctx).WithField("unit", unit.Name))
+
 			p := m.Get(unit.Name)
 			if p == nil {
-				log.G(ctx).Debugf("Skipping unit status update for unknown unit: %+v", unit)
+				log.G(ctx).Debugf("Skipping unit status update for unknown unit")
 				continue
 			}
 
@@ -84,7 +87,7 @@ func (m *unitManager) Watch(ctx context.Context) {
 				continue
 			}
 
-			log.G(ctx).Debugf("Getting unit state for %s", unit.Name)
+			log.G(ctx).Debugf("Getting unit state")
 			if err := p.LoadState(ctx); err != nil {
 				log.G(ctx).WithError(err).Error("Error loading process state")
 				continue
