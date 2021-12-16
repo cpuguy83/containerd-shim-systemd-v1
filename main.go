@@ -42,6 +42,7 @@ import (
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	"github.com/gogo/protobuf/proto"
+	"github.com/pelletier/go-toml"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -417,6 +418,9 @@ func main() {
 	flags.StringVar(&mountCfg, "mounts", mountCfg, "mount config for container")
 	flags.BoolVar(&tty, "tty", tty, "stdio is tty")
 
+	containerdConfigPath := filepath.Join(defaults.DefaultConfigDir, "config.toml")
+	flags.StringVar(&containerdConfigPath, "containerd-config", containerdConfigPath, "path to containerd config")
+
 	if len(os.Args) < 2 {
 		flags.Usage()
 		os.Exit(1)
@@ -442,6 +446,18 @@ func main() {
 	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(logrus.Fields{
 		"action": action,
 	}))
+
+	// read the containerd config so we can match log formats defined there.
+	var containerdConfig srvConfig
+	if f, err := toml.LoadFile(containerdConfigPath); err != nil {
+		logrus.WithError(err).Fatal("Failed to load containerd config")
+	} else {
+		if err := f.Unmarshal(&containerdConfig); err != nil {
+			logrus.WithError(err).Fatal("Failed to unmarshal conntainerd config")
+		}
+	}
+
+	setupLogFormat(ctx, containerdConfig)
 
 	errOut := func(err error) {
 		if err == nil {

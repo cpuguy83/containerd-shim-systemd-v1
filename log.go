@@ -11,6 +11,28 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type srvConfig struct {
+	Debug struct {
+		Format string `toml:"format"`
+	} `toml:"debug"`
+}
+
+func setupLogFormat(ctx context.Context, config srvConfig) {
+	if config.Debug.Format == "" {
+		config.Debug.Format = log.TextFormat
+	}
+	if config.Debug.Format == log.TextFormat {
+		logrus.StandardLogger().SetFormatter(&logrus.TextFormatter{
+			TimestampFormat: log.RFC3339NanoFixed,
+			FullTimestamp:   true,
+		})
+	} else if config.Debug.Format == log.JSONFormat {
+		logrus.StandardLogger().SetFormatter(&logrus.JSONFormatter{
+			TimestampFormat: log.RFC3339NanoFixed,
+		})
+	}
+}
+
 func OpenShimLog(ctx context.Context, bundle string) io.Writer {
 	logPath := filepath.Join(bundle, "log")
 	f, err := os.OpenFile(logPath, os.O_RDWR, 0)

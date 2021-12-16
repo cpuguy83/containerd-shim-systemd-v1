@@ -11,11 +11,11 @@ require (
 	github.com/containerd/typeurl v1.0.2
 	github.com/coreos/go-systemd v0.0.0-20190321100706-95778dfbb74e
 	github.com/coreos/go-systemd/v22 v22.3.2
-	github.com/cpuguy83/pipes v0.0.0-20210822175459-cdd9171bf6ca
 	github.com/godbus/dbus/v5 v5.0.5
 	github.com/gogo/protobuf v1.3.2
 	github.com/golang/protobuf v1.5.2
 	github.com/opencontainers/runtime-spec v1.0.3-0.20210326190908-1c3f411f0417
+	github.com/pelletier/go-toml v1.9.3
 	github.com/sirupsen/logrus v1.8.1
 	go.opentelemetry.io/otel v1.1.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.0.1
