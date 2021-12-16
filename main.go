@@ -164,6 +164,7 @@ func main() {
 		return err
 	}
 
+	containerdConfigPath := filepath.Join(defaults.DefaultConfigDir, "config.toml")
 	commands := map[string]func(context.Context) error{
 		"install": func(ctx context.Context) error {
 			cfg := installConfig{
@@ -225,6 +226,18 @@ func main() {
 			return err
 		},
 		"serve": func(ctx context.Context) error {
+			// read the containerd config so we can match log formats defined there.
+			var containerdConfig srvConfig
+			if f, err := toml.LoadFile(containerdConfigPath); err != nil {
+				logrus.WithError(err).Fatal("Failed to load containerd config")
+			} else {
+				if err := f.Unmarshal(&containerdConfig); err != nil {
+					logrus.WithError(err).Fatal("Failed to unmarshal conntainerd config")
+				}
+			}
+
+			setupLogFormat(ctx, containerdConfig)
+
 			log.G(ctx).Infof("Starting with unit name %s", os.Getenv("UNIT_NAME"))
 			done, err := ConfigureTracing(ctx, traceCfg)
 			if err != nil {
@@ -418,7 +431,6 @@ func main() {
 	flags.StringVar(&mountCfg, "mounts", mountCfg, "mount config for container")
 	flags.BoolVar(&tty, "tty", tty, "stdio is tty")
 
-	containerdConfigPath := filepath.Join(defaults.DefaultConfigDir, "config.toml")
 	flags.StringVar(&containerdConfigPath, "containerd-config", containerdConfigPath, "path to containerd config")
 
 	if len(os.Args) < 2 {
@@ -446,18 +458,6 @@ func main() {
 	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(logrus.Fields{
 		"action": action,
 	}))
-
-	// read the containerd config so we can match log formats defined there.
-	var containerdConfig srvConfig
-	if f, err := toml.LoadFile(containerdConfigPath); err != nil {
-		logrus.WithError(err).Fatal("Failed to load containerd config")
-	} else {
-		if err := f.Unmarshal(&containerdConfig); err != nil {
-			logrus.WithError(err).Fatal("Failed to unmarshal conntainerd config")
-		}
-	}
-
-	setupLogFormat(ctx, containerdConfig)
 
 	errOut := func(err error) {
 		if err == nil {
