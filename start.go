@@ -127,9 +127,10 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
 		unit.NewUnitOption(svc, "Environment", "DAEMON_UNIT_NAME="+os.Getenv("UNIT_NAME")),
 		unit.NewUnitOption(svc, "Environment", "UNIT_NAME=%n"), // %n is replaced with the unit name by systemd
+		unit.NewUnitOption(svc, "Environment", "EXIT_STATE_PATH="+p.exitStatePath()),
 	}
 
-	prefix := []string{p.exe, "create"}
+	prefix := []string{p.exe, "--debug=" + strconv.FormatBool(p.runc.Debug), "--bundle=" + p.Bundle, "create"}
 	if len(p.Rootfs) > 0 {
 		if p.noNewNamespace {
 			opts = append(opts, unit.NewUnitOption(svc, "ExecStartPre", p.exe+" mount "+p.mountConfigPath()))
@@ -170,8 +171,8 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", p.unitType()),
-		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
-		unit.NewUnitOption(svc, "GuessMainPID", "no"),
+		// unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
+		unit.NewUnitOption(svc, "GuessMainPID", "yes"),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
 		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
 		unit.NewUnitOption(svc, "ExecStopPost", "-"+p.exe+" --debug="+strconv.FormatBool(p.runc.Debug)+" --id="+p.id+" --bundle="+p.parent.Bundle+" exit "+p.fallbackExitCodePath()),
@@ -185,9 +186,13 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
 		unit.NewUnitOption(svc, "Environment", "DAEMON_UNIT_NAME="+os.Getenv("UNIT_NAME")),
 		unit.NewUnitOption(svc, "Environment", "UNIT_NAME=%n"), // %n is replaced with the unit name by systemd
+		unit.NewUnitOption(svc, "Environment", "EXIT_STATE_PATH="+p.exitStatePath()),
+		unit.NewUnitOption(svc, "Environment", "PIDFILE="+p.pidFile()),
 	}
 
-	prefix := []string{p.exe, "create"}
+	prefix := []string{p.exe, "--debug=" + strconv.FormatBool(p.runc.Debug), "--bundle=" + p.parent.Bundle, "create"}
+
+	// TODO: Really need to use --detach here so we don't have a runc process hanging around...
 	cmd := []string{"exec", "--process=" + p.processFilePath(), "--pid-file=" + p.pidFile(), "--detach"}
 	if p.Terminal || p.opts.Terminal {
 		s, err := p.ttySockPath()
@@ -198,10 +203,6 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 		cmd = append(cmd, "-t")
 		cmd = append(cmd, "--console-socket="+s)
 		opts = append(opts, unit.NewUnitOption(svc, "ExecStopPost", "-"+sysctl+" stop "+p.ttyUnitName()))
-
-		// Used to get exit codes for processes that returned too quickly for systemd to attach
-		// This is needed for when using `--detach`, which is neccessary for tty's, currently
-		opts = append(opts, unit.NewUnitOption(svc, "StandardOutput", "file:"+p.fallbackExitCodePath()))
 		prefix = append(prefix, "--tty")
 	}
 
@@ -237,8 +238,9 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	}
 
 	if p.ProcessState().Exited() {
-		return 0, fmt.Errorf("process has already exited")
+		return 0, fmt.Errorf("process has already exited: %s: %w", p.ProcessState(), errdefs.ErrFailedPrecondition)
 	}
+
 	if err := p.runc.Start(ctx, p.id); err != nil {
 		log.G(ctx).WithError(err).Error("Error calling runc start")
 		ret := fmt.Errorf("failed runc start: %w", err)
@@ -352,10 +354,6 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 	}
 
 	p.LoadState(ctx)
-
-	if p.ProcessState().ExitCode > 0 {
-		return 0, fmt.Errorf("error starting container")
-	}
 
 	pid, err := p.getPid(ctx)
 	if err != nil {

@@ -250,6 +250,9 @@ func (p *initProcess) LoadState(ctx context.Context) error {
 	if err := p.readExitState(&st); err == nil {
 		p.SetState(ctx, st)
 		return nil
+	} else if p.Pid() == 0 {
+		// Nothing to load
+		return nil
 	}
 
 	st.Reset()
@@ -271,22 +274,6 @@ func (p *execProcess) LoadState(ctx context.Context) error {
 	if !os.IsNotExist(err) {
 		log.G(ctx).WithField("unit", p.Name()).WithError(err).Debug("Error reading exit state file")
 	}
-
-	st.Reset()
-	if err := getUnitState(ctx, p.systemd, p.Name(), &st); err != nil {
-		return err
-	}
-
-	if st.Exited() {
-		// ok try reading the exit state file again...
-		var st2 pState
-		if err := p.readExitState(&st2); err == nil {
-			st = st2
-		}
-	}
-
-	log.G(ctx).WithField("unit", p.Name()).Debugf("Setting unit state from systemd: %s", st)
-	p.SetState(ctx, st)
 	return nil
 }
 

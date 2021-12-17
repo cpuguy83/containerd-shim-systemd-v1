@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path"
 	"path/filepath"
@@ -268,6 +267,7 @@ func main() {
 			return mount.UnmountAll(flags.Arg(0), 0)
 		},
 		"create": func(ctx context.Context) error {
+			ctx = log.WithLogger(ctx, log.G(ctx).WithField("unit", os.Getenv("UNIT_NAME")))
 			ctx = WithShimLog(ctx, OpenShimLog(ctx, bundle))
 
 			if mountCfg != "" {
@@ -275,168 +275,90 @@ func main() {
 					return err
 				}
 			}
-
-			cmd := exec.Command(flags.Arg(0), flags.Args()[1:]...)
-
-			// Open all fifos with O_RDWR first so that we don't block trying to open
-			// Then open with the correct permissions which get passed to runc.
-			// Very important to use the correct open perms so that when one side of the fifo closes the process gets the close notification.
-			//
-			// TODO: Do we need to use O_RDWR? I recall there was some issues early on that we were having so I'm leaving it in for now.
-			if p := os.Getenv("STDIN_FIFO"); p != "" {
-				f, err := os.OpenFile(p, os.O_RDWR, 0)
-				if err != nil {
-					return err
-				}
-				defer f.Close()
-
-				f2, err := os.OpenFile(p, os.O_RDONLY, 0)
-				if err != nil {
-					return err
-				}
-				defer f2.Close()
-				cmd.Stdin = f2
-			} else {
-				log.G(ctx).Debug("No stdin pipe")
-			}
-
-			if p := os.Getenv("STDOUT_FIFO"); p != "" {
-				f, err := os.OpenFile(p, os.O_RDWR, 0)
-				if err != nil {
-					return err
-				}
-				defer f.Close()
-
-				f2, err := os.OpenFile(p, os.O_WRONLY, 0)
-				if err != nil {
-					return err
-				}
-				defer f2.Close()
-
-				cmd.Stdout = f2
-			} else {
-				log.G(ctx).Debug("No stdout pipe")
-			}
-
-			if p := os.Getenv("STDERR_FIFO"); p != "" {
-				f, err := os.OpenFile(p, os.O_RDWR, 0)
-				if err != nil {
-					// Ignore errors on this if we have a TTY
-					// Often we'll get a file path here but no actual fifo is created with TTY's.
-					// Reason being that there is no stderr for TTY.
-					if !tty {
-						return err
-					}
-				} else {
-					defer f.Close()
-
-					f2, err := os.OpenFile(p, os.O_WRONLY, 0)
-					if err != nil {
-						return err
-					}
-					defer f2.Close()
-					cmd.Stderr = f2
-				}
-			} else {
-				log.G(ctx).Debug("No stderr pipe")
-			}
-
-			fmt.Fprintln(os.Stderr, flags.Arg(0), flags.Args())
-
-			if err := cmd.Start(); err != nil {
-				return err
-			}
-
-			wait := make(chan int)
-			go func() {
-				cmd.Wait()
-				wait <- cmd.ProcessState.ExitCode()
-			}()
-
-			select {
-			case <-time.After(time.Second):
-			case code := <-wait:
-				os.Stdout.Write([]byte(strconv.Itoa(code)))
-			}
-			return nil
+			return createCmd(ctx, bundle, flags.Args(), tty, mountCfg != "")
 		},
 		"exit": func(ctx context.Context) error {
+			ctx = log.WithLogger(ctx, log.G(ctx).WithField("unit", os.Getenv("UNIT_NAME")))
+			ctx = WithShimLog(ctx, OpenShimLog(ctx, bundle))
+
 			conn, err := systemd.NewSystemdConnectionContext(ctx)
 			if err != nil {
 				return err
 			}
 
+			var st pState
+			statusData, err := os.ReadFile(os.Getenv("EXIT_STATE_PATH"))
+			if err != nil {
+				if !os.IsNotExist(err) {
+					log.G(ctx).WithError(err).Error("Error reading status")
+				}
+			} else {
+				if err := json.Unmarshal(statusData, &st); err != nil {
+					return fmt.Errorf("error unmarshaling status: %v", err)
+				}
+
+				if st.Exited() {
+					return nil
+				}
+			}
+
 			code, err := strconv.Atoi(os.Getenv("EXIT_STATUS"))
 			if err != nil {
 				code = 255
-				log.G(ctx).WithError(err).Error("Error reading exit status")
+				if os.Getenv("EXIT_STATUS") == "" {
+					log.G(ctx).WithError(err).Errorf("Error reading exit status, falling back to file: %s", flags.Arg(0))
 
-				// Fallback to exit status written by our `create` subcommand
-				// This is currently needed for type=forking where the exec'd process exits quickly.
-				exitData, err := os.ReadFile(flags.Arg(0))
-				if err == nil {
-					c, err := strconv.Atoi(string(exitData))
-					if err != nil {
-						log.G(ctx).WithError(err).Warn("Error parsing exit code from file")
-						code = 255
+					// Fallback to exit status written by our `create` subcommand
+					// This is currently needed for type=forking where the exec'd process exits quickly.
+					exitData, err := os.ReadFile(flags.Arg(0))
+					if err == nil {
+						c, err := strconv.Atoi(string(exitData))
+						if err != nil {
+							log.G(ctx).WithError(err).Warn("Error parsing exit code from file")
+							code = 255
+						} else {
+							code = c
+						}
 					} else {
-						code = c
+						log.G(ctx).WithError(err).Warn("Error reading exit code from file")
 					}
-				} else {
-					log.G(ctx).WithError(err).Warn("Error reading exit code from file")
-					code = 255
 				}
 			}
 
-			if code == 255 {
-				log.G(ctx).Debug("Falling back to reading exit status from systemd api")
-				var st pState
-				getUnitState(ctx, conn, os.Getenv("UNIT_NAME"), &st)
-				if st.ExitCode > 0 {
-					code = int(st.ExitCode)
-				}
-			}
-
-			pidData, err := ioutil.ReadFile(os.Getenv("PIDFILE"))
-			var pid uint32
-			if err == nil {
-				p, err := strconv.Atoi(string(pidData))
+			if st.Pid == 0 {
+				pidData, err := os.ReadFile(os.Getenv("PIDFILE"))
 				if err != nil {
-					log.G(ctx).WithError(err).Error("Error reading pid data")
-				} else {
-					pid = uint32(p)
+					return fmt.Errorf("error reading pidfile: %v", err)
 				}
-			} else {
-				log.G(ctx).WithError(err).Error("Error reading pid file")
+				pid, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+				if err != nil {
+					return fmt.Errorf("error parsing pid: %v", err)
+				}
+				st.Pid = uint32(pid)
 			}
 
-			// "code" in systemd parlance is really a status string referring to the unit state
-			// "status" in systemd parlance is the exit status of the process
-			// This is super confusing but we turn that into a "Status" string here and an exit code.
-			s := pState{
-				Pid:      pid,
-				Status:   os.Getenv("EXIT_CODE"),
-				ExitCode: uint32(code),
-				ExitedAt: time.Now(),
+			st.Status = os.Getenv("EXIT_CODE")
+			st.ExitedAt = time.Now()
+			st.ExitCode = uint32(code)
+
+			if st.ExitCode == 255 {
+				log.G(ctx).Debug("Falling back to reading exit status from systemd api")
+				var st2 pState
+				if err := getUnitState(ctx, conn, os.Getenv("UNIT_NAME"), &st); err != nil {
+					log.G(ctx).WithError(err).Error("Error reading unit state")
+				}
+				if st2.ExitCode > 0 {
+					st.ExitCode = st2.ExitCode
+				}
 			}
 
-			data, err := json.Marshal(s)
+			data, err := json.Marshal(st)
 			if err != nil {
 				return err
 			}
 
-			var p string
-			// TODO: this whole bit is kind of messy.
-			// Everything from how we specify the id/bundle for this subcommand to how we get paths, etc.
-			if id == "" {
-				proc := &initProcess{Bundle: bundle}
-				p = proc.exitStatePath()
-			} else {
-				proc := &execProcess{execID: id, parent: &initProcess{Bundle: bundle}}
-				p = proc.exitStatePath()
-			}
-			if err := os.WriteFile(p, data, 0600); err != nil {
-				return err
+			if err := os.WriteFile(os.Getenv("EXIT_STATE_PATH"), data, 0600); err != nil {
+				return fmt.Errorf("error writing status: %v", err)
 			}
 
 			// Should this wait for the reload job to complete?

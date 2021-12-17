@@ -22,12 +22,12 @@ func setupLogFormat(ctx context.Context, config srvConfig) {
 		config.Debug.Format = log.TextFormat
 	}
 	if config.Debug.Format == log.TextFormat {
-		logrus.StandardLogger().SetFormatter(&logrus.TextFormatter{
+		logrus.SetFormatter(&logrus.TextFormatter{
 			TimestampFormat: log.RFC3339NanoFixed,
 			FullTimestamp:   true,
 		})
 	} else if config.Debug.Format == log.JSONFormat {
-		logrus.StandardLogger().SetFormatter(&logrus.JSONFormatter{
+		logrus.SetFormatter(&logrus.JSONFormatter{
 			TimestampFormat: log.RFC3339NanoFixed,
 		})
 	}

@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,6 +33,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sys/unix"
 )
 
 // Create a new container
@@ -315,6 +319,7 @@ func (p *execProcess) Create(ctx context.Context) error {
 	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil && !strings.Contains(err.Error(), "not loaded") {
 		log.G(ctx).WithError(err).Warn("Failed to reset systemd unit")
 	}
+
 	return nil
 }
 
@@ -575,4 +580,228 @@ func (p *initProcess) readPidFile() (uint32, error) {
 	}
 
 	return uint32(pid), nil
+}
+
+type waitStatus struct {
+	Status int
+	Err    error
+	Pid    uint32
+}
+
+func reap(ctx context.Context, chChld chan os.Signal, wait chan waitStatus, chProc <-chan *os.Process) {
+	signal.Notify(chChld, syscall.SIGCHLD)
+
+	// Wait for process start
+	var proc *os.Process
+	select {
+	case <-ctx.Done():
+	case proc = <-chProc:
+
+	}
+
+	for range chChld {
+		var ws unix.WaitStatus
+
+		pid, err := unix.Wait4(-1, &ws, unix.WNOHANG, nil)
+		log.G(ctx).WithError(err).Debugf("wait4: %d / %d", pid, ws.ExitStatus())
+		if err != nil {
+			if err != unix.EINTR {
+				wait <- waitStatus{Err: err}
+				return
+			}
+			continue
+		}
+
+		if pid == 0 {
+			// I don't think this should happen, but worth checking anyway.
+			continue
+		}
+
+		log.G(ctx).WithField("pid", pid).WithField("exitStatus", ws.ExitStatus()).Debug("wait4")
+
+		if ws.ExitStatus() != 0 {
+			wait <- waitStatus{Status: ws.ExitStatus(), Pid: uint32(pid)}
+			return
+		}
+
+		if proc.Pid == pid {
+			continue
+		}
+
+		wait <- waitStatus{Status: ws.ExitStatus(), Pid: uint32(pid)}
+		return
+	}
+}
+
+func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap bool) error {
+	log.G(ctx).Debugf("%s %s", cmdLine[0], cmdLine[1:])
+
+	cmd := exec.Command(cmdLine[0], cmdLine[1:]...)
+
+	// Open all fifos with O_RDWR first so that we don't block trying to open
+	// Then open with the correct permissions which get passed to runc.
+	// Very important to use the correct open perms so that when one side of the fifo closes the process gets the close notification.
+	//
+	// TODO: Do we need to use O_RDWR? I recall there was some issues early on that we were having so I'm leaving it in for now.
+	if p := os.Getenv("STDIN_FIFO"); p != "" {
+		f, err := os.OpenFile(p, os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		f2, err := os.OpenFile(p, os.O_RDONLY, 0)
+		if err != nil {
+			return err
+		}
+		defer f2.Close()
+		cmd.Stdin = f2
+	} else {
+		log.G(ctx).Debug("No stdin pipe")
+	}
+
+	if p := os.Getenv("STDOUT_FIFO"); p != "" {
+		f, err := os.OpenFile(p, os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		f2, err := os.OpenFile(p, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		defer f2.Close()
+
+		cmd.Stdout = f2
+	} else {
+		log.G(ctx).Debug("No stdout pipe")
+	}
+
+	if p := os.Getenv("STDERR_FIFO"); p != "" {
+		f, err := os.OpenFile(p, os.O_RDWR, 0)
+		if err != nil {
+			// Ignore errors on this if we have a TTY
+			// Often we'll get a file path here but no actual fifo is created with TTY's.
+			// Reason being that there is no stderr for TTY.
+			if !tty {
+				return err
+			}
+		} else {
+			defer f.Close()
+
+			f2, err := os.OpenFile(p, os.O_WRONLY, 0)
+			if err != nil {
+				return err
+			}
+			defer f2.Close()
+			cmd.Stderr = f2
+		}
+	} else {
+		log.G(ctx).Debug("No stderr pipe")
+	}
+
+	wait := make(chan waitStatus, 1)
+	chChld := make(chan os.Signal, 1)
+	chProc := make(chan *os.Process, 1)
+	defer signal.Stop(chChld)
+
+	var readPid uint32
+	if !noReap {
+		go reap(ctx, chChld, wait, chProc)
+
+		var i uintptr = 1
+		if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, uintptr(i), 0, 0, 0); err != nil {
+			log.G(ctx).WithError(err).Error("failed to set child subreaper")
+		}
+	}
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	chProc <- cmd.Process
+
+	defer cmd.Wait()
+
+	if noReap {
+		return nil
+	}
+
+	chPid := make(chan int)
+	go func() {
+		pidFile := os.Getenv("PIDFILE")
+		for {
+			done := func() bool {
+				_, err := os.Stat(pidFile)
+				if err != nil {
+					return false
+				}
+
+				f, err := os.Open(os.Getenv("PIDFILE"))
+				if err != nil {
+					log.G(ctx).WithError(err).Debug("Error opening pidfile")
+					return false
+				}
+				defer f.Close()
+
+				pidData, err := ioutil.ReadAll(f)
+				if err != nil {
+					log.G(ctx).WithError(err).Debug("Error reading pidfile")
+					return false
+				}
+
+				pid, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+				if err != nil {
+					log.G(ctx).WithError(err).Debug("Error parsing pidfile")
+					return false
+				}
+
+				atomic.StoreUint32(&readPid, uint32(pid))
+				chPid <- pid
+				return true
+			}()
+
+			if done {
+				return
+			}
+			<-time.After(100 * time.Millisecond)
+		}
+	}()
+
+	var st pState
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case status := <-wait:
+		st.ExitCode = uint32(status.Status)
+		st.ExitedAt = time.Now()
+		st.Pid = status.Pid
+	case <-time.After(time.Second):
+		log.G(ctx).Debug("Process is up")
+	case pid := <-chPid:
+		st.Pid = uint32(pid)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case status := <-wait:
+			st.ExitCode = uint32(status.Status)
+			st.ExitedAt = time.Now()
+		case <-time.After(time.Second):
+			log.G(ctx).Debug("Process is up")
+		}
+	}
+
+	data, err := json.Marshal(st)
+	if err != nil {
+		return fmt.Errorf("error marshalling state: %v", err)
+	}
+
+	if err := os.WriteFile(os.Getenv("EXIT_STATE_PATH"), data, 0600); err != nil {
+		return fmt.Errorf("error writing state: %v", err)
+	}
+
+	return nil
 }
