@@ -226,5 +226,9 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	}
 	p.systemd.ResetFailedUnitContext(ctx, p.Name())
 
+	if err := os.RemoveAll(p.stateDir()); err != nil && !os.IsNotExist(err) {
+		log.G(ctx).WithError(err).Debug("Failed to remove exec state dir")
+	}
+
 	return ps, nil
 }

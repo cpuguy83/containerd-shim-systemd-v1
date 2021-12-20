@@ -227,10 +227,6 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 	}
 
 	// TODO: In order to support shim restarts we need to persist this.
-	var logPath string
-	if s.debug {
-		logPath = filepath.Join(pInit.Bundle, r.ExecID+"-runc-debug.log")
-	}
 	ep := &execProcess{
 		Spec:   r.Spec,
 		parent: pInit,
@@ -252,9 +248,10 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 				SystemdCgroup: pInit.runc.SystemdCgroup,
 				PdeathSignal:  syscall.SIGKILL,
 				Root:          pInit.runc.Root,
-				Log:           logPath,
 			},
 		}}
+
+	ep.runc.Log = filepath.Join(ep.stateDir(), "runc-debug.log")
 	ep.process.cond = sync.NewCond(&ep.process.mu)
 	err = pInit.execs.Add(r.ExecID, ep)
 	if err != nil {
@@ -276,12 +273,11 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 }
 
 func (p *execProcess) pidFile() string {
-	return filepath.Join(p.root, p.id+".pid")
+	return filepath.Join(p.stateDir(), "pid")
 }
 
 func (p *execProcess) Create(ctx context.Context) error {
-	pJson := p.processFilePath()
-	if err := os.MkdirAll(filepath.Dir(pJson), 0700); err != nil {
+	if err := os.MkdirAll(p.stateDir(), 0700); err != nil {
 		return err
 	}
 
@@ -300,7 +296,7 @@ func (p *execProcess) Create(ctx context.Context) error {
 		}
 	}
 
-	if err := os.WriteFile(pJson, v, 0600); err != nil {
+	if err := os.WriteFile(p.processFilePath(), v, 0600); err != nil {
 		return err
 	}
 
@@ -323,8 +319,12 @@ func (p *execProcess) Create(ctx context.Context) error {
 	return nil
 }
 
+func (p *execProcess) stateDir() string {
+	return filepath.Join(p.parent.Bundle, "execs", p.execID)
+}
+
 func (p *execProcess) processFilePath() string {
-	return filepath.Join(filepath.Join(p.root, "execs", p.id+"-process.json"))
+	return filepath.Join(p.stateDir(), "process.json")
 }
 
 func (p *initProcess) mountConfigPath() string {

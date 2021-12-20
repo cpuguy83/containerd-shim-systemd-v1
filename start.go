@@ -157,10 +157,6 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 	return opts, nil
 }
 
-func (p *execProcess) fallbackExitCodePath() string {
-	return filepath.Join(p.root, p.execID+"-exit-code")
-}
-
 func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 	const svc = "Service"
 
@@ -175,7 +171,7 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "GuessMainPID", "yes"),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
 		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
-		unit.NewUnitOption(svc, "ExecStopPost", "-"+p.exe+" --debug="+strconv.FormatBool(p.runc.Debug)+" --id="+p.id+" --bundle="+p.parent.Bundle+" exit "+p.fallbackExitCodePath()),
+		unit.NewUnitOption(svc, "ExecStopPost", "-"+p.exe+" --debug="+strconv.FormatBool(p.runc.Debug)+" --id="+p.id+" --bundle="+p.parent.Bundle+" exit"),
 
 		// Set this as env vars here because we only want these fifos to be used for the container stdio, not the other commands we run.
 		// Otherwise we can run into interesting cases like the client has closeed the fifo and our Pre/Post commands hang
