@@ -771,26 +771,36 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 
 	var st pState
 
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case status := <-wait:
-		st.ExitCode = uint32(status.Status)
+	// If cmd.Wait fails, this means we had an error with runc.
+	// This could be anything an error on the system or it could be a user config error.
+	// Either way, we signal this error by using exit code 255.
+	// The shim server will find this and error the rpc ("create" for init processes, "start", for exec processes)
+	if err := cmd.Wait(); err != nil {
+		st.ExitCode = 255
 		st.ExitedAt = time.Now()
-		st.Pid = status.Pid
-	case <-time.After(time.Second):
-		log.G(ctx).Debug("Process is up")
-	case pid := <-chPid:
-		st.Pid = uint32(pid)
-
+		st.Pid = uint32(cmd.Process.Pid)
+	} else {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case status := <-wait:
 			st.ExitCode = uint32(status.Status)
 			st.ExitedAt = time.Now()
+			st.Pid = status.Pid
 		case <-time.After(time.Second):
 			log.G(ctx).Debug("Process is up")
+		case pid := <-chPid:
+			st.Pid = uint32(pid)
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case status := <-wait:
+				st.ExitCode = uint32(status.Status)
+				st.ExitedAt = time.Now()
+			case <-time.After(time.Second):
+				log.G(ctx).Debug("Process is up")
+			}
 		}
 	}
 

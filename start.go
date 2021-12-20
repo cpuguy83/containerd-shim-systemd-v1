@@ -351,6 +351,10 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 
 	p.LoadState(ctx)
 
+	if p.ProcessState().ExitCode == 255 {
+		return 0, fmt.Errorf("error starting exec process")
+	}
+
 	pid, err := p.getPid(ctx)
 	if err != nil {
 		return 0, err
