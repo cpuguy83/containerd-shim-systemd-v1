@@ -116,7 +116,7 @@ func ttyHandshake() (retErr error) {
 	return nil
 }
 
-func (p *process) ResizePTY(ctx context.Context, width, height int) error {
+func (p *process) ResizePTY(ctx context.Context, width, height int, sockPath string) error {
 	if !p.Terminal {
 		// This mimics what the runc shim does, and what the containerd integration tests expect
 		return nil
@@ -130,12 +130,8 @@ func (p *process) ResizePTY(ctx context.Context, width, height int) error {
 	var noRetry bool
 	if conn == nil {
 		noRetry = true
-
-		s, err := p.ttySockPath()
-		if err != nil {
-			return fmt.Errorf("error getting tty sock path: %w", err)
-		}
-		conn, err = net.Dial("unix", s)
+		var err error
+		conn, err = net.Dial("unix", sockPath)
 		if err != nil {
 			return fmt.Errorf("could not dial tty sock: %w", err)
 		}
@@ -147,7 +143,7 @@ func (p *process) ResizePTY(ctx context.Context, width, height int) error {
 		if !noRetry {
 			p.ttyConn.Close()
 			p.ttyConn = nil
-			return p.ResizePTY(ctx, width, height)
+			return p.ResizePTY(ctx, width, height, sockPath)
 		}
 		return fmt.Errorf("error writing winsize to the tty handler: %w", err)
 	}
@@ -209,6 +205,22 @@ func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_
 	return &ptypes.Empty{}, nil
 }
 
+func (p *execProcess) ResizePTY(ctx context.Context, w, h int) error {
+	ttyPath, err := p.ttySockPath()
+	if err != nil {
+		return err
+	}
+	return p.process.ResizePTY(ctx, w, h, ttyPath)
+}
+
+func (p *initProcess) ResizePTY(ctx context.Context, w, h int) error {
+	ttyPath, err := p.ttySockPath()
+	if err != nil {
+		return err
+	}
+	return p.process.ResizePTY(ctx, w, h, ttyPath)
+}
+
 // CloseIO of a process
 func (s *Service) CloseIO(ctx context.Context, r *taskapi.CloseIORequest) (_ *ptypes.Empty, retErr error) {
 	// TODO: I'm not sure what we should do here since we aren't really doing anything with container I/O
@@ -257,8 +269,32 @@ func recvFd(socket *net.UnixConn) (int, error) {
 	return fds[0], nil
 }
 
-func (p *process) ttySockPath() (string, error) {
-	sockInfoPath := filepath.Join(p.root, p.id+"-tty.sock")
+func (p *initProcess) ttySockPath() (string, error) {
+	sockInfoPath := filepath.Join(p.root, "tty.sock")
+	b, err := os.ReadFile(sockInfoPath)
+	if err == nil {
+		return string(b), nil
+	}
+
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	tmp, err := ioutil.TempDir(os.Getenv("XDG_RUNTIME_DIR"), "pty")
+	if err != nil {
+		return "", err
+	}
+	s := filepath.Join(tmp, "s")
+	if err := ioutil.WriteFile(sockInfoPath, []byte(s), 0600); err != nil {
+		os.RemoveAll(tmp)
+		return "", err
+	}
+
+	return s, nil
+}
+
+func (p *execProcess) ttySockPath() (string, error) {
+	sockInfoPath := filepath.Join(p.stateDir(), "tty.sock")
 	b, err := os.ReadFile(sockInfoPath)
 	if err == nil {
 		return string(b), nil
@@ -285,7 +321,7 @@ func (p *process) ttyUnitName() string {
 	return unitName(p.ns, p.id, "tty")
 }
 
-func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
+func (p *process) makePty(ctx context.Context, sockPath string) (_, _ string, retErr error) {
 	ctx, span := StartSpan(ctx, "process.StartTTY")
 	defer func() {
 		if retErr != nil {
@@ -293,11 +329,6 @@ func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
 		}
 		span.End()
 	}()
-
-	sockPath, err := p.ttySockPath()
-	if err != nil {
-		return "", "", fmt.Errorf("error getting tty sock path: %w", err)
-	}
 
 	logPath := filepath.Join(p.root, p.id+"-tty.log")
 	defer func() {
@@ -310,6 +341,28 @@ func (p *process) makePty(ctx context.Context) (_, _ string, retErr error) {
 			}
 		}
 	}()
+
+	if p.Stdin != "" {
+		f, _ := os.OpenFile(p.Stdin, os.O_RDWR, 0)
+		if f != nil {
+			defer f.Close()
+		}
+	}
+
+	if p.Stdout != "" {
+		f, _ := os.OpenFile(p.Stdout, os.O_RDWR, 0)
+		if f != nil {
+			defer f.Close()
+		}
+	}
+
+	if p.Stderr != "" {
+		f, _ := os.OpenFile(p.Stderr, os.O_RDWR, 0)
+		if f != nil {
+			defer f.Close()
+		}
+	}
+
 	properties := []systemd.Property{
 		systemd.PropType("notify"),
 		systemd.PropExecStart([]string{p.exe, "tty-handshake"}, false),

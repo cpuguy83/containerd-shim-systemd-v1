@@ -441,7 +441,11 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	}
 
 	if p.Terminal || p.opts.Terminal {
-		u, _, err := p.makePty(ctx)
+		sockPath, err := p.ttySockPath()
+		if err != nil {
+			return 0, err
+		}
+		u, _, err := p.makePty(ctx, sockPath)
 		if err != nil {
 			return 0, err
 		}

@@ -294,7 +294,11 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 
 func (p *initProcess) restore(ctx context.Context) (pid uint32, retErr error) {
 	if p.Terminal || p.opts.Terminal {
-		u, _, err := p.makePty(ctx)
+		sockPath, err := p.ttySockPath()
+		if err != nil {
+			return 0, err
+		}
+		u, _, err := p.makePty(ctx, sockPath)
 		if err != nil {
 			return 0, err
 		}
@@ -313,6 +317,23 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 		if !p.parent.ProcessState().Started() {
 			return 0, fmt.Errorf("%w: container is not started", errdefs.ErrFailedPrecondition)
 		}
+	}
+
+	if p.Terminal || p.opts.Terminal {
+		sockPath, err := p.ttySockPath()
+		if err != nil {
+			return 0, err
+		}
+		u, _, err := p.makePty(ctx, sockPath)
+		if err != nil {
+			return 0, err
+		}
+
+		defer func() {
+			if retErr != nil {
+				p.systemd.KillUnitContext(ctx, u, int32(syscall.SIGKILL))
+			}
+		}()
 	}
 
 	ch := make(chan string, 1)
