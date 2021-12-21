@@ -277,9 +277,18 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		}
 		return 0, ret
 	}
-	p.mu.Lock()
-	pid = p.state.Pid
-	p.mu.Unlock()
+
+	for p.Pid() == 0 && !p.ProcessState().Exited() {
+		select {
+		case <-ctx.Done():
+		default:
+		}
+
+		if err := p.LoadState(ctx); err != nil {
+			log.G(ctx).WithError(err).Warn("Error loading process state")
+		}
+	}
+
 	return pid, nil
 }
 
@@ -300,7 +309,10 @@ func (p *initProcess) restore(ctx context.Context) (pid uint32, retErr error) {
 
 func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 	if !p.parent.ProcessState().Started() {
-		return 0, fmt.Errorf("%w: container is not started", errdefs.ErrFailedPrecondition)
+		p.parent.LoadState(ctx)
+		if !p.parent.ProcessState().Started() {
+			return 0, fmt.Errorf("%w: container is not started", errdefs.ErrFailedPrecondition)
+		}
 	}
 
 	ch := make(chan string, 1)

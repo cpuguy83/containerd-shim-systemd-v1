@@ -501,15 +501,22 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 	}
 
 	handlePid := func() (uint32, error) {
-		p.LoadState(ctx)
-		pid := p.Pid()
-		if pid == 0 {
-			var err error
-			pid, err = p.readPidFile()
-			if err != nil {
-				return 0, fmt.Errorf("error reading pid file: %w", err)
+		if err := p.LoadState(ctx); err != nil {
+			log.G(ctx).WithError(err).Error("Error loading state")
+		}
+		for retries := 0; retries < 10 && p.Pid() == 0 && !p.ProcessState().Exited(); retries++ {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			default:
+			}
+
+			time.Sleep(10 * time.Millisecond)
+			if err := p.LoadState(ctx); err != nil {
+				log.G(ctx).WithError(err).Error("Error loading state")
 			}
 		}
+		pid := p.Pid()
 
 		p.mu.Lock()
 		if p.state.Pid == 0 {
@@ -724,10 +731,6 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 
 	defer cmd.Wait()
 
-	if noReap {
-		return nil
-	}
-
 	chPid := make(chan int)
 	go func() {
 		pidFile := os.Getenv("PIDFILE")
@@ -792,14 +795,16 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		case pid := <-chPid:
 			st.Pid = uint32(pid)
 
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case status := <-wait:
-				st.ExitCode = uint32(status.Status)
-				st.ExitedAt = time.Now()
-			case <-time.After(time.Second):
-				log.G(ctx).Debug("Process is up")
+			if !noReap {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case status := <-wait:
+					st.ExitCode = uint32(status.Status)
+					st.ExitedAt = time.Now()
+				case <-time.After(time.Second):
+					log.G(ctx).Debug("Process is up")
+				}
 			}
 		}
 	}
