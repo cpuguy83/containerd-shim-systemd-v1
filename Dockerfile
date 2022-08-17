@@ -36,7 +36,13 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/
 COPY --link --from=build /go/src/github.com/cpuguy83/containerd-shim-systemd-v1/bin/* /usr/local/bin/
 ENV PATH=/usr/local/bin:${PATH}
 COPY --link --from=docker /go/src/github.com/docker/docker/bundles/dynbinary-daemon/dockerd /usr/local/bin/
-RUN sed -i 's,/usr/bin/dockerd,/usr/local/bin/dockerd,g' /lib/systemd/system/docker.service
+RUN <<EOF
+set -e
+mkdir -p /etc/systemd/system/docker.service.d
+echo '[Service]' > /etc/systemd/system/docker.service.d/override.conf
+echo 'ExecStart=' >> /etc/systemd/system/docker.service.d/override.conf
+echo 'ExecStart=/usr/local/bin/dockerd -D -H unix:///var/run/docker.sock -H fd:// --default-runtime=io.containerd.systemd.v1' >> /etc/systemd/system/docker.service.d/override.conf
+EOF
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
