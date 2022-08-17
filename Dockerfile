@@ -30,7 +30,7 @@ RUN \
     GO111MODULE=off hack/make.sh dynbinary
 
 FROM debian:bullseye as test-img
-RUN apt-get update && apt-get install -y systemd curl
+RUN apt-get update && apt-get install -y systemd curl procps
 RUN curl -SLf https://get.docker.com | sh
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 COPY --link --from=build /go/src/github.com/cpuguy83/containerd-shim-systemd-v1/bin/* /usr/local/bin/
