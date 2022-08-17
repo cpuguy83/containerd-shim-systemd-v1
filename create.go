@@ -496,6 +496,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 			p.Kill(ctx, int(syscall.SIGKILL), true)
 			return ctx.Err()
 		case status := <-ch:
+			log.G(ctx).WithField("status", status).Info("Unit Status")
 			if status != "done" {
 				return fmt.Errorf("error starting systemd unit: %s", status)
 			}
@@ -600,43 +601,41 @@ type waitStatus struct {
 }
 
 func reap(ctx context.Context, chChld chan os.Signal, wait chan waitStatus, chProc <-chan *os.Process) {
-	signal.Notify(chChld, syscall.SIGCHLD)
-
-	// Wait for process start
+	// wait for process start
 	var proc *os.Process
 	select {
 	case <-ctx.Done():
 	case proc = <-chProc:
-
 	}
 
 	for range chChld {
-		var ws unix.WaitStatus
+		var (
+			ws  unix.WaitStatus
+			pid int
+			err error
+		)
 
-		pid, err := unix.Wait4(-1, &ws, unix.WNOHANG, nil)
-		log.G(ctx).WithError(err).Debugf("wait4: %d / %d", pid, ws.ExitStatus())
-		if err != nil {
-			if err != unix.EINTR {
-				wait <- waitStatus{Err: err}
-				return
+		for {
+			pid, err = unix.Wait4(-1, &ws, unix.WNOHANG, nil)
+			if err == unix.EINTR {
+				continue
 			}
-			continue
+			log.G(ctx).WithError(err).Debugf("wait4: %d / %d", pid, ws.ExitStatus())
+			if pid <= 0 {
+				time.Sleep(time.Millisecond)
+				continue
+			}
+			break
 		}
 
-		if pid == 0 {
-			// I don't think this should happen, but worth checking anyway.
-			continue
-		}
-
-		log.G(ctx).WithField("pid", pid).WithField("exitStatus", ws.ExitStatus()).Debug("wait4")
-
-		if ws.ExitStatus() != 0 {
-			wait <- waitStatus{Status: ws.ExitStatus(), Pid: uint32(pid)}
+		if pid == proc.Pid {
+			// This is the runc process
+			// If runc returns 0 we still need to give some time to see if the container process is stable.
+			// If non-zero then runc exited before bringing up the container.
+			if ws.ExitStatus() != 0 {
+				wait <- waitStatus{Status: ws.ExitStatus(), Pid: uint32(pid)}
+			}
 			return
-		}
-
-		if proc.Pid == pid {
-			continue
 		}
 
 		wait <- waitStatus{Status: ws.ExitStatus(), Pid: uint32(pid)}
@@ -717,6 +716,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 
 	var readPid uint32
 	if !noReap {
+		signal.Notify(chChld, syscall.SIGCHLD)
 		go reap(ctx, chChld, wait, chProc)
 
 		var i uintptr = 1
@@ -776,37 +776,27 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 
 	var st pState
 
-	// If cmd.Wait fails, this means we had an error with runc.
-	// This could be anything an error on the system or it could be a user config error.
-	// Either way, we signal this error by using exit code 255.
-	// The shim server will find this and error the rpc ("create" for init processes, "start", for exec processes)
-	if err := cmd.Wait(); err != nil {
-		st.ExitCode = 255
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case status := <-wait:
+		st.ExitCode = uint32(status.Status)
 		st.ExitedAt = time.Now()
-		st.Pid = uint32(cmd.Process.Pid)
-	} else {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case status := <-wait:
-			st.ExitCode = uint32(status.Status)
-			st.ExitedAt = time.Now()
-			st.Pid = status.Pid
-		case <-time.After(time.Second):
-			log.G(ctx).Debug("Process is up")
-		case pid := <-chPid:
-			st.Pid = uint32(pid)
+		st.Pid = status.Pid
+	case <-time.After(time.Second):
+		log.G(ctx).Debug("Process considered up after 1s")
+	case pid := <-chPid:
+		st.Pid = uint32(pid)
 
-			if !noReap {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case status := <-wait:
-					st.ExitCode = uint32(status.Status)
-					st.ExitedAt = time.Now()
-				case <-time.After(time.Second):
-					log.G(ctx).Debug("Process is up")
-				}
+		if !noReap {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case status := <-wait:
+				st.ExitCode = uint32(status.Status)
+				st.ExitedAt = time.Now()
+			case <-time.After(time.Second):
+				log.G(ctx).Debug("Process is up")
 			}
 		}
 	}
