@@ -1,5 +1,3 @@
-# syntax = docker/dockerfile:1.3-labs
-
 ARG GO_VERSION=1.17
 FROM golang:${GO_VERSION} AS go
 
@@ -7,7 +5,7 @@ FROM ubuntu:18.04 AS build
 RUN apt-get update && apt-get install -y gcc git make btrfs-tools
 WORKDIR /go/src/github.com/containerd/containerd
 ARG CONTAINERD_REPO=https://github.com/containerd/containerd.git
-ARG CONTAINERD_COMMIT=v1.6.0-beta.1
+ARG CONTAINERD_COMMIT=v1.6.8
 RUN <<EOF
 git init .
 git remote add origin $CONTAINERD_REPO

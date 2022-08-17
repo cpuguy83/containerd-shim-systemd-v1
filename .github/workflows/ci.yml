@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.17.3'
+          go-version: "1.17.3"
       - uses: actions/checkout@v2
         with:
           path: src/github.com/cpuguy83/containerd-shim-systemd/v1
@@ -24,25 +24,25 @@ jobs:
         with:
           path: src/github.com/containerd/containerd
           repository: containerd/containerd
-          ref: main
+          ref: v1.6.8
       - name: Install gotestsum
         run: go install gotest.tools/gotestsum@latest
       - name: Install required packages
         run: |
-            set -e -x
-            sudo add-apt-repository ppa:criu/ppa
-            sudo apt-get update
-            sudo apt-get install -y criu
+          set -e -x
+          sudo add-apt-repository ppa:criu/ppa
+          sudo apt-get update
+          sudo apt-get install -y criu
       - name: get containerd
         run: |
-            set -ex
-            curl -SLf https://github.com/containerd/containerd/releases/download/v${VERSION}/containerd-${VERSION}.linux-amd64.tar.gz | tar -xvz
-            sudo systemctl stop containerd
-            cd bin
-            for i in *; do sudo mv $i $(command -v $i); done
-            sudo systemctl start containerd
+          set -ex
+          curl -SLf https://github.com/containerd/containerd/releases/download/v${VERSION}/containerd-${VERSION}-linux-amd64.tar.gz | tar -xvz
+          sudo systemctl stop containerd
+          cd bin
+          for i in *; do sudo mv $i $(command -v $i); done
+          sudo systemctl start containerd
         env:
-          VERSION: 1.6.0-beta.2
+          VERSION: 1.6.8
       - name: install
         run: make test-daemon
       - name: test
