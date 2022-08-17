@@ -22,8 +22,8 @@ RUN \
 FROM base AS docker
 WORKDIR /go/src/github.com/docker/docker
 RUN apt-get update && apt-get install -y libbtrfs-dev libdevmapper-dev libltdl-dev
-ARG DOCKER_COMMIT=724feb898f4af3d7f156fb0064d59a7b68ea9be2
-RUN git init . && git remote add origin https://github.com/moby/moby.git && git pull origin ${DOCKER_COMMIT}
+ARG DOCKER_COMMIT=c213b8ec40208e804ef4adb170b89f364f6111d3
+RUN git init . && git remote add origin https://github.com/cpuguy83/docker.git && git pull origin ${DOCKER_COMMIT}
 RUN \
     --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
