@@ -213,9 +213,9 @@ func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState)
 	}
 	//}
 	// }
-	// if status := state["SubState"]; status != nil {
-	// 	st.Status = status.(string)
-	// }
+	if status := state["SubState"]; status != nil {
+		st.Status = status.(string)
+	}
 
 	return nil
 }
@@ -248,6 +248,9 @@ func (p *initProcess) State(ctx context.Context) (*State, error) {
 func (p *initProcess) LoadState(ctx context.Context) error {
 	var st pState
 	if err := p.readExitState(&st); err == nil {
+		if st.Pid > 0 && st.Status == "" {
+			st.Status = "running"
+		}
 		p.SetState(ctx, st)
 		return nil
 	} else if p.Pid() == 0 {
@@ -328,7 +331,7 @@ func toStatus(s string) task.Status {
 		return task.StatusPausing
 	case "paused":
 		return task.StatusPaused
-	case "stopped", "dead", "failed", "stop-post":
+	case "stopped", "dead", "failed", "stop-post", "exited":
 		return task.StatusStopped
 	default:
 		return task.StatusUnknown

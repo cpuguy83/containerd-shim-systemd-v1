@@ -783,6 +783,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		st.ExitCode = uint32(status.Status)
 		st.ExitedAt = time.Now()
 		st.Pid = status.Pid
+		st.Status = "exited"
 	case <-time.After(time.Second):
 		log.G(ctx).Debug("Process considered up after 1s")
 	case pid := <-chPid:
@@ -795,6 +796,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 			case status := <-wait:
 				st.ExitCode = uint32(status.Status)
 				st.ExitedAt = time.Now()
+				st.Status = "exited"
 			case <-time.After(time.Second):
 				log.G(ctx).Debug("Process is up")
 			}
