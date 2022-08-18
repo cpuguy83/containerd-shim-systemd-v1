@@ -788,18 +788,33 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		log.G(ctx).Debug("Process considered up after 1s")
 	case pid := <-chPid:
 		st.Pid = uint32(pid)
-
 		if !noReap {
+			// At this point we have the pid, so we can turn off the subreaper and call wait4 ourselves
+			// to make sure the process did not exit in the meantime.
+			var i uintptr = 0
+			if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, uintptr(i), 0, 0, 0); err != nil {
+				log.G(ctx).WithError(err).Error("failed to unset child subreaper")
+			}
+
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
 			case status := <-wait:
+				// Looks like we did reap the process, so use this status.
 				st.ExitCode = uint32(status.Status)
 				st.ExitedAt = time.Now()
 				st.Status = "exited"
-			case <-time.After(time.Second):
-				log.G(ctx).Debug("Process is up")
+			default:
+				var status unix.WaitStatus
+				// Double check if the process is still running.
+				p, _ := unix.Wait4(pid, &status, unix.WNOHANG, nil)
+				if p == pid {
+					st.ExitCode = uint32(status.ExitStatus())
+					st.ExitedAt = time.Now()
+					st.Status = "exited"
+				} else {
+					log.G(ctx).Debug("Process is up!")
+				}
 			}
+
 		}
 	}
 
