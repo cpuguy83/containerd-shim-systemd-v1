@@ -64,7 +64,7 @@ func newCtx() (context.Context, context.CancelFunc) {
 				case syscall.SIGUSR1:
 					buf := make([]byte, 16384)
 					n := runtime.Stack(buf, true)
-					f, err := ioutil.TempFile("", "systemd-shim")
+					f, err := ioutil.TempFile("", "containerd-shim-systemd-v1-goroutines")
 					if err != nil {
 						log.G(ctx).WithError(err).Error("failed to create stack dump file")
 					}

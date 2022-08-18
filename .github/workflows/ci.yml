@@ -65,9 +65,18 @@ jobs:
       - name: debug
         if: ${{ failure() }}
         run: |
+          sudo systemctl kill -s USR1 containerd-shim-systemd-v1
+          sleep 1
           sudo journalctl --system -u containerd-shim-systemd-v1 | tee ${GITHUB_WORKSPACE}/containerd-shim-systemd-v1.log
+          sudo chown $(id -u):$(id -g) /tmp/*containerd-shim-systemd-v1-goroutines*
       - uses: actions/upload-artifact@v2
         if: ${{ failure() }}
         with:
           name: daemon-log
           path: ${{github.workspace}}/containerd-shim-systemd-v1.log
+      - uses: actions/upload-artifact@v2
+        if: ${{ failure() }}
+        with:
+          name: goroutines
+          path: /tmp/*containerd-shim-systemd-v1-goroutines*
+
