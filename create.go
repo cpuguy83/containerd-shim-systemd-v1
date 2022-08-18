@@ -743,7 +743,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 					return false
 				}
 
-				f, err := os.Open(os.Getenv("PIDFILE"))
+				f, err := os.Open(pidFile)
 				if err != nil {
 					log.G(ctx).WithError(err).Debug("Error opening pidfile")
 					return false
