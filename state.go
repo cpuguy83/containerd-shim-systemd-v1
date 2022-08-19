@@ -360,6 +360,9 @@ func (s pState) Exited() bool {
 	if s.ExitCode > 0 {
 		return true
 	}
+	if toStatus(s.Status) == task.StatusStopped {
+		return true
+	}
 	return s.ExitedAt.After(timeZero)
 }
 
