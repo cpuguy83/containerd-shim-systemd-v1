@@ -116,5 +116,15 @@ func (p *process) waitForExit(ctx context.Context) (pState, error) {
 }
 
 func (p *process) Wait(ctx context.Context) (pState, error) {
+	ctx2, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() {
+		<-ctx2.Done()
+		// wake up the wait loop so it can exit
+		// This will wake up every wait, but... there generally shouldn't be a lot of them.
+		// It's more impportant to unblock API calls that are cancelled.
+		p.cond.Broadcast()
+	}()
 	return p.waitForExit(ctx)
 }
