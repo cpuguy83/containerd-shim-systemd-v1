@@ -188,7 +188,13 @@ func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (_ *ptypes.E
 		return nil, errdefs.ToGRPC(err)
 	}
 
-	ctx, span := StartSpan(ctx, "service.Kill", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
+	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(logrus.Fields{
+		"namespace":    ns,
+		"container_id": r.ID,
+		"exec_id":      r.ExecID,
+	}))
+
+	ctx, span := StartSpan(ctx, "service.Kill")
 	defer func() {
 		if retErr != nil {
 			retErr = errdefs.ToGRPCf(retErr, "kill")

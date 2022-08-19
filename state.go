@@ -321,6 +321,10 @@ func (p *execProcess) State(ctx context.Context) (*State, error) {
 	return st, nil
 }
 
+const (
+	exitedInit = "exited-init"
+)
+
 func toStatus(s string) task.Status {
 	switch s {
 	case "created", "start-pre":
@@ -331,7 +335,7 @@ func toStatus(s string) task.Status {
 		return task.StatusPausing
 	case "paused":
 		return task.StatusPaused
-	case "stopped", "dead", "failed", "stop-post", "exited":
+	case "stopped", "dead", "failed", "stop-post", "exited", exitedInit, "exit-code":
 		return task.StatusStopped
 	default:
 		return task.StatusUnknown

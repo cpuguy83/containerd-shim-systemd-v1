@@ -600,6 +600,15 @@ type waitStatus struct {
 	Pid    uint32
 }
 
+func waitAny(ws *unix.WaitStatus) (int, error) {
+	for {
+		pid, err := unix.Wait4(-1, ws, unix.WNOHANG, nil)
+		if err != unix.EINTR {
+			return pid, err
+		}
+	}
+}
+
 func reap(ctx context.Context, chChld chan os.Signal, wait chan waitStatus, chProc <-chan *os.Process) {
 	// wait for process start
 	var proc *os.Process
@@ -609,29 +618,19 @@ func reap(ctx context.Context, chChld chan os.Signal, wait chan waitStatus, chPr
 	}
 
 	for range chChld {
-		var (
-			ws  unix.WaitStatus
-			pid int
-			err error
-		)
+		var ws unix.WaitStatus
 
-		for {
-			pid, err = unix.Wait4(-1, &ws, unix.WNOHANG, nil)
-			if err == unix.EINTR {
-				continue
-			}
-			log.G(ctx).WithError(err).Debugf("wait4: %d / %d", pid, ws.ExitStatus())
-			if pid <= 0 {
-				time.Sleep(time.Millisecond)
-				continue
-			}
-			break
+		pid, err := waitAny(&ws)
+		if pid <= 0 {
+			log.G(ctx).WithError(err).WithField("pid", pid).Warn("Error waiting for child")
+			continue
 		}
 
 		if pid == proc.Pid {
 			// This is the runc process
 			// If runc returns 0 we still need to give some time to see if the container process is stable.
 			// If non-zero then runc exited before bringing up the container.
+			log.G(ctx).WithField("pid", pid).WithField("code", ws.ExitStatus()).Debug("runc exited")
 			if ws.ExitStatus() != 0 {
 				wait <- waitStatus{Status: ws.ExitStatus(), Pid: uint32(pid)}
 			}
@@ -643,7 +642,7 @@ func reap(ctx context.Context, chChld chan os.Signal, wait chan waitStatus, chPr
 	}
 }
 
-func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap bool) error {
+func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap bool) (retErr error) {
 	log.G(ctx).Debugf("%s %s", cmdLine[0], cmdLine[1:])
 
 	cmd := exec.Command(cmdLine[0], cmdLine[1:]...)
@@ -776,6 +775,41 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 
 	var st pState
 
+	defer func() {
+		if retErr != nil {
+			return
+		}
+		var t time.Time
+		if st.ExitCode == 0 {
+			return
+		}
+		if st.ExitedAt.Equal(t) {
+			return
+		}
+		retErr = fmt.Errorf("process exited with code %d", st.ExitCode)
+	}()
+
+	writeFile := func() error {
+		data, err := json.Marshal(st)
+		if err != nil {
+			return fmt.Errorf("error marshalling state: %v", err)
+		}
+
+		if err := os.WriteFile(os.Getenv("EXIT_STATE_PATH"), data, 0600); err != nil {
+			return fmt.Errorf("error writing state: %v", err)
+		}
+		return nil
+	}
+
+	if err := cmd.Wait(); err != nil {
+		// runc exited non-zero
+		st.ExitCode = uint32(cmd.ProcessState.ExitCode())
+		st.ExitedAt = time.Now()
+		st.Status = exitedInit
+		st.Pid = uint32(cmd.Process.Pid)
+		return writeFile()
+	}
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -801,7 +835,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 				// Looks like we did reap the process, so use this status.
 				st.ExitCode = uint32(status.Status)
 				st.ExitedAt = time.Now()
-				st.Status = "exited"
+				st.Status = exitedInit
 			default:
 				var status unix.WaitStatus
 				// Double check if the process is still running.
@@ -809,7 +843,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 				if p == pid {
 					st.ExitCode = uint32(status.ExitStatus())
 					st.ExitedAt = time.Now()
-					st.Status = "exited"
+					st.Status = exitedInit
 				} else {
 					log.G(ctx).Debug("Process is up!")
 				}

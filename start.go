@@ -346,17 +346,18 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 		p.systemd.KillUnitContext(ctx, p.Name(), int32(syscall.SIGKILL))
 	case status := <-ch:
 		if status != "done" {
-			st, err := p.Wait(ctx)
-			if err == nil {
-				return st.Pid, nil
-			}
-
 			pid, err := p.getPid(ctx)
 			if err == nil {
 				return pid, nil
 			}
 
-			getUnitState(ctx, p.systemd, p.Name(), &st)
+			if err := p.LoadState(ctx); err != nil {
+				log.G(ctx).WithError(err).Warn("Error loading process state")
+			}
+
+			if !p.ProcessState().Exited() {
+				log.G(ctx).Error("Start failed but process is not in exited state")
+			}
 
 			ret := fmt.Errorf("error starting exec process")
 			if p.runc.Debug {
@@ -384,7 +385,7 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 
 	p.LoadState(ctx)
 
-	if p.ProcessState().ExitCode == 255 {
+	if p.ProcessState().Status == exitedInit || p.ProcessState().Status == "exit-code" {
 		ret := fmt.Errorf("error starting exec process")
 		if p.runc.Debug {
 			debug, err := os.ReadFile(p.runc.Log)
