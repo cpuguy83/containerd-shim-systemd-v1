@@ -8,8 +8,13 @@ prog = containerd-shim-systemd-v1
 NO_NEW_NAMESPACE ?= false
 
 TEST_IMG ?= containerd-shim-systemd-v1:local
+RUN_IMG ?= $(TEST_IMG)
 
 DOCKER_BUILD ?= docker buildx build
+ifeq ($(V), 1)
+	DOCKER_BUILD += --progress=plain
+endif
+export V
 
 build:
 	$(GO) build -o bin/ .
@@ -34,11 +39,22 @@ test-daemon: build
 	sudo $(prog) --address=$(TEST_ADDR) --ttrpc-address=$(TEST_ADDR).ttrpc install --debug $(TRACEFLAGS) $(LOGMODE) --no-new-namespace=$(NO_NEW_NAMESPACE)
 	if [ "$(LOGS)" = "1" ]; then sudo journalctl -u $(prog) -f --lines=0; fi
 
+.PHONY: build-test-image
+.INTERMEDIATE: bin/.test-image-iid
 build-test-image:
-	$(DOCKER_BUILD) -t $(TEST_IMG) --target=test-img --load .
+	$(DOCKER_BUILD) -t $(TEST_IMG) $(EXTRA_BUILD_FLAGS) --target=test-img .
 
+_build-test-image:
+	$(DOCKER_BUILD) -t $(TEST_IMG) $(EXTRA_BUILD_FLAGS) --target=test-img .
+
+.PHONY: test-image
 test-image: build-test-image
+	set -ex; \
 	if [ -t ]; then tty_flags="-t"; fi; \
+	image="$(TEST_IMAGE)"; \
+	if [ -n "$${TEST_IMG_IIDFILE}" ]; then \
+		image="$$(cat $${TEST_IMG_IIDFILE})"; \
+	fi; \
 	docker run \
 		--rm \
 		$${tty_flags} \
@@ -55,13 +71,20 @@ test-image: build-test-image
 		--tmpfs /run/lock \
 		-v /var/lib/docker \
 		-v /var/lib/containerd \
-		--cgroupns private \
-		$(TEST_IMG)
+		-v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+		-v /sys/fs/cgroup/systemd:/sys/fs/cgroup/systemd:ro \
+		-v /var/log/journald \
+		$${image}
+
+
+_TEST_IMG_IIDFILE = bin/.test-image-iid
 
 .PHONY: bin/.test-image-cid
 bin/.test-image-cid:
 	if [ -f "$@" ]; then docker rm -f $$(cat $@) &> /dev/null; rm -f $(@); fi; \
-	$(MAKE) -s test-image EXTRA_TEST_IMAGE_FLAGS="$(EXTRA_TEST_IMAGE_FLAGS) -d --cidfile=$(@)"
+	rm -f $$(_TEST_IMG_IIDFILE) 2> /dev/null; \
+	mkdir -p bin; \
+	$(MAKE) test-image EXTRA_TEST_IMAGE_FLAGS="$(EXTRA_TEST_IMAGE_FLAGS) -d --cidfile=$(@)" EXTRA_BUILD_FLAGS="--builder=default $(EXTRA_BUILD_FLAGS) --iidfile=$(_TEST_IMG_IIDFILE)" TEST_IMG_IIDFILE=$(_TEST_IMG_IIDFILE);
 
 TEST_SHELL_CMD ?= bash
 test-shell: bin/.test-image-cid
