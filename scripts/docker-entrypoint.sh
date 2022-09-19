@@ -33,9 +33,4 @@ EOF
 
 systemctl enable containerd-shim-systemd-v1-install.service
 
-mount -t tmpfs -o uid=0,gid=0,mode=0755 cgroup /sys/fs/cgroup
-if [ -e /sys/fs/cgroup/memory/memory.use_hierarchy ]; then
-    echo 1 >/sys/fs/cgroup/memory/memory.use_hierarchy
-fi
-
 exec /lib/systemd/systemd

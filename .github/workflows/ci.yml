@@ -1,5 +1,6 @@
 name: CI
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -79,4 +80,3 @@ jobs:
         with:
           name: goroutines
           path: /tmp/*containerd-shim-systemd-v1-goroutines*
-
