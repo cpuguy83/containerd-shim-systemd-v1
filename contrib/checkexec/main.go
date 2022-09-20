@@ -82,9 +82,11 @@ func do() error {
 		if err != nil {
 			log.Println("task wait", err.Error())
 		}
-		es := <-ch
-		ec, et, err := es.Result()
-		log.Println("task wait:", err, ec, et)
+		if ch != nil {
+			es := <-ch
+			ec, et, err := es.Result()
+			log.Println("task wait:", err, ec, et)
+		}
 		if _, err := t.Delete(baseCtx); err != nil {
 			log.Println("task delete", err.Error())
 		}

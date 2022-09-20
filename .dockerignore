@@ -2,3 +2,4 @@ Dockerfile
 .dockerignore
 .git
 Makefile
+scripts/test-shell.sh
