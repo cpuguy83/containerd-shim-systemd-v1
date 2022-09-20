@@ -353,6 +353,11 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 
 			if !p.ProcessState().Exited() {
 				log.G(ctx).Error("Start failed but process is not in exited state")
+				break
+			}
+
+			if p.ProcessState().ExitCode != 255 {
+				break
 			}
 
 			ret := fmt.Errorf("error starting exec process")
