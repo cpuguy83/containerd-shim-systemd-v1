@@ -500,6 +500,14 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 			if status != "done" {
 				return fmt.Errorf("error starting systemd unit: %s", status)
 			}
+
+			if err := p.LoadState(ctx); err != nil {
+				return err
+			}
+
+			if p.ProcessState().Exited() {
+				return fmt.Errorf("container exited immediately, code: %d", p.ProcessState().ExitCode)
+			}
 		}
 
 		return nil
@@ -528,12 +536,12 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 			p.state.Pid = uint32(pid)
 		}
 		p.mu.Unlock()
-		if pid > 0 {
-			if p.ProcessState().Exited() {
-				p.cond.Broadcast()
-			}
+		var err error
+		if p.ProcessState().Exited() {
+			p.cond.Broadcast()
+			err = fmt.Errorf("container exited immediately, code: %d", p.ProcessState().ExitCode)
 		}
-		return uint32(pid), nil
+		return uint32(pid), err
 	}
 
 	if err := do(); err != nil {
