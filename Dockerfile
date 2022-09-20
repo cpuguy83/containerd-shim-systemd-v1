@@ -64,7 +64,7 @@ RUN <<EOF
     if [ -z "${TEST_SHIM_CGROUP}}" ]; then exit 0; fi
     set -e
     mkdir -p /etc/systemd/system/containerd-shim-systemd-v1-install.service.d
-    echo "Environment=TEST_SHIM_CGROUP=${TEST_SHIM_CGROUP}" >> /etc/systemd/system/containerd-shim-systemd-v1-install.service.d/override.conf
+    echo "[Service]\nEnvironment=TEST_SHIM_CGROUP=${TEST_SHIM_CGROUP}" >> /etc/systemd/system/containerd-shim-systemd-v1-install.service.d/override.conf
 EOF
 RUN systemctl enable containerd-shim-systemd-v1-install.service
 STOPSIGNAL SIGRTMIN+3
