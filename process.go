@@ -304,13 +304,16 @@ func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 			}
 		})
 		p.cond.Broadcast()
-		p.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
-			ContainerID: p.id,
-			ID:          p.id,
-			ExitStatus:  st.ExitCode,
-			ExitedAt:    st.ExitedAt,
-			Pid:         st.Pid,
-		})
+		// If the init helper process exited, this should not yield a task exit event as the task never actually started.
+		if st.Status != exitedInit {
+			p.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
+				ContainerID: p.id,
+				ID:          p.id,
+				ExitStatus:  st.ExitCode,
+				ExitedAt:    st.ExitedAt,
+				Pid:         st.Pid,
+			})
+		}
 	}
 	return st
 }
