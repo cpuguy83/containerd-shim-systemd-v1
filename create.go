@@ -833,6 +833,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 			select {
 			case status := <-wait:
 				// Looks like we did reap the process, so use this status.
+				st.Pid = status.Pid
 				st.ExitCode = uint32(status.Status)
 				st.ExitedAt = time.Now()
 				st.Status = exitedInit

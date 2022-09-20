@@ -343,14 +343,10 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 
 	select {
 	case <-ctx.Done():
-		p.systemd.KillUnitContext(ctx, p.Name(), int32(syscall.SIGKILL))
+		log.G(ctx).WithError(ctx.Err()).Warn("start: context cancelled, killing exec unit")
+		p.systemd.KillUnitContext(context.TODO(), p.Name(), int32(syscall.SIGKILL))
 	case status := <-ch:
 		if status != "done" {
-			pid, err := p.getPid(ctx)
-			if err == nil {
-				return pid, nil
-			}
-
 			if err := p.LoadState(ctx); err != nil {
 				log.G(ctx).WithError(err).Warn("Error loading process state")
 			}
