@@ -1,0 +1,13 @@
+[Unit]
+Description=Install systemd shim
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/local/bin/containerd-shim-systemd-v1 install --debug --log-mode=journald
+ExecStartPost=/bin/touch /tmp/init
+RemainAfterExit=true
+Type=oneshot
+${extra_env}
+
+[Install]
+WantedBy=multi-user.target

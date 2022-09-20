@@ -12,9 +12,13 @@ RUN_IMG ?= $(TEST_IMG)
 
 DOCKER_BUILD ?= docker buildx build
 ifeq ($(V), 1)
-	DOCKER_BUILD += --progress=plain
+DOCKER_BUILD += --progress=plain
 endif
 export V
+
+ifdef TEST_SHIM_CGROUP
+export TEST_SHIM_CGROUP
+endif
 
 OUTPUT ?= bin
 
@@ -48,15 +52,23 @@ _TEST_IMG_IIDFILE = $(OUTPUT)/.test-image-iid
 .PHONY: build-test-image
 build-test-image:
 	rm -f $(_TEST_IMG_IIDFILE)
-	$(DOCKER_BUILD) -t $(TEST_IMG) $(EXTRA_BUILD_FLAGS) --target=test-img .
+	$(DOCKER_BUILD) -t $(TEST_IMG) --build-arg TEST_SHIM_CGROUP $(EXTRA_BUILD_FLAGS) --target=test-img .
+
+ifneq ($(TEST_SHIM_CGROUP),)
+EXTRA_TEST_IMAGE_FLAGS ?=
+EXTRA_TEST_IMAGE_FLAGS += -e TEST_SHIM_CGROUP=$(TEST_SHIM_CGROUP)
+endif
+
+# volume name or host path for storing the bash history file for re-use.
+SHELL_BASH_DIR_VOLUME ?= containerd-shim-systemd-v1-test-shell-bash-dir
 
 .PHONY: test-image
 test-image: build-test-image
 	set -ex; \
 	if [ -t ]; then tty_flags="-t"; fi; \
 	image="$(TEST_IMAGE)"; \
-	if [ -n "$${TEST_IMG_IIDFILE}" ]; then \
-		image="$$(cat $${TEST_IMG_IIDFILE})"; \
+	if [ -n "$(TEST_IMG_IIDFILE)" ]; then \
+		image="$$(cat $(TEST_IMG_IIDFILE))"; \
 	fi; \
 	docker run \
 		--rm \
@@ -72,11 +84,12 @@ test-image: build-test-image
 		--tmpfs /tmp \
 		--tmpfs /run \
 		--tmpfs /run/lock \
+		--init=false \
 		-v /var/lib/docker \
 		-v /var/lib/containerd \
-		-v /sys/fs/cgroup:/sys/fs/cgroup:ro \
-		-v /sys/fs/cgroup/systemd:/sys/fs/cgroup/systemd:ro \
 		-v /var/log/journald \
+		-v $(SHELL_BASH_DIR_VOLUME):/root/.bash \
+		--cgroupns=private \
 		$${image}
 
 
@@ -85,12 +98,11 @@ test-image: build-test-image
 .INTERMEDIATE: $(OUTPUT)/.test-image-cid
 $(OUTPUT)/.test-image-cid:
 	if [ -f "$@" ]; then docker rm -f $$(cat $@) &> /dev/null; rm -f $(@); fi; \
-	rm -f $$(_TEST_IMG_IIDFILE) 2> /dev/null; \
+	rm -f $(_TEST_IMG_IIDFILE) 2> /dev/null; \
 	mkdir -p $(OUTPUT); \
-	$(MAKE) test-image EXTRA_TEST_IMAGE_FLAGS="$(EXTRA_TEST_IMAGE_FLAGS) -d --cidfile=$(@)" EXTRA_BUILD_FLAGS="--builder=default $(EXTRA_BUILD_FLAGS) --iidfile=$(_TEST_IMG_IIDFILE)" TEST_IMG_IIDFILE=$(_TEST_IMG_IIDFILE); \
+	$(MAKE) test-image EXTRA_TEST_IMAGE_FLAGS="$(EXTRA_TEST_IMAGE_FLAGS) -d --cidfile=$(@)" EXTRA_BUILD_FLAGS="--builder=default $(EXTRA_BUILD_FLAGS) --iidfile=$(_TEST_IMG_IIDFILE)" TEST_IMG_IIDFILE=$(_TEST_IMG_IIDFILE) TEST_SHIM_CGROUP=$(TEST_SHIM_CGROUP); \
 	rm -f $(_TEST_IMG_IIDFILE)
 
-TEST_SHELL_CMD ?= bash
 test-shell: $(OUTPUT)/.test-image-cid
-	@docker exec -it $$(cat $<) $(TEST_SHELL_CMD); \
-	docker rm -f $$(cat $<) || true;
+	trap "docker rm -f $$(cat $(<))" EXIT; \
+	scripts/test-shell.sh $(<)

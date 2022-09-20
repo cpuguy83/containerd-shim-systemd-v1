@@ -54,9 +54,19 @@ EOF
 RUN systemctl mask getty@tty1.service
 RUN echo "source /etc/profile.d/bash_completion.sh" >> ~/.bashrc
 RUN curl -SLf https://raw.githubusercontent.com/docker/cli/20.10/contrib/completion/bash/docker >> ~/.docker-completion.bash && echo "source ~/.docker-completion.bash" >> ~/.bashrc
+RUN mkdir -p /root/.bash && echo "HISTFILE=/root/.bash/history" >> /root/.bashrc && echo "history -a" >> /root/.bashrc
 COPY --link --from=build /go/src/github.com/cpuguy83/containerd-shim-systemd-v1/bin/* /usr/local/bin/
 COPY --link --from=checkexec /go/src/github.com/cpuguy83/containerd-shim-systemd-v1/bin/* /usr/local/bin/
 COPY --link --from=docker /go/src/github.com/docker/docker/bundles/dynbinary-daemon/dockerd /usr/local/bin/
+COPY --link contrib/test/containerd-shim-systemd-v1-install.service /lib/systemd/system/
+ARG TEST_SHIM_CGROUP
+RUN <<EOF
+    if [ -z "${TEST_SHIM_CGROUP}}" ]; then exit 0; fi
+    set -e
+    mkdir -p /etc/systemd/system/containerd-shim-systemd-v1-install.service.d
+    echo "Environment=TEST_SHIM_CGROUP=${TEST_SHIM_CGROUP}" >> /etc/systemd/system/containerd-shim-systemd-v1-install.service.d/override.conf
+EOF
+RUN systemctl enable containerd-shim-systemd-v1-install.service
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
