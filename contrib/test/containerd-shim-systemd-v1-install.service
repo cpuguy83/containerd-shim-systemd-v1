@@ -7,7 +7,6 @@ ExecStart=/usr/local/bin/containerd-shim-systemd-v1 install --debug --log-mode=j
 ExecStartPost=/bin/touch /tmp/init
 RemainAfterExit=true
 Type=oneshot
-${extra_env}
 
 [Install]
 WantedBy=multi-user.target
