@@ -40,12 +40,12 @@ $(which containerd-shim-systemd-v1) install # installs/starts systemd units
 
 Put the built binary into $PATH (as seen by the containerd daemon).
 
-```shell
+```console
 # ctr run --rm --runtime=io.containerd.systemd.v1 docker.io/busybox:latest test top
 ```
 
 You should be able to do things like
 
-```shell
+```console
 # systemctl status containerd-default-test
 ```
