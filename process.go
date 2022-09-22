@@ -133,6 +133,7 @@ type CreateOptions struct {
 	CriuWorkPath        string
 	CriuImagePath       string
 	SystemdCgroup       bool
+	ShimCgroup          string
 }
 
 func (c CreateOptions) RestoreArgs() []string {
@@ -183,6 +184,8 @@ type process struct {
 	cond    *sync.Cond
 	state   pState
 	deleted bool
+
+	shimCgroup string
 }
 
 func (p *process) ProcessState() pState {

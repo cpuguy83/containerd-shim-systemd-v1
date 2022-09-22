@@ -16,10 +16,6 @@ DOCKER_BUILD += --progress=plain
 endif
 export V
 
-ifdef TEST_SHIM_CGROUP
-export TEST_SHIM_CGROUP
-endif
-
 OUTPUT ?= bin
 
 build:
@@ -52,12 +48,7 @@ _TEST_IMG_IIDFILE = $(OUTPUT)/.test-image-iid
 .PHONY: build-test-image
 build-test-image:
 	rm -f $(_TEST_IMG_IIDFILE)
-	$(DOCKER_BUILD) -t $(TEST_IMG) --build-arg TEST_SHIM_CGROUP $(EXTRA_BUILD_FLAGS) --target=test-img .
-
-ifneq ($(TEST_SHIM_CGROUP),)
-EXTRA_TEST_IMAGE_FLAGS ?=
-EXTRA_TEST_IMAGE_FLAGS += -e TEST_SHIM_CGROUP=$(TEST_SHIM_CGROUP)
-endif
+	$(DOCKER_BUILD) -t $(TEST_IMG) $(EXTRA_BUILD_FLAGS) --target=test-img .
 
 # volume name or host path for storing the bash history file for re-use.
 SHELL_BASH_DIR_VOLUME ?= containerd-shim-systemd-v1-test-shell-bash-dir
@@ -89,7 +80,6 @@ test-image: build-test-image
 		-v /var/lib/containerd \
 		-v /var/log/journald \
 		-v $(SHELL_BASH_DIR_VOLUME):/root/.bash \
-		--cgroupns=private \
 		$${image}
 
 
@@ -100,7 +90,7 @@ $(OUTPUT)/.test-image-cid:
 	if [ -f "$@" ]; then docker rm -f $$(cat $@) &> /dev/null; rm -f $(@); fi; \
 	rm -f $(_TEST_IMG_IIDFILE) 2> /dev/null; \
 	mkdir -p $(OUTPUT); \
-	$(MAKE) test-image EXTRA_TEST_IMAGE_FLAGS="$(EXTRA_TEST_IMAGE_FLAGS) -d --cidfile=$(@)" EXTRA_BUILD_FLAGS="--builder=default $(EXTRA_BUILD_FLAGS) --iidfile=$(_TEST_IMG_IIDFILE)" TEST_IMG_IIDFILE=$(_TEST_IMG_IIDFILE) TEST_SHIM_CGROUP=$(TEST_SHIM_CGROUP); \
+	$(MAKE) test-image EXTRA_TEST_IMAGE_FLAGS="$(EXTRA_TEST_IMAGE_FLAGS) -d --cidfile=$(@)" EXTRA_BUILD_FLAGS="--builder=default $(EXTRA_BUILD_FLAGS) --iidfile=$(_TEST_IMG_IIDFILE)" TEST_IMG_IIDFILE=$(_TEST_IMG_IIDFILE); \
 	rm -f $(_TEST_IMG_IIDFILE)
 
 test-shell: $(OUTPUT)/.test-image-cid

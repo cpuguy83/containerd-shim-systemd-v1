@@ -129,6 +129,9 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "Environment", "UNIT_NAME=%n"), // %n is replaced with the unit name by systemd
 		unit.NewUnitOption(svc, "Environment", "EXIT_STATE_PATH="+p.exitStatePath()),
 	}
+	if p.shimCgroup != "" {
+		opts = append(opts, unit.NewUnitOption(svc, "Environment", "SHIM_CGROUP="+p.shimCgroup))
+	}
 
 	prefix := []string{p.exe, "--debug=" + strconv.FormatBool(p.runc.Debug), "--bundle=" + p.Bundle, "create"}
 	if len(p.Rootfs) > 0 {
@@ -183,12 +186,13 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "Environment", "DAEMON_UNIT_NAME="+os.Getenv("UNIT_NAME")),
 		unit.NewUnitOption(svc, "Environment", "UNIT_NAME=%n"), // %n is replaced with the unit name by systemd
 		unit.NewUnitOption(svc, "Environment", "EXIT_STATE_PATH="+p.exitStatePath()),
-		unit.NewUnitOption(svc, "Environment", "PIDFILE="+p.pidFile()),
+	}
+	if p.shimCgroup != "" {
+		opts = append(opts, unit.NewUnitOption(svc, "Environment", "SHIM_CGROUP="+p.shimCgroup))
 	}
 
 	prefix := []string{p.exe, "--debug=" + strconv.FormatBool(p.runc.Debug), "--bundle=" + p.parent.Bundle, "create"}
 
-	// TODO: Really need to use --detach here so we don't have a runc process hanging around...
 	cmd := []string{"exec", "--process=" + p.processFilePath(), "--pid-file=" + p.pidFile(), "--detach"}
 	if p.Terminal || p.opts.Terminal {
 		s, err := p.ttySockPath()

@@ -14,25 +14,14 @@ cat /etc/resolv.conf >/tmp/resolv.conf
 umount /etc/resolv.conf
 mv /tmp/resolv.conf /etc/resolv.conf
 
-mount -o remount rw /proc
-mount -o remount rw /proc/sys
+mount -o remount,rw /proc
+mount -o remount,rw /proc/sys
 
-mount -t tmpfs -o uid=0,gid=0,mode=0755 cgroup /sys/fs/cgroup
-if [ -e /sys/fs/cgroup/memory/memory.use_hierarchy ]; then
-    echo 1 >/sys/fs/cgroup/memory/memory.use_hierarchy
-fi
+cgroup_mounts="$(mount | grep cgroup | awk '{print $3}')"
+for cgroup_mount in ${cgroup_mounts}; do
+    umount -l "${cgroup_mount}" || true
+done
 
-mkdir -p /sys/fs/cgroup/unified
-mount -t cgroup2 none /sys/fs/cgroup/unified || true
-
-if [ -n "${TEST_SHIM_CGROUP}" ]; then
-    [ -d /sys/fs/cgroup/memory ] &&
-        mkdir -p /sys/fs/cgroup/memory/${TEST_SHIM_CGROUP}
-
-    [ -d /sys/fs/cgroup/unified ] &&
-        mkdir -p /sys/fs/cgroup/unified/${TEST_SHIM_CGROUP}
-fi
-
-echo PID: $$
+mount -t cgroup2 cgroup2 /sys/fs/cgroup
 
 exec /lib/systemd/systemd

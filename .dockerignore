@@ -3,3 +3,5 @@ Dockerfile
 .git
 Makefile
 scripts/test-shell.sh
+bin/
+.gihub/

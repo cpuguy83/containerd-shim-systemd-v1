@@ -8,11 +8,20 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <fcntl.h>
+#include <errno.h>
 
 
 int op_resize = 1;
 int tty_fd = 100;
 int sock_fd = 101;
+
+void lerror(char *msg) {
+    fprintf(stderr, "tty: %s: %s\n", msg, strerror(errno));
+}
+
+void lmsg(char *msg) {
+    fprintf(stderr, "tty: %s\n", msg);
+}
 
 struct copy_data {
     int w;
@@ -44,7 +53,7 @@ void handle_tty_op_conn(int fd)
         nr = read(fd, buf, sizeof(buf));
         if (nr < 0 )
         {
-            perror("read");
+            lerror("read");
             close(fd);
             return;
         }
@@ -55,7 +64,7 @@ void handle_tty_op_conn(int fd)
             nw = write(fd, msg, sizeof(msg));
             if (nw < 0)
             {
-                perror("write");
+                lerror("write");
                 close(fd);
                 return;
             }
@@ -76,11 +85,11 @@ void handle_tty_op_conn(int fd)
             nw = write(fd, sizeof(msg)+msg, sizeof(msg));
             if (nw < 0)
             {
-                perror("write");
+                lerror("write");
                 close(fd);
                 return;
             }
-            perror("parse");
+            lerror("parse");
             close(fd);
             return;
         }
@@ -91,7 +100,7 @@ void handle_tty_op_conn(int fd)
             nw = write(fd, msg, sizeof(msg));
             if (nw < 0)
             {
-                perror("write");
+                lerror("write");
                 close(fd);
                 return;
             }
@@ -105,12 +114,12 @@ void handle_tty_op_conn(int fd)
         free(ws);
         if (err < 0 )
         {
-            perror("ioctl TIOCSWINSZ");
+            lerror("ioctl TIOCSWINSZ");
             char *msg = "error setting win size";
             nw = write(fd, msg, sizeof(msg));
             if (nw < 0)
             {
-                perror("write");
+                lerror("write");
                 close(fd);
                 return;
             }
@@ -119,7 +128,7 @@ void handle_tty_op_conn(int fd)
         // Send ack
         nw = write(fd, "0", 1);
         if (nw < 1) {
-            perror("write");
+            lerror("write");
             close(fd);
             return;
         }
@@ -136,25 +145,25 @@ void *handle_tty_ops(void *args)
     int fd_flags = fcntl(sock_fd, F_GETFL);
     if (fd_flags < 0)
     {
-        perror("F_GETFL");
+        lerror("F_GETFL");
         return 0;
     }
 
     int err = fcntl(sock_fd, F_SETFL, fd_flags & ~O_NONBLOCK);
     if (err < 0)
     {
-        perror("F_SETFL");
+        lerror("F_SETFL");
         return 0;
     }
 
-    fprintf(stderr, "Ready for tty clients\n");
+    lmsg("Ready for tty clients\n");
 
     while (1)
     {
         int cfd = accept(sock_fd, NULL, NULL);
         if (cfd < 0)
         {
-            perror("accept");
+            lerror("accept");
             close(sock_fd);
             return 0;
         }
@@ -165,22 +174,62 @@ void *handle_tty_ops(void *args)
     }
 }
 
+void setcgroup(void)
+{
+    char *val = getenv("SHIM_CGROUP");
+    if (val == NULL)
+        return;
+
+    char *CG_PATH = "/sys/fs/cgroup";
+    char *CG_PROCS = "cgroup.procs";
+
+    int sz = strlen(CG_PATH) + strlen(val) + 1 + strlen(CG_PROCS);
+    char p[sz];
+
+    sprintf(p, "%s/%s/%s", CG_PATH, val, CG_PROCS);
+    lmsg("Setting cgroup");
+
+    FILE *fd = fopen(p, "w");
+    if (fd < 0)
+    {
+        lerror("fopen");
+        return;
+    }
+
+    lmsg("opened cgroup.procs");
+
+    pid_t pid = getpid();
+    int err = fprintf(fd, "%d\n", pid);
+    if (err < 0)
+    {
+        lerror("write cgroup.procs");
+    }
+    lmsg("wrote cgroup.procs");
+    err = fclose(fd);
+    if (err < 0)
+    {
+        lerror("fclose");
+    }
+}
+
+// TODO: set shim cgroup
 void handle_pty(void)
 {
-    char *val;
-
-    val = getenv("_TTY_HANDSHAKE");
+    char *val = getenv("_TTY_HANDSHAKE");
     if (val == NULL || *val != '2')
     {
         return;
     }
+
+    setcgroup();
+    lmsg("cgroup set");
 
     // TODO: make this configurable
     // Maybe we can use the container uid by default (unless it is root)?
     int err = setuid(10000);
     if (err < 0)
     {
-        perror("setuid");
+        lerror("setuid");
         return;
     }
 
@@ -206,7 +255,7 @@ void handle_pty(void)
 
     close(sock_fd);
 
-    fprintf(stderr, "Exiting\n");
+    lmsg("Exiting");
     exit(0);
 }
 

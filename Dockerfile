@@ -59,13 +59,6 @@ COPY --link --from=build /go/src/github.com/cpuguy83/containerd-shim-systemd-v1/
 COPY --link --from=checkexec /go/src/github.com/cpuguy83/containerd-shim-systemd-v1/bin/* /usr/local/bin/
 COPY --link --from=docker /go/src/github.com/docker/docker/bundles/dynbinary-daemon/dockerd /usr/local/bin/
 COPY --link contrib/test/containerd-shim-systemd-v1-install.service /lib/systemd/system/
-ARG TEST_SHIM_CGROUP
-RUN <<EOF
-    if [ -z "${TEST_SHIM_CGROUP}}" ]; then exit 0; fi
-    set -e
-    mkdir -p /etc/systemd/system/containerd-shim-systemd-v1-install.service.d
-    echo "[Service]\nEnvironment=TEST_SHIM_CGROUP=${TEST_SHIM_CGROUP}" >> /etc/systemd/system/containerd-shim-systemd-v1-install.service.d/override.conf
-EOF
 RUN systemctl enable containerd-shim-systemd-v1-install.service
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

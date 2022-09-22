@@ -12,6 +12,7 @@ set +e
 
 while true; do
     docker exec -it ${cid} /bin/sh -c '[ -f /tmp/init ]' && break
+    docker logs ${cid}
     sleep 1
 done
 

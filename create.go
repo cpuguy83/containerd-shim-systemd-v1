@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containerd/cgroups"
+	cgroupsv2 "github.com/containerd/cgroups/v2"
 	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
@@ -80,6 +82,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			opts.SystemdCgroup = vv.SystemdCgroup
 			opts.CriuImagePath = vv.CriuImagePath
 			opts.CriuWorkPath = vv.CriuWorkPath
+			opts.ShimCgroup = vv.ShimCgroup
 		case *runctypes.CreateOptions:
 			opts.NoPivotRoot = vv.NoPivotRoot
 			opts.NoNewKeyring = vv.NoNewKeyring
@@ -91,6 +94,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			opts.FileLocks = vv.FileLocks
 			opts.Terminal = vv.Terminal
 			opts.EmptyNamespaces = vv.EmptyNamespaces
+			opts.ShimCgroup = vv.ShimCgroup
 		}
 		log.G(ctx).WithField("typeurl", r.Options.TypeUrl).Debug("Decoding create options")
 	}
@@ -144,8 +148,9 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 				Root:          filepath.Join(opts.Root, ns),
 				Log:           logPath,
 			},
-			exe:  s.exe,
-			root: r.Bundle,
+			exe:        s.exe,
+			root:       r.Bundle,
+			shimCgroup: opts.ShimCgroup,
 		},
 		Bundle:           r.Bundle,
 		Rootfs:           r.Rootfs,
@@ -658,6 +663,10 @@ func reap(ctx context.Context, chChld chan os.Signal, wait chan waitStatus, chPr
 func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap bool) (retErr error) {
 	log.G(ctx).Debugf("%s %s", cmdLine[0], cmdLine[1:])
 
+	if err := setCgroup(); err != nil {
+		log.G(ctx).WithError(err).Error("Error setting cgroup")
+	}
+
 	cmd := exec.Command(cmdLine[0], cmdLine[1:]...)
 
 	// Open all fifos with O_RDWR first so that we don't block trying to open
@@ -742,6 +751,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 	}
 
 	chProc <- cmd.Process
+	log.G(ctx).Debugf("runc pid: %d", cmd.Process.Pid)
 
 	defer cmd.Wait()
 
@@ -866,13 +876,46 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		}
 	}
 
-	data, err := json.Marshal(st)
-	if err != nil {
-		return fmt.Errorf("error marshalling state: %v", err)
+	return writeFile()
+}
+
+type cgMode cgroups.CGMode
+
+func (m cgMode) String() string {
+	switch cgroups.CGMode(m) {
+	case cgroups.Unified:
+		return "unified"
+	case cgroups.Hybrid:
+		return "hybrid"
+	case cgroups.Legacy:
+		return "legacy"
+	default:
+		return "unknown"
+	}
+}
+
+func setCgroup() error {
+	cgPath := os.Getenv("SHIM_CGROUP")
+	if cgPath == "" {
+		return nil
 	}
 
-	if err := os.WriteFile(os.Getenv("EXIT_STATE_PATH"), data, 0600); err != nil {
-		return fmt.Errorf("error writing state: %v", err)
+	if cgroups.Mode() == cgroups.Unified {
+		cg, err := cgroupsv2.LoadManager("/sys/fs/cgroup", cgPath)
+		if err != nil {
+			return fmt.Errorf("cgroups v2 mode %s: error loading cgroup: %w", cgMode(cgroups.Mode()), err)
+		}
+		if err := cg.AddProc(uint64(os.Getpid())); err != nil {
+			return fmt.Errorf("error adding proc to cgroup: %v", err)
+		}
+	} else {
+		cg, err := cgroups.Load(cgroups.V1, cgroups.StaticPath(cgPath))
+		if err != nil {
+			return fmt.Errorf("cgroups v1 mode %s: error loading cgroup: %w", cgMode(cgroups.Mode()), err)
+		}
+		if err := cg.AddProc(uint64(os.Getpid())); err != nil {
+			return fmt.Errorf("error adding proc to cgroup: %v", err)
+		}
 	}
 
 	return nil
