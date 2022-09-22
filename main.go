@@ -2,9 +2,9 @@ package main
 
 /*
 #cgo CFLAGS: -Wall
-extern void handle_pty();
+extern void pty_main();
 void __attribute__((constructor)) init(void) {
-	handle_pty();
+	pty_main();
 }
 */
 import "C"
@@ -89,14 +89,6 @@ var (
 )
 
 func main() {
-	if os.Getenv(ttyHandshakeEnv) == "1" {
-		if err := ttyHandshake(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-
 	var (
 		debug          bool
 		socket         = defaultAddress

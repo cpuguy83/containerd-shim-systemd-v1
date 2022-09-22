@@ -6,22 +6,18 @@
 #include <netdb.h>
 #include <sys/un.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <fcntl.h>
-#include <errno.h>
+#include <libgen.h>
+
+#include "systemd.h"
+#include "log.h"
 
 
 int op_resize = 1;
-int tty_fd = 100;
-int sock_fd = 101;
-
-void lerror(char *msg) {
-    fprintf(stderr, "tty: %s: %s\n", msg, strerror(errno));
-}
-
-void lmsg(char *msg) {
-    fprintf(stderr, "tty: %s\n", msg);
-}
+int sock_fd;
+int tty_fd;
 
 struct copy_data {
     int w;
@@ -212,26 +208,9 @@ void setcgroup(void)
     }
 }
 
-// TODO: set shim cgroup
-void handle_pty(void)
+int handle_pty(void)
 {
-    char *val = getenv("_TTY_HANDSHAKE");
-    if (val == NULL || *val != '2')
-    {
-        return;
-    }
 
-    setcgroup();
-    lmsg("cgroup set");
-
-    // TODO: make this configurable
-    // Maybe we can use the container uid by default (unless it is root)?
-    int err = setuid(10000);
-    if (err < 0)
-    {
-        lerror("setuid");
-        return;
-    }
 
     pthread_t stdin_copy_thr_id, stdout_copy_thr_id, tty_op_thr_id;
 
@@ -259,3 +238,152 @@ void handle_pty(void)
     exit(0);
 }
 
+int mkdir_all(char *path)
+{
+    lmsg(path);
+    char *p = path;
+    while (*p != '\0')
+    {
+        if (*p == '/')
+        {
+            *p = '\0';
+            mkdir(path, 0755);
+            *p = '/';
+        }
+        p++;
+    }
+    return 0;
+}
+
+int tty_recv_fd(char *sock_path)
+{
+    lmsg("tty_recv_fd");
+    lmsg(sock_path);
+
+    sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock_fd < 0)
+    {
+        return sock_fd;
+    }
+    lmsg("created socket");
+
+    unlink(sock_path);
+
+    char *dir = strdup(sock_path);
+    int err = mkdir_all(dirname(dir));
+    if (err < 0)
+    {
+        close(sock_fd);
+        return err;
+    }
+    lmsg("mkdir_all");
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(struct sockaddr_un));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+
+    lmsg("binding tty socket path");
+    lmsg(sock_path);
+
+    err = bind(sock_fd, (struct sockaddr *)&addr, sizeof(struct sockaddr_un));
+    if (err < 0)
+    {
+        close(sock_fd);
+        return err;
+    }
+
+    lmsg("bound socket");
+
+    err = listen(sock_fd, 1);
+    if (err < 0)
+    {
+        close(sock_fd);
+        return err;
+    }
+
+    lmsg("listening on socket");
+
+    err = sd_notify("READY=1");
+    if (err < 0)
+    {
+        lerror("sd_notify");
+    } else {
+        lmsg("sd_notify READY=1");
+    }
+
+    int conn = accept(sock_fd, NULL, NULL);
+    if (conn < 0)
+    {
+        close(sock_fd);
+        return conn;
+    }
+
+    lmsg("accepted connection");
+
+    char buf[512];
+    struct iovec e = {buf, 512};
+    char cmsg[CMSG_SPACE(sizeof(int))];
+    struct msghdr m = {NULL, 0, &e, 1, cmsg, sizeof(cmsg), 0};
+
+    int n = recvmsg(conn, &m, 0);
+    if (n < 0)
+    {
+        close(conn);
+        close(sock_fd);
+        return n;
+    }
+
+    lmsg("received fd");
+
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    int fd = *(int *)CMSG_DATA(c);
+
+    close(conn);
+    // We re-use sock_fd for the tty operations, so don't close that.
+    return fd;
+}
+
+
+void pty_main(void)
+{
+    char *val = getenv("_TTY_HANDSHAKE");
+    if (val == NULL || *val != '1')
+    {
+        return;
+    }
+
+    lmsg("HELLLO!!!!");
+
+    char *sock_path = getenv("_TTY_SOCKET_PATH");
+    if (sock_path == NULL)
+    {
+        lerror("no socket path");
+        exit(1);
+    }
+
+    setcgroup();
+    lmsg("cgroup set");
+
+
+    tty_fd = tty_recv_fd(sock_path);
+    if (tty_fd < 0)
+    {
+        lerror("tty_recv_fd");
+        exit(2);
+    }
+
+    // TODO: make this configurable
+    // Maybe we can use the container uid by default (unless it is root)?
+    int err = setuid(10000);
+    if (err < 0)
+    {
+        lerror("setuid");
+        exit(1);
+    }
+
+    if (handle_pty() < 0) {
+        lerror("handle_pty");
+        exit(3);
+    }
+}

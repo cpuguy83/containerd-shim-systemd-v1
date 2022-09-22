@@ -14,7 +14,6 @@ import (
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/namespaces"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
-	"github.com/coreos/go-systemd/v22/daemon"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	dbus "github.com/godbus/dbus/v5"
 	ptypes "github.com/gogo/protobuf/types"
@@ -28,93 +27,6 @@ const (
 	ttySockPathEnv  = "_TTY_SOCKET_PATH"
 	ttyHandshakeEnv = "_TTY_HANDSHAKE"
 )
-
-func ttyHandshake() (retErr error) {
-	fmt.Fprintln(os.Stderr, "TTY handshake phase 1")
-	defer func() {
-		if retErr != nil {
-			daemon.SdNotify(false, daemon.SdNotifyStopping)
-		}
-	}()
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
-
-	sockPath := os.Getenv(ttySockPathEnv)
-	if sockPath == "" {
-		return fmt.Errorf("%s not set", ttySockPathEnv)
-	}
-
-	unix.Unlink(sockPath)
-	if err := os.MkdirAll(filepath.Dir(sockPath), 0700); err != nil {
-		return fmt.Errorf("error creating sock path parent dir: %w", err)
-	}
-
-	l, err := net.Listen("unix", sockPath)
-	if err != nil {
-		return fmt.Errorf("error listening on sock path: %w", err)
-	}
-
-	daemon.SdNotify(false, daemon.SdNotifyReady)
-
-	fmt.Fprintln(os.Stderr, "Waiting for init client")
-	conn, err := l.Accept()
-	if err != nil {
-		return fmt.Errorf("error accepting connection to tty handler: %w", err)
-	}
-	defer conn.Close()
-
-	fmt.Fprintln(os.Stderr, "Waiting for TTY handshake")
-	console, err := recvFd(conn.(*net.UnixConn))
-	if err != nil {
-		return fmt.Errorf("error receiving console fd from tty handler: %w", err)
-	}
-
-	fmt.Fprintln(os.Stderr, "Received console fd")
-
-	if console != 100 {
-		err = unix.Dup2(console, 100)
-		if err != nil {
-			return fmt.Errorf("error copying console to fd 3: %w", err)
-		}
-		unix.Close(console)
-	}
-
-	os.Unsetenv(sockPath)
-	if err := os.Setenv(ttyHandshakeEnv, "2"); err != nil {
-		return fmt.Errorf("error setting %s: %w", ttyHandshakeEnv, err)
-	}
-
-	rc, err := l.(*net.UnixListener).SyscallConn()
-	if err != nil {
-		return fmt.Errorf("error getting raw connection: %w", err)
-	}
-
-	var dupErr error
-	err = rc.Control(func(fd uintptr) {
-		dupErr = unix.Dup2(int(fd), 101)
-	})
-	if err != nil {
-		return fmt.Errorf("error controlling socket: %w", err)
-	}
-	if dupErr != nil {
-		return fmt.Errorf("error duplicating socket fd: %w", dupErr)
-	}
-
-	fmt.Fprintln(os.Stderr, "Starting TTY copier")
-
-	// We re-exec with ttyHandshakeEnv set to 2
-	// The new process stays in C-land and does not let the go runtime spin-up.
-	// This allows us to consume significantly less memory.
-	//
-	// We add extra flags just for the humans who see this in the process list.
-	// The flags don't actually do anything.
-	if err := unix.Exec(exe, []string{exe, "tty-handler", "--socket-path=" + sockPath}, os.Environ()); err != nil {
-		return fmt.Errorf("error re-execing to handshake phase 2: %w", err)
-	}
-	return nil
-}
 
 func (p *process) ResizePTY(ctx context.Context, width, height int, sockPath string) error {
 	if !p.Terminal {
@@ -376,7 +288,7 @@ func (p *process) makePty(ctx context.Context, sockPath string) (_, _ string, re
 		{Name: "Environment", Value: dbus.MakeVariant(env)},
 		{Name: "StandardInputFile", Value: dbus.MakeVariant(p.Stdin)},
 		{Name: "StandardOutputFile", Value: dbus.MakeVariant(p.Stdout)},
-		{Name: "StandardErrorFile", Value: dbus.MakeVariant(logPath)},
+		{Name: "StandardError", Value: dbus.MakeVariant("journal")},
 	}
 
 	ttyUnit := p.ttyUnitName()

@@ -203,11 +203,14 @@ func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState)
 	// st.ExitedAt = time.UnixMicro(int64(ts.(uint64)))
 	// if !st.ExitedAt.After(timeZero) {
 	if st.ExitCode == 0 {
-		code, _ := readExecStatusExit(state["ExecStart"].([][]interface{})[0])
-		// if t.After(timeZero) {
-		// st.ExitedAt = t
-		if code > 0 {
-			st.ExitCode = uint32(code)
+		execStart := state["ExecStart"].([][]interface{})
+		if len(execStart) > 0 {
+			code, _ := readExecStatusExit(state["ExecStart"].([][]interface{})[0])
+			// if t.After(timeZero) {
+			// st.ExitedAt = t
+			if code > 0 {
+				st.ExitCode = uint32(code)
+			}
 		}
 		// }
 	}
