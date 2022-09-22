@@ -577,6 +577,11 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 				if err == nil {
 					ret = fmt.Errorf("%w\n%s", ret, string(logData))
 				}
+
+				ttyData, err := os.ReadFile(filepath.Join(p.root, p.id+"-tty.log"))
+				if err == nil {
+					ret = fmt.Errorf("%w\n%s", ret, string(ttyData))
+				}
 			}
 			if err2 := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err2 != nil {
 				log.G(ctx).WithError(err2).Debug("Error deleting container in runc")
