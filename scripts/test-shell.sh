@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 
-set -eu -o pipefail
+set -eux -o pipefail
+
+env | grep GOTEST
 
 cid="$(cat ${1})"
 
-: ${TEST_SHELL_CMD:=bash}
+: "${TEST_SHELL_CMD:=bash}"
+: "${EXTRA_TEST_SHELL_FLAGS:=""}"
 
 readonly service="containerd-shim-systemd-v1.service"
 
@@ -20,5 +23,5 @@ set -e
 
 docker exec -it ${cid} systemctl start containerd-shim-systemd-v1-install.service
 
-docker exec -it ${cid} ${TEST_SHELL_CMD}
+docker exec -it ${EXTRA_TEST_SHELL_FLAGS} ${cid} ${TEST_SHELL_CMD}
 docker rm -f ${cid} || true

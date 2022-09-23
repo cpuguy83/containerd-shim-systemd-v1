@@ -16,6 +16,8 @@ DOCKER_BUILD += --progress=plain
 endif
 export V
 
+TEST_IMG_TARGET ?= test-img
+
 OUTPUT ?= bin
 
 build:
@@ -48,10 +50,11 @@ _TEST_IMG_IIDFILE = $(OUTPUT)/.test-image-iid
 .PHONY: build-test-image
 build-test-image:
 	rm -f $(_TEST_IMG_IIDFILE)
-	$(DOCKER_BUILD) -t $(TEST_IMG) $(EXTRA_BUILD_FLAGS) --target=test-img .
+	$(DOCKER_BUILD) -t $(TEST_IMG) --target=$(TEST_IMG_TARGET) $(EXTRA_BUILD_FLAGS) .
 
 # volume name or host path for storing the bash history file for re-use.
 SHELL_BASH_DIR_VOLUME ?= containerd-shim-systemd-v1-test-shell-bash-dir
+VOLUME_CACHE_PREFIX ?= containerd-shim-systemd-v1-test-cache
 
 .PHONY: test-image
 test-image: build-test-image
@@ -72,14 +75,14 @@ test-image: build-test-image
 		--cap-add NET_ADMIN \
 		--cap-add SYS_RESOURCE \
 		-e container=docker \
-		--tmpfs /tmp \
 		--tmpfs /run \
 		--tmpfs /run/lock \
-		--init=false \
 		-v /var/lib/docker \
 		-v /var/lib/containerd \
 		-v /var/log/journald \
 		-v $(SHELL_BASH_DIR_VOLUME):/root/.bash \
+		-v $(VOLUME_CACHE_PREFIX)-gobuild:/root/.cache/go-build \
+		-v $(VOLUME_CACHE_PREFIX)-gomod:/go/pkg/mod \
 		$${image}
 
 
@@ -90,9 +93,23 @@ $(OUTPUT)/.test-image-cid:
 	if [ -f "$@" ]; then docker rm -f $$(cat $@) &> /dev/null; rm -f $(@); fi; \
 	rm -f $(_TEST_IMG_IIDFILE) 2> /dev/null; \
 	mkdir -p $(OUTPUT); \
-	$(MAKE) test-image EXTRA_TEST_IMAGE_FLAGS="$(EXTRA_TEST_IMAGE_FLAGS) -d --cidfile=$(@)" EXTRA_BUILD_FLAGS="--builder=default $(EXTRA_BUILD_FLAGS) --iidfile=$(_TEST_IMG_IIDFILE)" TEST_IMG_IIDFILE=$(_TEST_IMG_IIDFILE); \
+	BUILD_ARGS="--build-arg CONTAINERD_REPO --build-arg CONTAINERD_COMMIT"; \
+	$(MAKE) test-image EXTRA_TEST_IMAGE_FLAGS="$(EXTRA_TEST_IMAGE_FLAGS) -d --cidfile=$(@)" EXTRA_BUILD_FLAGS="--builder=default $${BUILD_ARGS} $(EXTRA_BUILD_FLAGS) --iidfile=$(_TEST_IMG_IIDFILE)" TEST_IMG_IIDFILE=$(_TEST_IMG_IIDFILE); \
 	rm -f $(_TEST_IMG_IIDFILE)
 
 test-shell: $(OUTPUT)/.test-image-cid
-	trap "docker rm -f $$(cat $(<))" EXIT; \
 	scripts/test-shell.sh $(<)
+
+export GOTEST ?= gotestsum --format=standard-verbose --
+export EXTRA_TESTFLAGS := -no-criu -no-shim-cgroup
+export RUNC_FLAVOR ?= runc
+export TEST_RUNTIME = io.containerd.systemd.v1
+
+TEST_RESULTS_DIR ?= $(OUTPUT)/test-results
+$(TEST_RESULTS_DIR)/containerd-integration-junit.xml: $(OUTPUT)/.test-image-cid
+	mkdir -p $(TEST_RESULTS_DIR); \
+	EXTRA_TEST_SHELL_FLAGS="-e RUNC_FLAVOR -e TEST_RUNTIME -e EXTRA_TESTFLAGS -e GOTESTSUM_JUNITFILE=/report.xml -e GOTEST $(EXTRA_TEST_SHELL_FLAGS)" TEST_SHELL_CMD="make integration" scripts/test-shell.sh $(<); \
+	docker cp "$$(cat $(<)):/report.xml" $(@)
+	docker kill $$(cat $(<)); \
+
+containerd-integration: $(TEST_RESULTS_DIR)/containerd-integration-junit.xml

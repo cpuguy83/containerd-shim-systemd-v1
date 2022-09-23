@@ -39,8 +39,8 @@ RUN \
     --mount=type=cache,target=/root/.cache/go-build \
     GO111MODULE=off hack/make.sh dynbinary
 
-FROM debian:bullseye as test-img
-RUN apt-get update && apt-get install -y systemd curl procps vim bash-completion
+FROM buildpack-deps:bullseye as test-img
+RUN apt-get update && apt-get install -y systemd curl procps vim bash-completion make git gcc
 RUN curl -SLf https://get.docker.com | sh
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 ENV PATH=/usr/local/bin:${PATH}
@@ -60,8 +60,26 @@ COPY --link --from=checkexec /go/src/github.com/cpuguy83/containerd-shim-systemd
 COPY --link --from=docker /go/src/github.com/docker/docker/bundles/dynbinary-daemon/dockerd /usr/local/bin/
 COPY --link contrib/test/containerd-shim-systemd-v1-install.service /lib/systemd/system/
 RUN systemctl enable containerd-shim-systemd-v1-install.service
+COPY --link --from=go /usr/local/go /usr/local/go
+ENV GOPATH=/go PATH=/go/bin:/usr/local/go/bin:$PATH
+ARG CONTAINERD_REPO=https://github.com/containerd/containerd.git
+ARG CONTAINERD_COMMIT=9cd3357b7fd7218e4aec3eae239db1f68a5a6ec6 # v1.6.8
+WORKDIR /go/src/github.com/containerd/containerd
+RUN <<EOF
+set -e
+git init .
+git remote add origin ${CONTAINERD_REPO}
+git fetch --depth=1 origin ${CONTAINERD_COMMIT}
+git checkout "${CONTAINERD_COMMIT}"
+EOF
+RUN \
+    --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go install gotest.tools/gotestsum@latest
+
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
 
 FROM scratch
 COPY --from=build /go/src/github.com/cpuguy83/containerd-shim-systemd-v1/bin/* /
