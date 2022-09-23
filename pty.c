@@ -240,7 +240,6 @@ int handle_pty(void)
 
 int mkdir_all(char *path)
 {
-    lmsg(path);
     char *p = path;
     while (*p != '\0')
     {
@@ -257,9 +256,6 @@ int mkdir_all(char *path)
 
 int tty_recv_fd(char *sock_path)
 {
-    lmsg("tty_recv_fd");
-    lmsg(sock_path);
-
     sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (sock_fd < 0)
     {
@@ -276,7 +272,6 @@ int tty_recv_fd(char *sock_path)
         close(sock_fd);
         return err;
     }
-    lmsg("mkdir_all");
 
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(struct sockaddr_un));
@@ -353,8 +348,6 @@ void pty_main(void)
         return;
     }
 
-    lmsg("HELLLO!!!!");
-
     char *sock_path = getenv("_TTY_SOCKET_PATH");
     if (sock_path == NULL)
     {
@@ -375,8 +368,7 @@ void pty_main(void)
 
     // TODO: make this configurable
     // Maybe we can use the container uid by default (unless it is root)?
-    int err = setuid(10000);
-    if (err < 0)
+    if (setuid(10000) < 0)
     {
         lerror("setuid");
         exit(1);

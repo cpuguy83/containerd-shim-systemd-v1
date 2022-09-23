@@ -4,9 +4,9 @@
 #include "log.h"
 
 void lerror(char *msg) {
-    fprintf(stderr, "tty: %s: %s\n", msg, strerror(errno));
+    fprintf(stderr, "%s: %s\n", msg, strerror(errno));
 }
 
 void lmsg(char *msg) {
-    fprintf(stderr, "tty: %s\n", msg);
+    fprintf(stderr, "%s\n", msg);
 }
