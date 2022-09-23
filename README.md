@@ -10,12 +10,7 @@ Advantages over the standard runc (io.containerd.runc.v2) shim:
 4. Possible to send all stdout/stderr messages to journald instead of managing pipes.
 5. Shim can be restarted for whatever reason w/o disrupting containers (TODO).
 
-Because of a bug in containerd 1.5, this currently only works starting from
-containerd 1.6.0-beta.1, alternatively you can apply this commit:
-https://github.com/containerd/containerd/commit/130a9c7ddbdd33a95a4b531ff25506d2d1651b20
-There is a possibility this patch could be backported to containerd 1.5, however
-I'd say it is slim since it only helps projects like this one, not current
-production workloads.
+This requires a minimum of containerd 1.6 to function.
 
 This is alpha quality software and does not yet fully implement the containerd shim API.
 Do not use this in production environments.
