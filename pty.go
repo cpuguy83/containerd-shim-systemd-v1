@@ -288,7 +288,7 @@ func (p *process) makePty(ctx context.Context, sockPath string) (_, _ string, re
 		{Name: "Environment", Value: dbus.MakeVariant(env)},
 		{Name: "StandardInputFile", Value: dbus.MakeVariant(p.Stdin)},
 		{Name: "StandardOutputFile", Value: dbus.MakeVariant(p.Stdout)},
-		{Name: "StandardError", Value: dbus.MakeVariant("journal")},
+		{Name: "StandardErrorFile", Value: dbus.MakeVariant(logPath)},
 	}
 
 	ttyUnit := p.ttyUnitName()
