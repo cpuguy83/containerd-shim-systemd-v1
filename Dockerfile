@@ -31,9 +31,9 @@ RUN \
 # Only docker's dev branch has support for custom shims right now, so get dockerd from there.
 FROM base AS docker
 WORKDIR /go/src/github.com/docker/docker
-RUN apt-get update && apt-get install -y libbtrfs-dev libdevmapper-dev libltdl-dev
 ARG DOCKER_COMMIT=b84225c66b555b98104934b84c38eb9691f2abf3
 RUN git init . && git remote add origin https://github.com/cpuguy83/docker.git && git pull origin ${DOCKER_COMMIT}
+ENV DOCKER_BUILDTAGS="exclude_graphdriver_devicemapper exclude_graphdriver_btrfs"
 RUN \
     --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
