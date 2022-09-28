@@ -169,7 +169,7 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 	}
 
 	opts := []*unit.UnitOption{
-		unit.NewUnitOption(svc, "Type", p.unitType()),
+		unit.NewUnitOption(svc, "Type", "notify"),
 		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
 		unit.NewUnitOption(svc, "GuessMainPID", "yes"),
 		unit.NewUnitOption(svc, "Delegate", "yes"),

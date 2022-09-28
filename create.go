@@ -28,6 +28,7 @@ import (
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
+	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/proto"
@@ -598,20 +599,6 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 	return handlePid()
 }
 
-func (p *initProcess) readPidFile() (uint32, error) {
-	pidData, err := os.ReadFile(p.pidFile())
-	if err != nil {
-		return 0, err
-	}
-
-	pid, err := strconv.Atoi(string(pidData))
-	if err != nil {
-		return 0, fmt.Errorf("error parsing pid file: %w", err)
-	}
-
-	return uint32(pid), nil
-}
-
 type waitStatus struct {
 	Status int
 	Err    error
@@ -741,7 +728,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		go reap(ctx, chChld, wait, chProc)
 
 		var i uintptr = 1
-		if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, uintptr(i), 0, 0, 0); err != nil {
+		if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, i, 0, 0, 0); err != nil {
 			log.G(ctx).WithError(err).Error("failed to set child subreaper")
 		}
 	}
@@ -830,6 +817,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		st.ExitedAt = time.Now()
 		st.Status = exitedInit
 		st.Pid = uint32(cmd.Process.Pid)
+		sdNotify(ctx, notifyErrno(st.ExitCode), notifyStatus(st.Status))
 		return writeFile()
 	}
 
@@ -841,15 +829,14 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		st.ExitedAt = time.Now()
 		st.Pid = status.Pid
 		st.Status = "exited"
-	case <-time.After(time.Second):
-		log.G(ctx).Debug("Process considered up after 1s")
+		sdNotify(ctx, notifyErrno(st.ExitCode), notifyStatus(st.Status), notifyMainPID(st.Pid))
 	case pid := <-chPid:
 		st.Pid = uint32(pid)
 		if !noReap {
 			// At this point we have the pid, so we can turn off the subreaper and call wait4 ourselves
 			// to make sure the process did not exit in the meantime.
 			var i uintptr = 0
-			if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, uintptr(i), 0, 0, 0); err != nil {
+			if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, i, 0, 0, 0); err != nil {
 				log.G(ctx).WithError(err).Error("failed to unset child subreaper")
 			}
 
@@ -860,6 +847,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 				st.ExitCode = uint32(status.Status)
 				st.ExitedAt = time.Now()
 				st.Status = exitedInit
+				sdNotify(ctx, notifyStatus(st.Status), notifyErrno(st.ExitCode), notifyMainPID(st.Pid))
 			default:
 				var status unix.WaitStatus
 				// Double check if the process is still running.
@@ -868,7 +856,9 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 					st.ExitCode = uint32(status.ExitStatus())
 					st.ExitedAt = time.Now()
 					st.Status = exitedInit
+					sdNotify(ctx, notifyStatus(exitedInit), notifyErrno(st.ExitCode), notifyMainPID(st.Pid))
 				} else {
+					sdNotify(ctx, daemon.SdNotifyReady, notifyMainPID(st.Pid))
 					log.G(ctx).Debug("Process is up!")
 				}
 			}
@@ -877,6 +867,24 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 	}
 
 	return writeFile()
+}
+
+func notifyMainPID(pid uint32) string {
+	return fmt.Sprintf("MAINPID=%d", pid)
+}
+
+func notifyStatus(status string) string {
+	return fmt.Sprintf("STATUS=%s", status)
+}
+
+func notifyErrno(errno uint32) string {
+	return fmt.Sprintf("ERRNO=%d", errno)
+}
+
+func sdNotify(ctx context.Context, status ...string) {
+	if _, err := daemon.SdNotify(false, strings.Join(status, "\n")); err != nil {
+		log.G(ctx).WithError(err).Error("failed to notify systemd")
+	}
 }
 
 type cgMode cgroups.CGMode
