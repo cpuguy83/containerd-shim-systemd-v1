@@ -210,10 +210,7 @@ void setcgroup(void)
 
 int handle_pty(void)
 {
-
-
     pthread_t stdin_copy_thr_id, stdout_copy_thr_id, tty_op_thr_id;
-
     struct copy_data *stdin_copy = (struct copy_data *)malloc(sizeof(struct copy_data));
     stdin_copy->w = tty_fd;
     stdin_copy->r = 0;
@@ -267,6 +264,7 @@ int tty_recv_fd(char *sock_path)
 
     char *dir = strdup(sock_path);
     int err = mkdir_all(dirname(dir));
+    free(dir);
     if (err < 0)
     {
         close(sock_fd);
@@ -357,7 +355,6 @@ void pty_main(void)
 
     setcgroup();
     lmsg("cgroup set");
-
 
     tty_fd = tty_recv_fd(sock_path);
     if (tty_fd < 0)
