@@ -90,11 +90,12 @@ test-image: build-test-image
 .PHONY: $(OUTPUT)/.test-image-cid
 .INTERMEDIATE: $(OUTPUT)/.test-image-cid
 $(OUTPUT)/.test-image-cid:
+	set -e;
 	if [ -f "$@" ]; then docker rm -f $$(cat $@) &> /dev/null; rm -f $(@); fi; \
 	rm -f $(_TEST_IMG_IIDFILE) 2> /dev/null; \
 	mkdir -p $(OUTPUT); \
 	BUILD_ARGS="--build-arg CONTAINERD_REPO --build-arg CONTAINERD_COMMIT"; \
-	$(MAKE) test-image EXTRA_TEST_IMAGE_FLAGS="$(EXTRA_TEST_IMAGE_FLAGS) -d --cidfile=$(@)" EXTRA_BUILD_FLAGS="--builder=default $${BUILD_ARGS} $(EXTRA_BUILD_FLAGS) --iidfile=$(_TEST_IMG_IIDFILE)" TEST_IMG_IIDFILE=$(_TEST_IMG_IIDFILE); \
+	$(MAKE) test-image EXTRA_TEST_IMAGE_FLAGS="$(EXTRA_TEST_IMAGE_FLAGS) -d --cidfile=$(@)" EXTRA_BUILD_FLAGS="--builder=default $${BUILD_ARGS} $(EXTRA_BUILD_FLAGS) --iidfile=$(_TEST_IMG_IIDFILE)" TEST_IMG_IIDFILE=$(_TEST_IMG_IIDFILE) && \
 	rm -f $(_TEST_IMG_IIDFILE)
 
 test-shell: $(OUTPUT)/.test-image-cid
