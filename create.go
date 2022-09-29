@@ -817,9 +817,12 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		st.ExitedAt = time.Now()
 		st.Status = exitedInit
 		st.Pid = uint32(cmd.Process.Pid)
+		err = writeFile()
 		sdNotify(ctx, notifyErrno(st.ExitCode), notifyStatus(st.Status))
-		return writeFile()
+		return err
 	}
+
+	var notify func()
 
 	select {
 	case <-ctx.Done():
@@ -829,7 +832,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		st.ExitedAt = time.Now()
 		st.Pid = status.Pid
 		st.Status = "exited"
-		sdNotify(ctx, notifyErrno(st.ExitCode), notifyStatus(st.Status), notifyMainPID(st.Pid))
+		notify = func() { sdNotify(ctx, notifyErrno(st.ExitCode), notifyStatus(st.Status), notifyMainPID(st.Pid)) }
 	case pid := <-chPid:
 		st.Pid = uint32(pid)
 		if !noReap {
@@ -847,7 +850,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 				st.ExitCode = uint32(status.Status)
 				st.ExitedAt = time.Now()
 				st.Status = exitedInit
-				sdNotify(ctx, notifyStatus(st.Status), notifyErrno(st.ExitCode), notifyMainPID(st.Pid))
+				notify = func() { sdNotify(ctx, notifyStatus(st.Status), notifyErrno(st.ExitCode), notifyMainPID(st.Pid)) }
 			default:
 				var status unix.WaitStatus
 				// Double check if the process is still running.
@@ -856,17 +859,23 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 					st.ExitCode = uint32(status.ExitStatus())
 					st.ExitedAt = time.Now()
 					st.Status = exitedInit
-					sdNotify(ctx, notifyStatus(exitedInit), notifyErrno(st.ExitCode), notifyMainPID(st.Pid))
+					notify = func() { sdNotify(ctx, notifyStatus(exitedInit), notifyErrno(st.ExitCode), notifyMainPID(st.Pid)) }
 				} else {
-					sdNotify(ctx, daemon.SdNotifyReady, notifyMainPID(st.Pid))
-					log.G(ctx).Debug("Process is up!")
+					notify = func() {
+						sdNotify(ctx, daemon.SdNotifyReady, notifyMainPID(st.Pid))
+						log.G(ctx).Debug("Process is up!")
+					}
 				}
 			}
 
 		}
 	}
 
-	return writeFile()
+	err := writeFile()
+	if notify != nil {
+		notify()
+	}
+	return err
 }
 
 func notifyMainPID(pid uint32) string {
