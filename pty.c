@@ -14,12 +14,12 @@
 #include "systemd.h"
 #include "log.h"
 
-
 int op_resize = 1;
 int sock_fd;
 int tty_fd;
 
-struct copy_data {
+struct copy_data
+{
     int w;
     int r;
 };
@@ -28,7 +28,7 @@ void *copy(void *args)
 {
     struct copy_data *cp;
 
-    cp = (struct copy_data*)args;
+    cp = (struct copy_data *)args;
 
     char buf[1024];
     int n;
@@ -39,15 +39,15 @@ void *copy(void *args)
     return 0;
 }
 
-
 void handle_tty_op_conn(int fd)
 {
     int nr, nw;
     char buf[256];
 
-    while (1) {
+    while (1)
+    {
         nr = read(fd, buf, sizeof(buf));
-        if (nr < 0 )
+        if (nr < 0)
         {
             lerror("read");
             close(fd);
@@ -78,7 +78,7 @@ void handle_tty_op_conn(int fd)
         if (err < 0)
         {
             char *msg = "parse error";
-            nw = write(fd, sizeof(msg)+msg, sizeof(msg));
+            nw = write(fd, msg, sizeof(msg));
             if (nw < 0)
             {
                 lerror("write");
@@ -102,13 +102,13 @@ void handle_tty_op_conn(int fd)
             }
         }
 
-        struct winsize* ws = (struct winsize*)malloc(sizeof(struct winsize));
+        struct winsize *ws = (struct winsize *)malloc(sizeof(struct winsize));
         ws->ws_col = w;
         ws->ws_row = h;
 
         err = ioctl(tty_fd, TIOCSWINSZ, ws);
         free(ws);
-        if (err < 0 )
+        if (err < 0)
         {
             lerror("ioctl TIOCSWINSZ");
             char *msg = "error setting win size";
@@ -123,7 +123,8 @@ void handle_tty_op_conn(int fd)
 
         // Send ack
         nw = write(fd, "0", 1);
-        if (nw < 1) {
+        if (nw < 1)
+        {
             lerror("write");
             close(fd);
             return;
@@ -301,7 +302,9 @@ int tty_recv_fd(char *sock_path)
     if (err < 0)
     {
         lerror("sd_notify");
-    } else {
+    }
+    else
+    {
         lmsg("sd_notify READY=1");
     }
 
@@ -337,7 +340,6 @@ int tty_recv_fd(char *sock_path)
     return fd;
 }
 
-
 void pty_main(void)
 {
     char *val = getenv("_TTY_HANDSHAKE");
@@ -371,7 +373,8 @@ void pty_main(void)
         exit(1);
     }
 
-    if (handle_pty() < 0) {
+    if (handle_pty() < 0)
+    {
         lerror("handle_pty");
         exit(3);
     }
