@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
+	"iter"
 	"sync"
 	"time"
 
 	"github.com/containerd/containerd/log"
-	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
 )
 
@@ -29,25 +29,24 @@ type connected interface {
 // after a reconnect, resyncs tracked units to recover anything missed while
 // disconnected.
 //
-// It deliberately uses SetPropertiesSubscriber and NOT SetSubStateSubscriber:
-// go-systemd's substate subscriber calls GetUnitPathProperties (a GetAll) for
-// every unit signal seen on the connection. On the direct private bus that read
-// triggers UnitNew/UnitRemoved feedback which, compounded per event, pegs a CPU
-// core (the historical "event storm", commit 910fe5a). The properties
-// subscriber never reads, so dispatch performs no GetAll on our behalf; we do a
-// single targeted read only for our own units, only when they exit.
+// The reactor reads unit PropertiesChanged signals off a dedicated connection
+// itself (see unitsignals.go) rather than via go-systemd's Set*Subscriber, which
+// races on its subscriber field and reads unit properties per signal. Reading
+// raw signals never reads properties, so it cannot trigger the historical
+// GetAll feedback storm; a single targeted read happens only for our own units,
+// only when they exit.
 func (s *Service) watchEvents(ctx context.Context) {
 	go s.runEventReactor(ctx)
 }
 
-// runEventReactor owns a dedicated private connection for the subscription so it
-// can be re-dialed if the connection drops, without disturbing the shared
+// runEventReactor owns a dedicated private connection for the signal stream so
+// it can be re-dialed if the connection drops, without disturbing the shared
 // connection used for method calls (which every Process references directly).
 //
 // The work queue and its worker pool live for the whole reactor, while the
-// connection (and thus the subscription) is re-established on drop. Each time a
-// subscription comes up the reactor resyncs -- enqueuing every tracked unit --
-// so a unit that exited while the connection was down is still reconciled. That
+// connection (and thus the signal stream) is re-established on drop. Each time a
+// connection comes up the reactor resyncs -- enqueuing every tracked unit -- so
+// a unit that exited while the connection was down is still reconciled. That
 // resync is the missed-event backstop that replaces the old periodic scan.
 func (s *Service) runEventReactor(ctx context.Context) {
 	const retry = time.Second
@@ -61,7 +60,7 @@ func (s *Service) runEventReactor(ctx context.Context) {
 			return
 		}
 
-		conn, err := systemd.NewSystemdConnectionContext(ctx)
+		conn, err := dialSignalBus(ctx)
 		if err != nil {
 			log.G(ctx).WithError(err).Warn("event reactor: connect failed; will retry")
 			if sleepCtx(ctx, retry) {
@@ -73,16 +72,15 @@ func (s *Service) runEventReactor(ctx context.Context) {
 		runCtx, cancel := context.WithCancel(ctx)
 		go watchConnection(runCtx, cancel, conn)
 
-		updates := make(chan *systemd.PropertiesUpdate, 256)
-		errs := make(chan error, 256)
-		conn.SetPropertiesSubscriber(updates, errs)
+		sigs := make(chan *dbus.Signal, signalBufferSize)
+		conn.Signal(sigs)
 
-		// Recover any exit missed while we had no subscription. At startup this
-		// is a no-op because nothing is tracked yet; after a reconnect it catches
-		// units that exited during the gap.
+		// Recover any exit missed while we had no connection. At startup this is a
+		// no-op because nothing is tracked yet; after a reconnect it catches units
+		// that exited during the gap.
 		r.resync()
 
-		r.consume(runCtx, updates, errs)
+		r.consume(runCtx, unitUpdates(runCtx, sigs))
 
 		cancel()
 		conn.Close()
@@ -90,15 +88,15 @@ func (s *Service) runEventReactor(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		log.G(ctx).Warn("event reactor: subscription ended, re-dialing")
+		log.G(ctx).Warn("event reactor: signal stream ended, re-dialing")
 		if sleepCtx(ctx, retry) {
 			return
 		}
 	}
 }
 
-// watchConnection cancels the run context when the subscription connection drops
-// (Conn.Connected() reports false), so runEventReactor can re-dial.
+// watchConnection cancels the run context when the signal connection drops
+// (Connected() reports false), so runEventReactor can re-dial.
 func watchConnection(ctx context.Context, onLost func(), conn connected) {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
@@ -185,45 +183,21 @@ func (r *eventReactor) resync() {
 	}
 }
 
-// consume is the informer loop: it drains the property-change stream until ctx
-// is cancelled or the channels close, enqueuing exit transitions. It does only
+// consume is the informer loop: it ranges the decoded update stream until ctx
+// is cancelled or the stream ends, enqueuing exit transitions. It does only
 // cheap, I/O-free work, so the informer never blocks on a systemd read -- one
-// slow or hung reconcile cannot stall event intake or let the subscription's
-// bounded channel back up and drop updates. The work queue coalesces duplicate
-// events for a unit and never reconciles the same unit on two workers at once,
-// so multiple events for the same unit cannot interfere.
-func (r *eventReactor) consume(ctx context.Context, updates <-chan *systemd.PropertiesUpdate, errs <-chan error) {
-	for {
-		select {
-		case <-ctx.Done():
-			log.G(ctx).WithError(ctx.Err()).Info("Exiting unit event loop")
-			return
-		case err, ok := <-errs:
-			if !ok {
-				return
-			}
-			if err != nil {
-				log.G(ctx).WithError(err).Debug("systemd property subscription error")
-			}
-		case u, ok := <-updates:
-			if !ok {
-				return
-			}
-			enqueueIfExit(r.q, r.units, u)
-		}
+// slow or hung reconcile cannot stall event intake or let the signal channel
+// back up and drop updates. The work queue coalesces duplicate events for a unit
+// and never reconciles the same unit on two workers at once, so multiple events
+// for the same unit cannot interfere.
+//
+// Taking an iter.Seq decouples the informer from the signal source. Context
+// cancellation is handled by the sequence, which stops yielding and returns.
+func (r *eventReactor) consume(ctx context.Context, updates iter.Seq[unitUpdate]) {
+	for u := range updates {
+		enqueueIfExit(r.q, r.units, u)
 	}
-}
-
-// reactToUnitEvents wires a reactor's worker pool and informer loop for a single
-// subscription, blocking until ctx is cancelled or the channels close. It does
-// not resync (production drives that from runEventReactor on connect); it exists
-// so the informer/worker behaviour can be exercised in tests without a
-// connection.
-func reactToUnitEvents(ctx context.Context, units processLookup, updates <-chan *systemd.PropertiesUpdate, errs <-chan error) {
-	r := newEventReactor(units)
-	stop := r.start(ctx)
-	defer stop()
-	r.consume(ctx, updates, errs)
+	log.G(ctx).WithError(ctx.Err()).Info("Exiting unit event loop")
 }
 
 // enqueueIfExit is the informer predicate: it enqueues a unit for reconciliation
@@ -240,15 +214,15 @@ func reactToUnitEvents(ctx context.Context, units processLookup, updates <-chan 
 //   - the leading pre-start inactive/dead is still enqueued (the process is not
 //     yet exited), but reconcileUnit/LoadState is level-driven and no-ops for a
 //     not-yet-started process, so it cannot produce a spurious exit.
-func enqueueIfExit(q *unitWorkQueue, units processLookup, u *systemd.PropertiesUpdate) {
+func enqueueIfExit(q *unitWorkQueue, units processLookup, u unitUpdate) {
 	if !unitEventIsExit(u.Changed) {
 		return
 	}
-	p := units.Get(u.UnitName)
+	p := units.Get(u.Name)
 	if p == nil || p.ProcessState().Exited() {
 		return
 	}
-	q.Add(u.UnitName)
+	q.Add(u.Name)
 }
 
 // reconcileWorker drains the queue, reconciling one unit at a time until the

@@ -10,11 +10,10 @@ import (
 	eventsapi "github.com/containerd/containerd/api/events"
 )
 
-// These tests exercise the real initProcess/execProcess SetState so the
-// exactly-once TaskExit guarantee is verified against the production emit path,
-// not a fake. The scan loop and the D-Bus reconciler both funnel exits through
-// SetState, so a single exit must yield a single TaskExit even when observed
-// more than once or concurrently.
+// These tests exercise the real initProcess/execProcess SetState, so the
+// exactly-once TaskExit guarantee is verified against the actual emit path, not
+// a fake. Every observed exit funnels through SetState, so a single exit must
+// yield a single TaskExit even when observed more than once or concurrently.
 
 func TestInitProcessTaskExitIsEmittedOnce(t *testing.T) {
 	exited := pState{Pid: 42, ExitCode: 1}

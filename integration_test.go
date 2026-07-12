@@ -17,7 +17,8 @@ import (
 // These tests exercise the real event reactor against a live systemd manager.
 // They use the system private bus when run as root (CI) and otherwise fall back
 // to the per-user systemd instance's private socket, so they can run
-// unprivileged during development. Run with: go test -tags integration ./...
+// unprivileged during development. They skip in -short mode and when no private
+// bus is reachable.
 
 func TestReactorReactsToRealExit(t *testing.T) {
 	ctx := context.Background()
@@ -34,13 +35,14 @@ func TestReactorReactsToRealExit(t *testing.T) {
 		}}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
 
-		updates := make(chan *systemd.PropertiesUpdate, 256)
-		errs := make(chan error, 256)
-		conn.SetPropertiesSubscriber(updates, errs)
+		sigConn := dialSignalConn(t, ctx, path)
+		defer sigConn.Close()
+		sigs := make(chan *dbus.Signal, signalBufferSize)
+		sigConn.Signal(sigs)
 
 		rctx, cancel := context.WithCancel(ctx)
 		defer cancel()
-		go reactToUnitEvents(rctx, units, updates, errs)
+		go reactToUnitEvents(rctx, units, unitUpdates(rctx, sigs))
 
 		startTransient(t, ctx, conn, unit, []string{"/bin/sh", "-c", "exit 3"})
 
@@ -58,7 +60,7 @@ func TestReactorReactsToRealExit(t *testing.T) {
 	})
 }
 
-func TestPropertiesSubscriberDoesNotAmplify(t *testing.T) {
+func TestSignalConsumerDoesNotAmplify(t *testing.T) {
 	ctx := context.Background()
 	path := privateBusPath(t)
 	reg := newUnitRegistry(t, path)
@@ -69,18 +71,17 @@ func TestPropertiesSubscriberDoesNotAmplify(t *testing.T) {
 	conn := dialPrivate(t, ctx, path)
 	defer conn.Close()
 
-	// New design: properties subscriber only, no GetAll in the subscriber.
-	updates := make(chan *systemd.PropertiesUpdate, 1024)
-	errs := make(chan error, 1024)
-	conn.SetPropertiesSubscriber(updates, errs)
+	// Run our raw signal consumer during the churn: it decodes unit updates but
+	// never reads unit properties, so unlike go-systemd's substate subscriber it
+	// cannot feed back UnitNew/UnitRemoved and amplify the signal stream.
+	sigConn := dialSignalConn(t, ctx, path)
+	defer sigConn.Close()
+	sigs := make(chan *dbus.Signal, 1024)
+	sigConn.Signal(sigs)
+	cctx, ccancel := context.WithCancel(ctx)
+	defer ccancel()
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-updates:
-			case <-errs:
-			}
+		for range unitUpdates(cctx, sigs) {
 		}
 	}()
 
@@ -106,11 +107,11 @@ func TestPropertiesSubscriberDoesNotAmplify(t *testing.T) {
 
 	afterWorkload := mon.total()
 
-	// Storm signature: signals keep flooding after the workload stops. With the
-	// properties subscriber (no GetAll feedback) the bus goes quiet almost
-	// immediately, so awaitQuiet returns fast on success; a self-amplifying
-	// subscriber never reaches a quiet step and this only returns false after
-	// the full timeout (a failing test is allowed to take longer).
+	// Storm signature: signals keep flooding after the workload stops. With a
+	// consumer that never reads properties the bus goes quiet almost immediately,
+	// so awaitQuiet returns fast on success; a self-amplifying consumer never
+	// reaches a quiet step and this only returns false after the full timeout (a
+	// failing test is allowed to take longer).
 	if !awaitQuiet(10*time.Second, 100*time.Millisecond, 50, mon.total) {
 		t.Fatalf("bus never went quiet after workload; likely event amplification (%d signals since workload)", mon.total()-afterWorkload)
 	}
@@ -252,16 +253,25 @@ type signalMonitor struct {
 	count int64
 }
 
-func newSignalMonitor(t *testing.T, ctx context.Context, path string) *signalMonitor {
+// dialSignalConn opens a raw godbus connection to the given private bus for
+// receiving signals: authenticate as the current uid and skip Hello, since the
+// private bus talks straight to systemd with no message bus.
+func dialSignalConn(t *testing.T, ctx context.Context, path string) *dbus.Conn {
 	t.Helper()
 	c, err := dbus.Dial(path, dbus.WithContext(ctx))
 	if err != nil {
-		t.Fatalf("dial monitor: %v", err)
+		t.Fatalf("dial signal conn: %v", err)
 	}
 	if err := c.Auth([]dbus.Auth{dbus.AuthExternal(strconv.Itoa(os.Getuid()))}); err != nil {
 		c.Close()
-		t.Fatalf("auth monitor: %v", err)
+		t.Fatalf("auth signal conn: %v", err)
 	}
+	return c
+}
+
+func newSignalMonitor(t *testing.T, ctx context.Context, path string) *signalMonitor {
+	t.Helper()
+	c := dialSignalConn(t, ctx, path)
 	m := &signalMonitor{conn: c}
 	ch := make(chan *dbus.Signal, 4096)
 	c.Signal(ch)
