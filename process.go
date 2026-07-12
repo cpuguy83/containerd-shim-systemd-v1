@@ -30,23 +30,18 @@ type processManager struct {
 	ls map[string]Process
 }
 
-func newUnitManager(conn *systemd.Conn) *unitManager {
-	um := &unitManager{idx: make(map[string]Process), sd: conn}
-	um.cond = sync.NewCond(&um.mu)
-	return um
+func newUnitManager() *unitManager {
+	return &unitManager{idx: make(map[string]Process)}
 }
 
 type unitManager struct {
-	sd   *systemd.Conn
-	mu   sync.Mutex
-	cond *sync.Cond
-	idx  map[string]Process
+	mu  sync.Mutex
+	idx map[string]Process
 }
 
 func (m *unitManager) Add(p Process) {
 	m.mu.Lock()
 	m.idx[p.Name()] = p
-	m.cond.Broadcast()
 	m.mu.Unlock()
 }
 
@@ -62,6 +57,17 @@ func (m *unitManager) Get(name string) Process {
 	p := m.idx[name]
 	m.mu.Unlock()
 	return p
+}
+
+// Names returns the unit names of every currently tracked process.
+func (m *unitManager) Names() []string {
+	m.mu.Lock()
+	names := make([]string, 0, len(m.idx))
+	for name := range m.idx {
+		names = append(names, name)
+	}
+	m.mu.Unlock()
+	return names
 }
 
 func (m *processManager) Add(id string, p Process) error {
@@ -190,7 +196,7 @@ type process struct {
 }
 
 // claimExitNotification returns true for exactly one caller: the first to reach
-// it. Every state path (the periodic scan, the D-Bus event reconciler, and the
+// it. Every state path (the D-Bus event reconciler, the reconnect resync, and the
 // start/delete helpers) funnels an exit through SetState, but the resulting
 // TaskExit must be emitted only once no matter how many of them observe the exit
 // concurrently. Callers gate emission on st.Exited() && p.claimExitNotification().

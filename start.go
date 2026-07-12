@@ -125,7 +125,6 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "Environment", "STDIN_FIFO="+p.Stdin),
 		unit.NewUnitOption(svc, "Environment", "STDOUT_FIFO="+p.Stdout),
 		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
-		unit.NewUnitOption(svc, "Environment", "DAEMON_UNIT_NAME="+os.Getenv("UNIT_NAME")),
 		unit.NewUnitOption(svc, "Environment", "UNIT_NAME=%n"), // %n is replaced with the unit name by systemd
 		unit.NewUnitOption(svc, "Environment", "EXIT_STATE_PATH="+p.exitStatePath()),
 	}
@@ -183,7 +182,6 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "Environment", "STDIN_FIFO="+p.Stdin),
 		unit.NewUnitOption(svc, "Environment", "STDOUT_FIFO="+p.Stdout),
 		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
-		unit.NewUnitOption(svc, "Environment", "DAEMON_UNIT_NAME="+os.Getenv("UNIT_NAME")),
 		unit.NewUnitOption(svc, "Environment", "UNIT_NAME=%n"), // %n is replaced with the unit name by systemd
 		unit.NewUnitOption(svc, "Environment", "EXIT_STATE_PATH="+p.exitStatePath()),
 	}

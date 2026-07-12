@@ -1,5 +1,3 @@
-//go:build integration
-
 package main
 
 import (
@@ -28,7 +26,8 @@ func TestReactorReactsToRealExit(t *testing.T) {
 	defer conn.Close()
 
 	t.Run("a real unit exit is observed and handled exactly once", func(t *testing.T) {
-		unit := uniqueUnit("react-once")
+		reg := newUnitRegistry(t, path)
+		unit := reg.unit("react-once")
 		p := &fakeProcess{name: unit, loadStateFn: func(f *fakeProcess) error {
 			f.state = pState{ExitCode: 3, ExitedAt: time.Now()}
 			return nil
@@ -44,7 +43,6 @@ func TestReactorReactsToRealExit(t *testing.T) {
 		go reactToUnitEvents(rctx, units, updates, errs)
 
 		startTransient(t, ctx, conn, unit, []string{"/bin/sh", "-c", "exit 3"})
-		defer resetUnit(ctx, conn, unit)
 
 		if !eventually(10*time.Second, 10*time.Millisecond, func() bool { return p.LoadStateCalls() >= 1 }) {
 			t.Fatal("reactor never observed the unit exit")
@@ -63,6 +61,7 @@ func TestReactorReactsToRealExit(t *testing.T) {
 func TestPropertiesSubscriberDoesNotAmplify(t *testing.T) {
 	ctx := context.Background()
 	path := privateBusPath(t)
+	reg := newUnitRegistry(t, path)
 
 	mon := newSignalMonitor(t, ctx, path)
 	defer mon.close()
@@ -90,7 +89,7 @@ func TestPropertiesSubscriberDoesNotAmplify(t *testing.T) {
 	for r := 0; r < rounds; r++ {
 		var wg sync.WaitGroup
 		for i := 0; i < per; i++ {
-			unit := uniqueUnit(fmt.Sprintf("amp-%d-%d", r, i))
+			unit := reg.unit(fmt.Sprintf("amp-%d-%d", r, i))
 			ch := make(chan string, 1)
 			props := []systemd.Property{
 				systemd.PropExecStart([]string{"/bin/true"}, false),
@@ -137,8 +136,16 @@ func awaitQuiet(timeout, step time.Duration, maxPerStep int64, total func() int6
 
 // --- integration helpers ---
 
+// privateBusPath returns the address of a systemd private bus to test against,
+// or skips the test when one is not available. It skips in -short mode (these
+// tests talk to a real systemd and create transient units) and when no private
+// bus is reachable: the system bus when running as root, otherwise the caller's
+// user bus.
 func privateBusPath(t *testing.T) string {
 	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration test in -short mode")
+	}
 	if os.Geteuid() == 0 {
 		if _, err := os.Stat("/run/systemd/private"); err == nil {
 			return "unix:path=/run/systemd/private"
@@ -157,7 +164,15 @@ func privateBusPath(t *testing.T) string {
 
 func dialPrivate(t *testing.T, ctx context.Context, path string) *systemd.Conn {
 	t.Helper()
-	conn, err := systemd.NewConnection(func() (*dbus.Conn, error) {
+	conn, err := dialPrivateConn(ctx, path)
+	if err != nil {
+		t.Fatalf("dial private bus: %v", err)
+	}
+	return conn
+}
+
+func dialPrivateConn(ctx context.Context, path string) (*systemd.Conn, error) {
+	return systemd.NewConnection(func() (*dbus.Conn, error) {
 		c, err := dbus.Dial(path, dbus.WithContext(ctx))
 		if err != nil {
 			return nil, err
@@ -168,10 +183,47 @@ func dialPrivate(t *testing.T, ctx context.Context, path string) *systemd.Conn {
 		}
 		return c, nil
 	})
-	if err != nil {
-		t.Fatalf("dial private bus: %v", err)
-	}
-	return conn
+}
+
+// unitRegistry tracks the transient units a test creates and resets them all on
+// cleanup, using its own short-lived connection. Registering via t.Cleanup means
+// units are reset even when a test fails or panics, so the harness never leaves
+// failed shim-itest-* units behind on the host bus.
+type unitRegistry struct {
+	path  string
+	mu    sync.Mutex
+	names []string
+}
+
+func newUnitRegistry(t *testing.T, path string) *unitRegistry {
+	r := &unitRegistry{path: path}
+	t.Cleanup(func() {
+		r.mu.Lock()
+		names := r.names
+		r.mu.Unlock()
+		if len(names) == 0 {
+			return
+		}
+		conn, err := dialPrivateConn(context.Background(), path)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for _, n := range names {
+			conn.StopUnitContext(context.Background(), n, "replace", nil)
+			conn.ResetFailedUnitContext(context.Background(), n)
+		}
+	})
+	return r
+}
+
+// unit returns a fresh unique unit name and registers it for cleanup.
+func (r *unitRegistry) unit(tag string) string {
+	name := uniqueUnit(tag)
+	r.mu.Lock()
+	r.names = append(r.names, name)
+	r.mu.Unlock()
+	return name
 }
 
 func uniqueUnit(tag string) string {
@@ -193,11 +245,6 @@ func startTransient(t *testing.T, ctx context.Context, conn *systemd.Conn, name 
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timed out starting unit %s", name)
 	}
-}
-
-func resetUnit(ctx context.Context, conn *systemd.Conn, name string) {
-	conn.StopUnitContext(ctx, name, "replace", nil)
-	conn.ResetFailedUnitContext(ctx, name)
 }
 
 type signalMonitor struct {

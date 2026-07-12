@@ -472,6 +472,67 @@ func TestReactToUnitEvents(t *testing.T) {
 	})
 }
 
+func TestEventReactorResync(t *testing.T) {
+	const running = "io-containerd-systemd-ns-run-init.service"
+	const missed = "io-containerd-systemd-ns-missed-init.service"
+
+	t.Run("resync recovers an exit that arrived while disconnected", func(t *testing.T) {
+		// The unit already exited in systemd, but no event was delivered (the
+		// connection was down). resync must reconcile it and pick up the exit.
+		p := &fakeProcess{name: missed, loadStateFn: func(f *fakeProcess) error {
+			f.setState(pState{ExitCode: 2, ExitedAt: time.Now()})
+			return nil
+		}}
+		units := &fakeLookup{m: map[string]Process{missed: p}}
+
+		r := newEventReactor(units)
+		stop := r.start(context.Background())
+		defer stop()
+
+		r.resync()
+
+		if !eventually(2*time.Second, time.Millisecond, func() bool { return p.ProcessState().Exited() }) {
+			t.Fatal("resync did not reconcile the missed exit")
+		}
+	})
+
+	t.Run("resync reconciles every tracked unit", func(t *testing.T) {
+		a := &fakeProcess{name: running}
+		b := &fakeProcess{name: missed}
+		units := &fakeLookup{m: map[string]Process{running: a, missed: b}}
+
+		r := newEventReactor(units)
+		stop := r.start(context.Background())
+		defer stop()
+
+		r.resync()
+
+		if !eventually(2*time.Second, time.Millisecond, func() bool {
+			return a.LoadStateCalls() == 1 && b.LoadStateCalls() == 1
+		}) {
+			t.Fatalf("expected each tracked unit reconciled once, got a=%d b=%d", a.LoadStateCalls(), b.LoadStateCalls())
+		}
+	})
+
+	t.Run("resync does not re-read an already-exited unit", func(t *testing.T) {
+		p := &fakeProcess{name: missed, state: pState{ExitCode: 1, ExitedAt: time.Now()}}
+		units := &fakeLookup{m: map[string]Process{missed: p}}
+
+		r := newEventReactor(units)
+		stop := r.start(context.Background())
+		defer stop()
+
+		r.resync()
+
+		// Give a reconcile the chance to (wrongly) run, then assert it didn't read.
+		if got := stableFor(time.Second, 200*time.Millisecond, time.Millisecond, func() int64 {
+			return int64(p.LoadStateCalls())
+		}); got != 0 {
+			t.Fatalf("expected no read for an already-exited unit, got %d", got)
+		}
+	})
+}
+
 // --- helpers ---
 
 // eventually polls cond until it returns true or timeout elapses, sleeping step
@@ -536,6 +597,16 @@ func (l *fakeLookup) Get(name string) Process {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.m[name]
+}
+
+func (l *fakeLookup) Names() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	names := make([]string, 0, len(l.m))
+	for name := range l.m {
+		names = append(names, name)
+	}
+	return names
 }
 
 func (l *fakeLookup) remove(name string) {
