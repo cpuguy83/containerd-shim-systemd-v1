@@ -180,12 +180,28 @@ type process struct {
 	runc    *runc.Runc
 	ttyConn net.Conn
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	state   pState
-	deleted bool
+	mu           sync.Mutex
+	cond         *sync.Cond
+	state        pState
+	deleted      bool
+	exitNotified bool
 
 	shimCgroup string
+}
+
+// claimExitNotification returns true for exactly one caller: the first to reach
+// it. Every state path (the periodic scan, the D-Bus event reconciler, and the
+// start/delete helpers) funnels an exit through SetState, but the resulting
+// TaskExit must be emitted only once no matter how many of them observe the exit
+// concurrently. Callers gate emission on st.Exited() && p.claimExitNotification().
+func (p *process) claimExitNotification() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.exitNotified {
+		return false
+	}
+	p.exitNotified = true
+	return true
 }
 
 func (p *process) ProcessState() pState {
@@ -296,7 +312,7 @@ func (p *initProcess) pidFile() string {
 
 func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 	st := p.process.SetState(ctx, state)
-	if st.Exited() {
+	if st.Exited() && p.claimExitNotification() {
 		log.G(ctx).Debugf("EXITED: %s %s", p.Name(), st)
 		p.execs.Each(func(exec Process) {
 			if err := exec.LoadState(ctx); err != nil {
@@ -431,7 +447,7 @@ func (p *execProcess) getPid(ctx context.Context) (uint32, error) {
 
 func (p *execProcess) SetState(ctx context.Context, state pState) pState {
 	st := p.process.SetState(ctx, state)
-	if st.Exited() {
+	if st.Exited() && p.claimExitNotification() {
 		p.cond.Broadcast()
 		p.parent.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
 			ContainerID: p.parent.id,

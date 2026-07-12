@@ -144,6 +144,9 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		p.systemd.KillUnitContext(ctx, unitName(p.ns, p.id, "tty"), 9)
 	}
 
+	// By this point waitForExit has returned, so p.state is Exited(): the unit
+	// event reactor's Exited() guard will short-circuit before any read, so
+	// unloading the unit here cannot provoke a not-found GetAll feedback loop.
 	if err := os.Remove("/run/systemd/system/" + p.Name()); err != nil {
 		return pState{}, err
 	}

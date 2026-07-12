@@ -467,6 +467,10 @@ func serve(ctx context.Context, cfg Config) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// React to systemd unit state changes over D-Bus immediately, in parallel
+	// with the periodic reconcile started by watchUnits above.
+	shm.watchEvents(ctx)
+
 	listeners, err := activation.Listeners()
 	if err != nil {
 		return err
