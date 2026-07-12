@@ -1,4 +1,4 @@
-ARG GO_VERSION=1.17
+ARG GO_VERSION=1.26
 FROM golang:${GO_VERSION} AS go
 
 FROM ubuntu:18.04 AS build

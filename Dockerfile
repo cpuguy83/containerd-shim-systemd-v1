@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 
-FROM golang:1.18 AS go
+FROM golang:1.26 AS go
 
 FROM buildpack-deps:bullseye as base
 ENV GOROOT=/usr/local/go GOPATH=/go PATH=/go/bin:/usr/local/go/bin:$PATH
