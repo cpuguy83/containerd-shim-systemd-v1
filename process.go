@@ -31,43 +31,53 @@ type processManager struct {
 }
 
 func newUnitManager() *unitManager {
-	return &unitManager{idx: make(map[string]Process)}
+	return &unitManager{byPath: make(map[string]Process)}
 }
 
 type unitManager struct {
-	mu  sync.Mutex
-	idx map[string]Process
+	mu sync.Mutex
+	// byPath maps a unit's systemd-escaped D-Bus object-path base to its
+	// process. The event reactor resolves incoming signals through this index so
+	// it never has to unescape a name on the signal path; the escaping happens
+	// once here, when a unit is added or removed.
+	byPath map[string]Process
 }
 
 func (m *unitManager) Add(p Process) {
 	m.mu.Lock()
-	m.idx[p.Name()] = p
+	m.byPath[p.PathName()] = p
 	m.mu.Unlock()
 }
 
 func (m *unitManager) Delete(p Process) {
 	m.mu.Lock()
-	delete(m.idx, p.Name())
+	delete(m.byPath, p.PathName())
 	m.mu.Unlock()
 	log.G(context.TODO()).Debugf("deleted unit %s", p.Name())
 }
 
-func (m *unitManager) Get(name string) Process {
+// GetByPath resolves a process from a systemd unit object-path base (the escaped
+// unit name carried by a D-Bus signal), without unescaping it. It returns nil
+// for units the shim does not track -- the private bus broadcasts every unit's
+// signals, so most lookups miss.
+func (m *unitManager) GetByPath(pathBase string) Process {
 	m.mu.Lock()
-	p := m.idx[name]
+	p := m.byPath[pathBase]
 	m.mu.Unlock()
 	return p
 }
 
-// Names returns the unit names of every currently tracked process.
-func (m *unitManager) Names() []string {
+// Paths returns the systemd-escaped object-path base of every tracked unit --
+// the keys GetByPath accepts. The reactor uses it to resync all tracked units
+// after a reconnect.
+func (m *unitManager) Paths() []string {
 	m.mu.Lock()
-	names := make([]string, 0, len(m.idx))
-	for name := range m.idx {
-		names = append(names, name)
+	paths := make([]string, 0, len(m.byPath))
+	for p := range m.byPath {
+		paths = append(paths, p)
 	}
 	m.mu.Unlock()
-	return names
+	return paths
 }
 
 func (m *processManager) Add(id string, p Process) error {
@@ -111,6 +121,9 @@ type Process interface {
 	Kill(context.Context, int, bool) error
 	Pid() uint32
 	Name() string
+	// PathName returns the unit's systemd-escaped D-Bus object-path base, the
+	// identifier the event reactor matches incoming signals against.
+	PathName() string
 	LoadState(context.Context) error
 	SetState(context.Context, pState) pState
 	ProcessState() pState
@@ -171,6 +184,11 @@ type process struct {
 	ns   string
 	id   string
 	root string
+
+	// pathName is the unit's systemd-escaped D-Bus object-path base, computed
+	// once at creation. The event reactor matches incoming signals against it,
+	// so it is stored rather than re-escaped on every manager lookup.
+	pathName string
 
 	exe        string
 	notifyFifo string
@@ -236,6 +254,13 @@ func (p *execProcess) Name() string {
 
 func (p *initProcess) Name() string {
 	return unitName(p.ns, p.id, "init")
+}
+
+// PathName returns the unit's systemd-escaped D-Bus object-path base. It is
+// populated once at creation (see Create in create.go) so signal lookups never
+// re-escape the name.
+func (p *process) PathName() string {
+	return p.pathName
 }
 
 func (p *process) Pid() uint32 {

@@ -5,53 +5,23 @@ import (
 	"testing"
 	"time"
 
+	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
 )
-
-func TestPathBusUnescape(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"an unescaped element is returned unchanged", "foostuff", "foostuff"},
-		{"an escaped dot decodes to a period", "foo_2eservice", "foo.service"},
-		{"escaped dashes decode to hyphens", "io_2dcontainerd_2dfoo_2eservice", "io-containerd-foo.service"},
-		{"a lone underscore is the empty string", "_", ""},
-		{"a trailing underscore is taken literally", "foo_", "foo_"},
-		{"an underscore with too few following chars is literal", "foo_2", "foo_2"},
-		{"an invalid hex escape is taken literally", "foo_zzbar", "foo_zzbar"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := pathBusUnescape(tc.in); got != tc.want {
-				t.Fatalf("pathBusUnescape(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestUnitNameFromPath(t *testing.T) {
-	t.Run("a unit object path decodes back to the unit name", func(t *testing.T) {
-		const op = dbus.ObjectPath("/org/freedesktop/systemd1/unit/io_2dcontainerd_2dsystemd_2dns_2dabc_2dinit_2eservice")
-		if got, want := unitNameFromPath(op), "io-containerd-systemd-ns-abc-init.service"; got != want {
-			t.Fatalf("unitNameFromPath(%q) = %q, want %q", op, got, want)
-		}
-	})
-}
 
 func TestDecodeUnitPropertiesChanged(t *testing.T) {
 	changed := changedProps(map[string]string{"ActiveState": "failed", "SubState": "failed"})
 
-	t.Run("a Unit PropertiesChanged signal decodes to its unit and changed set", func(t *testing.T) {
+	t.Run("a Unit PropertiesChanged signal decodes to its escaped path base and changed set", func(t *testing.T) {
 		u, ok := decodeUnitPropertiesChanged(unitSignal("foo_2eservice", changed))
 		if !ok {
 			t.Fatal("expected a Unit PropertiesChanged signal to decode")
 		}
-		if u.Name != "foo.service" {
-			t.Fatalf("unit name = %q, want foo.service", u.Name)
+		if u.pathBase != "foo_2eservice" {
+			t.Fatalf("path base = %q, want foo_2eservice (left escaped)", u.pathBase)
 		}
-		if v, ok := u.Changed["ActiveState"]; !ok || v.Value() != "failed" {
-			t.Fatalf("changed[ActiveState] = %v, want failed", u.Changed["ActiveState"])
+		if v, ok := u.changed["ActiveState"]; !ok || v.Value() != "failed" {
+			t.Fatalf("changed[ActiveState] = %v, want failed", u.changed["ActiveState"])
 		}
 	})
 
@@ -111,10 +81,10 @@ func TestUnitUpdates(t *testing.T) {
 
 		var got []string
 		for u := range unitUpdates(ctx, sigs) {
-			got = append(got, u.Name)
+			got = append(got, u.pathBase)
 		}
-		if len(got) != 2 || got[0] != "keep.service" || got[1] != "also.service" {
-			t.Fatalf("got %v, want [keep.service also.service]", got)
+		if len(got) != 2 || got[0] != "keep_2eservice" || got[1] != "also_2eservice" {
+			t.Fatalf("got %v, want [keep_2eservice also_2eservice]", got)
 		}
 	})
 
@@ -167,6 +137,40 @@ func TestUnitUpdates(t *testing.T) {
 			t.Fatalf("consumer saw %d updates before breaking, want 1", seen)
 		}
 	})
+}
+
+// Signal intake runs for every PropertiesChanged the bus broadcasts, most of
+// which are not ours, so it must not allocate per signal.
+func TestSignalIntakeDoesNotAllocate(t *testing.T) {
+	active := changedProps(map[string]string{"ActiveState": "active", "SubState": "running"})
+	failed := changedProps(map[string]string{"ActiveState": "failed", "SubState": "failed"})
+
+	ours := "io-containerd-systemd-ns-abc-def-init.service"
+	sigs := []*dbus.Signal{
+		unitSignal("systemd_2dlogind_2eservice", active),
+		unitSignal("dbus_2eservice", active),
+		unitSignal("systemd_2djournald_2eservice", failed), // a foreign unit's exit
+		unitSignal(systemd.PathBusEscape(ours), active),
+		unitSignal(systemd.PathBusEscape(ours), failed),
+	}
+
+	p := &fakeProcess{name: ours}
+	p.setState(pState{ExitCode: 3, ExitedAt: time.Now()})
+	units := newUnitManager()
+	units.Add(p)
+	q := newUnitWorkQueue()
+	defer q.ShutDown()
+
+	got := testing.AllocsPerRun(100, func() {
+		for _, s := range sigs {
+			if u, ok := decodeUnitPropertiesChanged(s); ok {
+				enqueueIfExit(q, units, u)
+			}
+		}
+	})
+	if got != 0 {
+		t.Fatalf("signal intake allocated %v times/run, want 0", got)
+	}
 }
 
 // unitSignal builds a Unit PropertiesChanged signal for the given escaped unit
