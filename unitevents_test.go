@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
 )
 
@@ -68,7 +69,7 @@ func TestReconcileUnit(t *testing.T) {
 		p := &fakeProcess{name: unit}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
 
-		reconcileUnit(context.Background(), units, unit)
+		reconcileUnit(context.Background(), units, systemd.PathBusEscape(unit))
 
 		if p.LoadStateCalls() != 1 {
 			t.Fatalf("expected exactly one LoadState call, got %d", p.LoadStateCalls())
@@ -79,7 +80,7 @@ func TestReconcileUnit(t *testing.T) {
 		other := &fakeProcess{name: unit}
 		units := &fakeLookup{m: map[string]Process{unit: other}}
 
-		reconcileUnit(context.Background(), units, "some-other-unit.service")
+		reconcileUnit(context.Background(), units, systemd.PathBusEscape("some-other-unit.service"))
 
 		if other.LoadStateCalls() != 0 {
 			t.Fatalf("expected no LoadState call for an untracked unit, got %d", other.LoadStateCalls())
@@ -90,7 +91,7 @@ func TestReconcileUnit(t *testing.T) {
 		p := &fakeProcess{name: unit, state: pState{ExitCode: 1, ExitedAt: time.Now()}}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
 
-		reconcileUnit(context.Background(), units, unit)
+		reconcileUnit(context.Background(), units, systemd.PathBusEscape(unit))
 
 		if p.LoadStateCalls() != 0 {
 			t.Fatalf("expected no LoadState call for an exited unit, got %d", p.LoadStateCalls())
@@ -118,7 +119,7 @@ func TestEnqueueIfExit(t *testing.T) {
 
 	t.Run("a non-exit transition is not enqueued", func(t *testing.T) {
 		q, units := newQueued(&fakeProcess{name: unit})
-		running := unitUpdate{Name: unit, Changed: changedProps(map[string]string{"ActiveState": "active", "SubState": "running"})}
+		running := newUpdate(unit, changedProps(map[string]string{"ActiveState": "active", "SubState": "running"}))
 		enqueueIfExit(q, units, running)
 		if queueLen(q) != 0 {
 			t.Fatalf("expected a running-state change not to enqueue, queue has %d", queueLen(q))
@@ -227,7 +228,7 @@ func TestReactToUnitEvents(t *testing.T) {
 		done := make(chan struct{})
 		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
-		running := unitUpdate{Name: unit, Changed: changedProps(map[string]string{"ActiveState": "active", "SubState": "running"})}
+		running := newUpdate(unit, changedProps(map[string]string{"ActiveState": "active", "SubState": "running"}))
 		updates <- running // completing this send means the informer has consumed it
 
 		cancel()
@@ -572,10 +573,14 @@ func changedProps(kv map[string]string) map[string]dbus.Variant {
 }
 
 func exitUpdate(unit string) unitUpdate {
-	return unitUpdate{
-		Name:    unit,
-		Changed: changedProps(map[string]string{"ActiveState": "failed", "SubState": "failed"}),
-	}
+	return newUpdate(unit, changedProps(map[string]string{"ActiveState": "failed", "SubState": "failed"}))
+}
+
+// newUpdate builds a unitUpdate the way the decoder does: the reactor keys off
+// the systemd-escaped object-path base, so tests escape the real unit name here
+// rather than hand-writing escaped paths.
+func newUpdate(unit string, changed map[string]dbus.Variant) unitUpdate {
+	return unitUpdate{pathBase: systemd.PathBusEscape(unit), changed: changed}
 }
 
 // seqFromChan adapts a channel of updates into the iter.Seq the reactor consumes,
@@ -614,20 +619,29 @@ type fakeLookup struct {
 	m  map[string]Process
 }
 
-func (l *fakeLookup) Get(name string) Process {
+// GetByPath mirrors unitManager.GetByPath: it resolves a process from a
+// systemd-escaped object-path base by matching each tracked process's PathName.
+func (l *fakeLookup) GetByPath(pathBase string) Process {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.m[name]
+	for _, p := range l.m {
+		if p.PathName() == pathBase {
+			return p
+		}
+	}
+	return nil
 }
 
-func (l *fakeLookup) Names() []string {
+// Paths returns the escaped object-path base of every tracked unit, matching
+// what GetByPath accepts.
+func (l *fakeLookup) Paths() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	names := make([]string, 0, len(l.m))
-	for name := range l.m {
-		names = append(names, name)
+	paths := make([]string, 0, len(l.m))
+	for _, p := range l.m {
+		paths = append(paths, p.PathName())
 	}
-	return names
+	return paths
 }
 
 func (l *fakeLookup) remove(name string) {
@@ -680,6 +694,7 @@ func (f *fakeProcess) SetState(_ context.Context, st pState) pState {
 }
 
 func (f *fakeProcess) Name() string         { return f.name }
+func (f *fakeProcess) PathName() string     { return systemd.PathBusEscape(f.name) }
 func (f *fakeProcess) Pid() uint32          { return f.ProcessState().Pid }
 func (f *fakeProcess) LogWriter() io.Writer { return io.Discard }
 

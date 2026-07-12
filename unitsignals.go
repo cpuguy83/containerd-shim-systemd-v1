@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"iter"
 	"os"
 	"path"
@@ -34,11 +33,16 @@ const (
 	systemdPrivateBus = "unix:path=/run/systemd/private"
 )
 
-// unitUpdate is a decoded systemd Unit PropertiesChanged event: the unit name
-// and the properties that changed.
+// unitUpdate is a decoded systemd Unit PropertiesChanged event. pathBase is the
+// unit's D-Bus object-path base, left systemd-escaped (e.g.
+// "io_2dcontainerd_2dsystemd_2d..._2eservice"). It is used verbatim as an index
+// key via processLookup.GetByPath: the private bus broadcasts every unit's
+// signals, so unescaping each name would allocate a string we discard for all
+// the units we do not track. Escaping our own names once, when a unit is added,
+// is far cheaper than unescaping every signal.
 type unitUpdate struct {
-	Name    string
-	Changed map[string]dbus.Variant
+	pathBase string
+	changed  map[string]dbus.Variant
 }
 
 // dialSignalBus opens a dedicated connection to systemd's private bus for
@@ -84,7 +88,9 @@ func unitUpdates(ctx context.Context, sigs <-chan *dbus.Signal) iter.Seq[unitUpd
 }
 
 // decodeUnitPropertiesChanged extracts a unitUpdate from a raw signal, reporting
-// false for anything that is not a systemd Unit PropertiesChanged.
+// false for anything that is not a systemd Unit PropertiesChanged. It keeps the
+// unit's object-path base escaped rather than unescaping it, so it does no
+// allocation for the name (see unitUpdate).
 func decodeUnitPropertiesChanged(sig *dbus.Signal) (unitUpdate, bool) {
 	if sig == nil || sig.Name != propertiesChangedSignal || len(sig.Body) < 2 {
 		return unitUpdate{}, false
@@ -96,34 +102,5 @@ func decodeUnitPropertiesChanged(sig *dbus.Signal) (unitUpdate, bool) {
 	if !ok {
 		return unitUpdate{}, false
 	}
-	return unitUpdate{Name: unitNameFromPath(sig.Path), Changed: changed}, true
-}
-
-// unitNameFromPath decodes a systemd unit object path (e.g.
-// /org/freedesktop/systemd1/unit/foo_2eservice) back into the unit name
-// (foo.service).
-func unitNameFromPath(op dbus.ObjectPath) string {
-	return pathBusUnescape(path.Base(string(op)))
-}
-
-// pathBusUnescape reverses the escaping systemd applies to build a unit's D-Bus
-// object path, turning _xx hex escapes back into their bytes. It mirrors
-// systemd's bus_label_unescape: a lone "_" is the empty string, and an "_" that
-// is not followed by two hex digits is taken literally.
-func pathBusUnescape(p string) string {
-	if p == "_" {
-		return ""
-	}
-	n := make([]byte, 0, len(p))
-	for i := 0; i < len(p); i++ {
-		if p[i] == '_' && i+2 < len(p) {
-			if b, err := hex.DecodeString(p[i+1 : i+3]); err == nil {
-				n = append(n, b...)
-				i += 2
-				continue
-			}
-		}
-		n = append(n, p[i])
-	}
-	return string(n)
+	return unitUpdate{pathBase: path.Base(string(sig.Path)), changed: changed}, true
 }

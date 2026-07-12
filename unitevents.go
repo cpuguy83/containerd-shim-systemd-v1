@@ -10,13 +10,17 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
-// processLookup resolves and enumerates tracked processes by systemd unit name.
-// It is satisfied by *unitManager and lets the event reactor be tested with a
-// fake that never touches D-Bus.
+// processLookup resolves and enumerates tracked processes by their systemd unit
+// object-path base (the escaped unit name from a D-Bus signal). It is satisfied
+// by *unitManager and lets the event reactor be tested with a fake that never
+// touches D-Bus.
 type processLookup interface {
-	Get(name string) Process
-	// Names returns the unit names of every currently tracked process.
-	Names() []string
+	// GetByPath resolves a process from a systemd unit object-path base (the
+	// escaped unit name carried by a signal), without unescaping it.
+	GetByPath(pathBase string) Process
+	// Paths returns the escaped object-path base of every tracked unit -- the
+	// keys GetByPath accepts -- for a resync sweep.
+	Paths() []string
 }
 
 // connected is the subset of *systemd.Conn used by the reconnect watchdog.
@@ -178,8 +182,8 @@ func (r *eventReactor) start(ctx context.Context) (stop func()) {
 // down is recovered: reconcileUnit re-reads current state, and the Exited()
 // guard makes it a no-op for units that are still running or already handled.
 func (r *eventReactor) resync() {
-	for _, name := range r.units.Names() {
-		r.q.Add(name)
+	for _, pathBase := range r.units.Paths() {
+		r.q.Add(pathBase)
 	}
 }
 
@@ -202,12 +206,14 @@ func (r *eventReactor) consume(ctx context.Context, updates iter.Seq[unitUpdate]
 
 // enqueueIfExit is the informer predicate: it enqueues a unit for reconciliation
 // only on an exit transition for a unit we still track and have not already
-// marked exited. It does no I/O (the ProcessState read is an in-memory lock), so
-// it cannot trigger the GetAll feedback storm, and it keeps three sources of
-// noise off the queue:
+// marked exited. It resolves the unit through the escaped-name index, so a
+// signal for a unit we do not track (the private bus broadcasts every unit's
+// changes) is dropped by a map miss without ever unescaping the name. It does no
+// I/O either (the ProcessState read is an in-memory lock), so it cannot trigger
+// the GetAll feedback storm, and it keeps three sources of noise off the queue:
 //
 //   - non-exit transitions (the flood of activating/running changes) and other
-//     units' signals -- the private bus broadcasts every unit's changes;
+//     units' signals;
 //   - trailing exit events after we have already handled the exit -- a normal
 //     lifecycle emits two exit-matching events (a leading inactive/dead before
 //     the unit starts, then the real inactive/failed), plus more on restarts;
@@ -215,37 +221,45 @@ func (r *eventReactor) consume(ctx context.Context, updates iter.Seq[unitUpdate]
 //     yet exited), but reconcileUnit/LoadState is level-driven and no-ops for a
 //     not-yet-started process, so it cannot produce a spurious exit.
 func enqueueIfExit(q *unitWorkQueue, units processLookup, u unitUpdate) {
-	if !unitEventIsExit(u.Changed) {
+	if !unitEventIsExit(u.changed) {
 		return
 	}
-	p := units.Get(u.Name)
+	p := units.GetByPath(u.pathBase)
 	if p == nil || p.ProcessState().Exited() {
 		return
 	}
-	q.Add(u.Name)
+	q.Add(u.pathBase)
 }
 
 // reconcileWorker drains the queue, reconciling one unit at a time until the
 // queue is shut down. A reconcile that returns an error is retried with an
 // exponential backoff up to reconcileMaxRetries; a success (or exhausting the
-// retries) clears the unit's retry count.
+// retries) clears the unit's retry count. The queue key is the unit's escaped
+// object-path base; the real name is resolved only for the failure logs.
 func reconcileWorker(ctx context.Context, q *unitWorkQueue, units processLookup) {
 	for {
-		name, shutdown := q.Get()
+		pathBase, shutdown := q.Get()
 		if shutdown {
 			return
 		}
-		err := reconcileUnit(ctx, units, name)
-		q.Done(name)
+		err := reconcileUnit(ctx, units, pathBase)
+		q.Done(pathBase)
 
-		switch {
-		case err == nil:
-			q.Forget(name)
-		case q.Retry(name, reconcileMaxRetries, reconcileRetryBase, reconcileRetryMax):
-			log.G(ctx).WithError(err).WithField("unit", name).Debug("Reconcile failed; scheduled retry")
-		default:
-			q.Forget(name)
-			log.G(ctx).WithError(err).WithField("unit", name).Warn("Giving up reconciling unit after retries; a reconnect resync will recover it")
+		if err == nil {
+			q.Forget(pathBase)
+			continue
+		}
+
+		// Log with the real unit name when the unit is still tracked.
+		unit := pathBase
+		if p := units.GetByPath(pathBase); p != nil {
+			unit = p.Name()
+		}
+		if q.Retry(pathBase, reconcileMaxRetries, reconcileRetryBase, reconcileRetryMax) {
+			log.G(ctx).WithError(err).WithField("unit", unit).Debug("Reconcile failed; scheduled retry")
+		} else {
+			q.Forget(pathBase)
+			log.G(ctx).WithError(err).WithField("unit", unit).Warn("Giving up reconciling unit after retries; a reconnect resync will recover it")
 		}
 	}
 }
@@ -257,14 +271,18 @@ func reconcileWorker(ctx context.Context, q *unitWorkQueue, units processLookup)
 // read itself failed, so the caller can retry; an untracked or already-exited
 // unit is nothing to do and returns nil.
 //
+// pathBase is the unit's escaped object-path base, resolved through the reactor's
+// index; the systemd read inside LoadState uses the process's own name, so the
+// key is only a lookup handle here.
+//
 // The Unit-interface payload that enqueued this work signals that the unit
 // stopped but does not carry the exit code (ExecMainStatus lives on the Service
 // interface, which go-systemd does not forward). LoadState reads the persisted
 // exit file first and otherwise does a single targeted GetAll on our own,
 // still-loaded unit -- safe from the feedback storm because the unit is loaded
 // and the read is scoped to us.
-func reconcileUnit(ctx context.Context, units processLookup, name string) error {
-	p := units.Get(name)
+func reconcileUnit(ctx context.Context, units processLookup, pathBase string) error {
+	p := units.GetByPath(pathBase)
 	if p == nil {
 		// Unit is untracked or was deleted between enqueue and reconcile.
 		return nil
@@ -274,7 +292,7 @@ func reconcileUnit(ctx context.Context, units processLookup, name string) error 
 		return nil
 	}
 
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("unit", name))
+	ctx = log.WithLogger(ctx, log.G(ctx).WithField("unit", p.Name()))
 	ctx = WithShimLog(ctx, p.LogWriter())
 
 	if err := p.LoadState(ctx); err != nil {

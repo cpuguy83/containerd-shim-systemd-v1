@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/go-runc"
 	"github.com/containerd/typeurl"
 	"github.com/coreos/go-systemd/v22/daemon"
+	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	ptypes "github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/proto"
@@ -165,6 +166,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		shimLog: shimLog,
 	}
 	p.process.cond = sync.NewCond(&p.process.mu)
+	p.process.pathName = systemd.PathBusEscape(p.Name())
 
 	if err := s.processes.Add(path.Join(ns, r.ID), p); err != nil {
 		return nil, err
@@ -259,6 +261,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 
 	ep.runc.Log = filepath.Join(ep.stateDir(), "runc-debug.log")
 	ep.process.cond = sync.NewCond(&ep.process.mu)
+	ep.process.pathName = systemd.PathBusEscape(ep.Name())
 	err = pInit.execs.Add(r.ExecID, ep)
 	if err != nil {
 		return nil, fmt.Errorf("process %s: %w", r.ExecID, err)
