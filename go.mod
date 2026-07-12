@@ -1,6 +1,6 @@
 module github.com/cpuguy83/containerd-shim-systemd-v1
 
-go 1.17
+go 1.23
 
 require (
 	github.com/containerd/cgroups v1.0.4
@@ -9,7 +9,7 @@ require (
 	github.com/containerd/ttrpc v1.1.0
 	github.com/containerd/typeurl v1.0.2
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf
-	github.com/coreos/go-systemd/v22 v22.3.2
+	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/godbus/dbus/v5 v5.1.0
 	github.com/gogo/protobuf v1.3.2
 	github.com/golang/protobuf v1.5.2
@@ -20,7 +20,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.9.0
 	go.opentelemetry.io/otel/sdk v1.9.0
 	go.opentelemetry.io/otel/trace v1.9.0
-	golang.org/x/sys v0.0.0-20220817070843-5a390386f1f2
+	golang.org/x/sys v0.1.0
 	google.golang.org/grpc v1.48.0
 )
 
