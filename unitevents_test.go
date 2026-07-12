@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"iter"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
 )
 
@@ -118,7 +118,7 @@ func TestEnqueueIfExit(t *testing.T) {
 
 	t.Run("a non-exit transition is not enqueued", func(t *testing.T) {
 		q, units := newQueued(&fakeProcess{name: unit})
-		running := &systemd.PropertiesUpdate{UnitName: unit, Changed: changedProps(map[string]string{"ActiveState": "active", "SubState": "running"})}
+		running := unitUpdate{Name: unit, Changed: changedProps(map[string]string{"ActiveState": "active", "SubState": "running"})}
 		enqueueIfExit(q, units, running)
 		if queueLen(q) != 0 {
 			t.Fatalf("expected a running-state change not to enqueue, queue has %d", queueLen(q))
@@ -152,13 +152,12 @@ func TestReactToUnitEvents(t *testing.T) {
 		}}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
 
-		updates := make(chan *systemd.PropertiesUpdate, 1)
-		errs := make(chan error)
+		updates := make(chan unitUpdate, 1)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		done := make(chan struct{})
-		go func() { reactToUnitEvents(ctx, units, updates, errs); close(done) }()
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
 		updates <- exitUpdate(unit)
 
@@ -187,13 +186,12 @@ func TestReactToUnitEvents(t *testing.T) {
 		}}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
 
-		updates := make(chan *systemd.PropertiesUpdate)
-		errs := make(chan error)
+		updates := make(chan unitUpdate)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		done := make(chan struct{})
-		go func() { reactToUnitEvents(ctx, units, updates, errs); close(done) }()
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
 		updates <- exitUpdate(unit) // pre-start inactive/dead (completed send == consumed)
 
@@ -222,15 +220,14 @@ func TestReactToUnitEvents(t *testing.T) {
 		p := &fakeProcess{name: unit}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
 
-		updates := make(chan *systemd.PropertiesUpdate)
-		errs := make(chan error)
+		updates := make(chan unitUpdate)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		done := make(chan struct{})
-		go func() { reactToUnitEvents(ctx, units, updates, errs); close(done) }()
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
-		running := &systemd.PropertiesUpdate{UnitName: unit, Changed: changedProps(map[string]string{"ActiveState": "active", "SubState": "running"})}
+		running := unitUpdate{Name: unit, Changed: changedProps(map[string]string{"ActiveState": "active", "SubState": "running"})}
 		updates <- running // completing this send means the informer has consumed it
 
 		cancel()
@@ -245,13 +242,12 @@ func TestReactToUnitEvents(t *testing.T) {
 		tracked := &fakeProcess{name: unit}
 		units := &fakeLookup{m: map[string]Process{unit: tracked}}
 
-		updates := make(chan *systemd.PropertiesUpdate)
-		errs := make(chan error)
+		updates := make(chan unitUpdate)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		done := make(chan struct{})
-		go func() { reactToUnitEvents(ctx, units, updates, errs); close(done) }()
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
 		updates <- exitUpdate("some-other-unit.service")
 
@@ -265,12 +261,11 @@ func TestReactToUnitEvents(t *testing.T) {
 
 	t.Run("cancelling the context stops the reactor", func(t *testing.T) {
 		units := &fakeLookup{m: map[string]Process{}}
-		updates := make(chan *systemd.PropertiesUpdate)
-		errs := make(chan error)
+		updates := make(chan unitUpdate)
 		ctx, cancel := context.WithCancel(context.Background())
 
 		done := make(chan struct{})
-		go func() { reactToUnitEvents(ctx, units, updates, errs); close(done) }()
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
 		cancel()
 		select {
@@ -296,13 +291,12 @@ func TestReactToUnitEvents(t *testing.T) {
 		}}
 		units := &fakeLookup{m: map[string]Process{slowUnit: slow, fastUnit: fast}}
 
-		updates := make(chan *systemd.PropertiesUpdate, 2)
-		errs := make(chan error)
+		updates := make(chan unitUpdate, 2)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		done := make(chan struct{})
-		go func() { reactToUnitEvents(ctx, units, updates, errs); close(done) }()
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
 		updates <- exitUpdate(slowUnit) // a worker starts and blocks
 		updates <- exitUpdate(fastUnit) // must still be handled by another worker
@@ -336,13 +330,12 @@ func TestReactToUnitEvents(t *testing.T) {
 		// An unbuffered channel makes each send synchronize with the informer, so
 		// a completed send means that event was consumed and (while the first read
 		// is in flight) coalesced onto the in-progress work.
-		updates := make(chan *systemd.PropertiesUpdate)
-		errs := make(chan error)
+		updates := make(chan unitUpdate)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		done := make(chan struct{})
-		go func() { reactToUnitEvents(ctx, units, updates, errs); close(done) }()
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
 		updates <- exitUpdate(unit) // a worker starts the read and blocks
 		<-started
@@ -379,13 +372,12 @@ func TestReactToUnitEvents(t *testing.T) {
 		}}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
 
-		updates := make(chan *systemd.PropertiesUpdate, 1)
-		errs := make(chan error)
+		updates := make(chan unitUpdate, 1)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		done := make(chan struct{})
-		go func() { reactToUnitEvents(ctx, units, updates, errs); close(done) }()
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
 		updates <- exitUpdate(unit)
 
@@ -410,13 +402,12 @@ func TestReactToUnitEvents(t *testing.T) {
 		}}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
 
-		updates := make(chan *systemd.PropertiesUpdate, 1)
-		errs := make(chan error)
+		updates := make(chan unitUpdate, 1)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		done := make(chan struct{})
-		go func() { reactToUnitEvents(ctx, units, updates, errs); close(done) }()
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
 		updates <- exitUpdate(unit)
 
@@ -450,13 +441,12 @@ func TestReactToUnitEvents(t *testing.T) {
 		units.m[unit] = p
 		units.mu.Unlock()
 
-		updates := make(chan *systemd.PropertiesUpdate, 1)
-		errs := make(chan error)
+		updates := make(chan unitUpdate, 1)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		done := make(chan struct{})
-		go func() { reactToUnitEvents(ctx, units, updates, errs); close(done) }()
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
 
 		updates <- exitUpdate(unit)
 
@@ -581,11 +571,42 @@ func changedProps(kv map[string]string) map[string]dbus.Variant {
 	return changed
 }
 
-func exitUpdate(unit string) *systemd.PropertiesUpdate {
-	return &systemd.PropertiesUpdate{
-		UnitName: unit,
-		Changed:  changedProps(map[string]string{"ActiveState": "failed", "SubState": "failed"}),
+func exitUpdate(unit string) unitUpdate {
+	return unitUpdate{
+		Name:    unit,
+		Changed: changedProps(map[string]string{"ActiveState": "failed", "SubState": "failed"}),
 	}
+}
+
+// seqFromChan adapts a channel of updates into the iter.Seq the reactor consumes,
+// so tests can drive the informer by sending on a channel. It stops when ctx is
+// cancelled or the channel is closed.
+func seqFromChan(ctx context.Context, ch <-chan unitUpdate) iter.Seq[unitUpdate] {
+	return func(yield func(unitUpdate) bool) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case u, ok := <-ch:
+				if !ok {
+					return
+				}
+				if !yield(u) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// reactToUnitEvents wires a reactor's worker pool and informer loop for a single
+// update stream, blocking until the stream ends. It skips the resync that
+// runEventReactor performs on connect, so a test drives only the events it sends.
+func reactToUnitEvents(ctx context.Context, units processLookup, updates iter.Seq[unitUpdate]) {
+	r := newEventReactor(units)
+	stop := r.start(ctx)
+	defer stop()
+	r.consume(ctx, updates)
 }
 
 type fakeLookup struct {
