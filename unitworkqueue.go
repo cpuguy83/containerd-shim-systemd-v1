@@ -18,7 +18,7 @@ import (
 //     is still handled.
 //   - Bounded retries: a failed reconcile can be re-queued after an exponential
 //     backoff (Retry) up to a cap, and the per-item failure count is cleared on
-//     success (Forget). The periodic scan in Watch remains the ultimate backstop.
+//     success (Forget). The reconnect resync remains the ultimate backstop.
 //
 // It intentionally omits the metrics and pluggable rate limiters of client-go's
 // workqueue; the reconcile is level-driven (it reads current state), so a simple

@@ -5,10 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/signal"
 	"path"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/api/types/task"
@@ -21,113 +19,6 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
-
-// Watch periodically polls systemd for status updates of units being tracked.
-//
-// We are polling instead of watching for systemd events b/c the events seem to trigger a library bug
-// where we end up getting bombarded with events at a rediculous rate, causing huge amounts of CPU usage.
-// Until that gets figured out, we need to keep using polling.
-func (m *unitManager) Watch(ctx context.Context) {
-	filterFn := func(p Process) bool {
-		return p.ProcessState().ExitedAt.After(timeZero)
-	}
-
-	timer := time.NewTimer(time.Second)
-	defer timer.Stop()
-
-	if !timer.Stop() {
-		<-timer.C
-	}
-
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
-	defer signal.Stop(hup)
-
-	for {
-		m.mu.Lock()
-		for len(m.idx) == 0 {
-			select {
-			case <-ctx.Done():
-				m.mu.Unlock()
-				log.G(ctx).WithError(ctx.Err()).Info("Exiting unit watch loop")
-				return
-			default:
-			}
-			m.cond.Wait()
-		}
-		m.mu.Unlock()
-
-		select {
-		case <-ctx.Done():
-			log.G(ctx).WithError(ctx.Err()).Info("Exiting unit watch loop")
-			return
-		default:
-		}
-
-		units, err := m.sd.ListUnitsByNamesContext(ctx, m.Keys(filterFn))
-		if err != nil {
-			log.G(ctx).WithError(err).Error("Error while watching unit statuses")
-		}
-
-		for _, unit := range units {
-			unit := unit
-			ctx := log.WithLogger(ctx, log.G(ctx).WithField("unit", unit.Name))
-
-			p := m.Get(unit.Name)
-			if p == nil {
-				log.G(ctx).Debugf("Skipping unit status update for unknown unit")
-				continue
-			}
-
-			ctx = WithShimLog(ctx, p.LogWriter())
-
-			if p.ProcessState().Exited() {
-				// Process is already exited, we don't care about state updates on this unit anymore
-				log.G(ctx).Debug("Skipped unit status update for exited process")
-				continue
-			}
-
-			log.G(ctx).Debugf("Getting unit state")
-			if err := p.LoadState(ctx); err != nil {
-				log.G(ctx).WithError(err).Error("Error loading process state")
-				continue
-			}
-
-			log.G(ctx).WithField("unit", p.Name()).Debugf("Updated unit state: %s", p.ProcessState())
-		}
-
-		timer.Reset(time.Minute)
-		select {
-		case <-ctx.Done():
-			log.G(ctx).WithError(ctx.Err()).Info("Exiting unit watch loop")
-			return
-		case <-hup:
-			log.G(ctx).Debug("Received SIGHUP, reloading units")
-			if !timer.Stop() {
-				<-timer.C
-			}
-		case <-timer.C:
-		}
-	}
-}
-
-func (m *unitManager) Keys(filter func(p Process) bool) []string {
-	m.mu.Lock()
-	keys := make([]string, 0, len(m.idx))
-	for k, p := range m.idx {
-		if filter(p) {
-			continue
-		}
-		keys = append(keys, k)
-	}
-	m.mu.Unlock()
-	return keys
-}
-
-func (s *Service) watchUnits(ctx context.Context) error {
-	go s.units.Watch(ctx)
-	return nil
-}
 
 // State returns runtime state of a process
 func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskapi.StateResponse, retErr error) {

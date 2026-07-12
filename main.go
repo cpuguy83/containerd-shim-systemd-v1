@@ -353,11 +353,9 @@ func main() {
 				return fmt.Errorf("error writing status: %v", err)
 			}
 
-			// Should this wait for the reload job to complete?
-			// e.g. by passing in a channel instead of nil and waiting on the channel
-			if _, err := conn.ReloadUnitContext(ctx, os.Getenv("DAEMON_UNIT_NAME"), "replace", nil); err != nil {
-				return err
-			}
+			// The shim observes this exit over D-Bus (the unit only reaches
+			// inactive/failed after this ExecStopPost completes, so the state
+			// file above is already in place when it reconciles).
 			return nil
 		},
 	}
@@ -460,15 +458,12 @@ func serve(ctx context.Context, cfg Config) error {
 	}
 	defer svc.Close()
 
-	if err := shm.watchUnits(ctx); err != nil {
-		return err
-	}
-
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// React to systemd unit state changes over D-Bus immediately, in parallel
-	// with the periodic reconcile started by watchUnits above.
+	// React to systemd unit state changes over D-Bus. This is the shim's sole
+	// monitor of unit state; it resyncs tracked units on reconnect to recover
+	// anything missed while the connection was down.
 	shm.watchEvents(ctx)
 
 	listeners, err := activation.Listeners()

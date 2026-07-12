@@ -10,11 +10,13 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
-// processLookup resolves a tracked process by its systemd unit name.
+// processLookup resolves and enumerates tracked processes by systemd unit name.
 // It is satisfied by *unitManager and lets the event reactor be tested with a
 // fake that never touches D-Bus.
 type processLookup interface {
 	Get(name string) Process
+	// Names returns the unit names of every currently tracked process.
+	Names() []string
 }
 
 // connected is the subset of *systemd.Conn used by the reconnect watchdog.
@@ -22,10 +24,10 @@ type connected interface {
 	Connected() bool
 }
 
-// watchEvents starts the systemd unit event reactor. It reacts to unit exits
-// immediately, in parallel with the periodic reconcile in Watch (see state.go);
-// both funnel through the idempotent Process.SetState, so a single real exit
-// still yields at most one TaskExit.
+// watchEvents starts the systemd unit event reactor. It is the shim's sole
+// monitor of unit state: it reacts to unit exits immediately over D-Bus and,
+// after a reconnect, resyncs tracked units to recover anything missed while
+// disconnected.
 //
 // It deliberately uses SetPropertiesSubscriber and NOT SetSubStateSubscriber:
 // go-systemd's substate subscriber calls GetUnitPathProperties (a GetAll) for
@@ -41,10 +43,18 @@ func (s *Service) watchEvents(ctx context.Context) {
 // runEventReactor owns a dedicated private connection for the subscription so it
 // can be re-dialed if the connection drops, without disturbing the shared
 // connection used for method calls (which every Process references directly).
-// The 1-minute reconcile in Watch is the backstop for anything missed while
-// re-dialing.
+//
+// The work queue and its worker pool live for the whole reactor, while the
+// connection (and thus the subscription) is re-established on drop. Each time a
+// subscription comes up the reactor resyncs -- enqueuing every tracked unit --
+// so a unit that exited while the connection was down is still reconciled. That
+// resync is the missed-event backstop that replaces the old periodic scan.
 func (s *Service) runEventReactor(ctx context.Context) {
 	const retry = time.Second
+
+	r := newEventReactor(s.units)
+	stop := r.start(ctx)
+	defer stop()
 
 	for {
 		if ctx.Err() != nil {
@@ -53,7 +63,7 @@ func (s *Service) runEventReactor(ctx context.Context) {
 
 		conn, err := systemd.NewSystemdConnectionContext(ctx)
 		if err != nil {
-			log.G(ctx).WithError(err).Warn("event reactor: connect failed; reconcile scan is the backstop")
+			log.G(ctx).WithError(err).Warn("event reactor: connect failed; will retry")
 			if sleepCtx(ctx, retry) {
 				return
 			}
@@ -67,7 +77,12 @@ func (s *Service) runEventReactor(ctx context.Context) {
 		errs := make(chan error, 256)
 		conn.SetPropertiesSubscriber(updates, errs)
 
-		reactToUnitEvents(runCtx, s.units, updates, errs)
+		// Recover any exit missed while we had no subscription. At startup this
+		// is a no-op because nothing is tracked yet; after a reconnect it catches
+		// units that exited during the gap.
+		r.resync()
+
+		r.consume(runCtx, updates, errs)
 
 		cancel()
 		conn.Close()
@@ -122,7 +137,7 @@ const eventReconcileWorkers = 8
 
 // Retry policy for a failed reconcile (e.g. a transient systemd read error).
 // Failures back off base, 2*base, 4*base, ... capped at max, and are given up on
-// after maxRetries attempts, at which point the periodic scan in Watch is the
+// after maxRetries attempts, at which point the next reconnect resync is the
 // backstop. These are vars so tests can shrink them.
 var (
 	reconcileMaxRetries = 5
@@ -130,33 +145,54 @@ var (
 	reconcileRetryMax   = 10 * time.Second
 )
 
-// reactToUnitEvents runs the event reactor as a controller: the loop below is
-// the informer -- it consumes the property-change stream and does only cheap,
-// I/O-free work, translating each relevant exit event into a unit name on the
-// work queue. A pool of workers drains that queue and performs the blocking
-// state read (the reconcile).
-//
-// Splitting the two means the informer never blocks on a systemd read, so one
-// slow or hung read cannot stall event intake or let the subscription's bounded
-// channel back up and drop updates. The work queue coalesces duplicate events
-// for a unit and never reconciles the same unit on two workers at once, so
-// multiple events for the same unit cannot interfere.
-func reactToUnitEvents(ctx context.Context, units processLookup, updates <-chan *systemd.PropertiesUpdate, errs <-chan error) {
-	q := newUnitWorkQueue()
+// eventReactor is the controller half of the event pipeline: a work queue keyed
+// by unit name plus a pool of workers that reconcile units. It outlives any
+// single D-Bus connection -- the connection (and its subscription) is fed in via
+// consume and can be re-established on drop, while the queue and workers persist.
+type eventReactor struct {
+	units processLookup
+	q     *unitWorkQueue
+}
 
+func newEventReactor(units processLookup) *eventReactor {
+	return &eventReactor{units: units, q: newUnitWorkQueue()}
+}
+
+// start launches the worker pool and returns a stop function that shuts the
+// queue down and waits for the workers to drain.
+func (r *eventReactor) start(ctx context.Context) (stop func()) {
 	var wg sync.WaitGroup
 	for i := 0; i < eventReconcileWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			reconcileWorker(ctx, q, units)
+			reconcileWorker(ctx, r.q, r.units)
 		}()
 	}
-	// Ordered so ShutDown runs first (waking the workers) and then we wait for
-	// them to finish.
-	defer wg.Wait()
-	defer q.ShutDown()
+	return func() {
+		r.q.ShutDown()
+		wg.Wait()
+	}
+}
 
+// resync enqueues every tracked unit for reconciliation. It runs when a
+// subscription is (re-)established so an exit missed while the connection was
+// down is recovered: reconcileUnit re-reads current state, and the Exited()
+// guard makes it a no-op for units that are still running or already handled.
+func (r *eventReactor) resync() {
+	for _, name := range r.units.Names() {
+		r.q.Add(name)
+	}
+}
+
+// consume is the informer loop: it drains the property-change stream until ctx
+// is cancelled or the channels close, enqueuing exit transitions. It does only
+// cheap, I/O-free work, so the informer never blocks on a systemd read -- one
+// slow or hung reconcile cannot stall event intake or let the subscription's
+// bounded channel back up and drop updates. The work queue coalesces duplicate
+// events for a unit and never reconciles the same unit on two workers at once,
+// so multiple events for the same unit cannot interfere.
+func (r *eventReactor) consume(ctx context.Context, updates <-chan *systemd.PropertiesUpdate, errs <-chan error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -173,9 +209,21 @@ func reactToUnitEvents(ctx context.Context, units processLookup, updates <-chan 
 			if !ok {
 				return
 			}
-			enqueueIfExit(q, units, u)
+			enqueueIfExit(r.q, r.units, u)
 		}
 	}
+}
+
+// reactToUnitEvents wires a reactor's worker pool and informer loop for a single
+// subscription, blocking until ctx is cancelled or the channels close. It does
+// not resync (production drives that from runEventReactor on connect); it exists
+// so the informer/worker behaviour can be exercised in tests without a
+// connection.
+func reactToUnitEvents(ctx context.Context, units processLookup, updates <-chan *systemd.PropertiesUpdate, errs <-chan error) {
+	r := newEventReactor(units)
+	stop := r.start(ctx)
+	defer stop()
+	r.consume(ctx, updates, errs)
 }
 
 // enqueueIfExit is the informer predicate: it enqueues a unit for reconciliation
@@ -223,7 +271,7 @@ func reconcileWorker(ctx context.Context, q *unitWorkQueue, units processLookup)
 			log.G(ctx).WithError(err).WithField("unit", name).Debug("Reconcile failed; scheduled retry")
 		default:
 			q.Forget(name)
-			log.G(ctx).WithError(err).WithField("unit", name).Warn("Giving up reconciling unit after retries; periodic scan will recover it")
+			log.G(ctx).WithError(err).WithField("unit", name).Warn("Giving up reconciling unit after retries; a reconnect resync will recover it")
 		}
 	}
 }
@@ -248,7 +296,7 @@ func reconcileUnit(ctx context.Context, units processLookup, name string) error 
 		return nil
 	}
 	if p.ProcessState().Exited() {
-		// Already reconciled by an earlier event or the periodic scan.
+		// Already reconciled by an earlier event or a resync.
 		return nil
 	}
 

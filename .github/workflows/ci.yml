@@ -8,7 +8,7 @@ on:
     branches:
       - main
 jobs:
-  integration:
+  containerd-integration:
     runs-on: ubuntu-26.04
     timeout-minutes: 40
     defaults:
@@ -78,3 +78,25 @@ jobs:
         with:
           name: goroutines
           path: /tmp/*containerd-shim-systemd-v1-goroutines*
+
+  test:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - uses: actions/checkout@v7
+      - name: go test (race)
+        # Unit tests with the race detector. -short skips the integration tests,
+        # which talk to a live systemd bus and would otherwise trip a data race
+        # inside go-systemd's dispatch goroutine (it reads the subscriber field
+        # without the lock the setter uses; coreos/go-systemd#519).
+        run: go test -short -race ./...
+      - name: go test (integration)
+        # Run the integration tests against a live systemd bus, as root for
+        # access to the system private socket (/run/systemd/private); PATH is
+        # preserved so the setup-go toolchain is found under sudo. No -race here
+        # because of go-systemd#519 above.
+        run: sudo -E env "PATH=$PATH" go test ./...
+

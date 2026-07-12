@@ -78,7 +78,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		waitEvents:     make(chan struct{}),
 		defaultLogMode: cfg.LogMode,
 		processes:      &processManager{ls: make(map[string]Process)},
-		units:          newUnitManager(conn),
+		units:          newUnitManager(),
 		runcBin:        runcPath,
 		debug:          debug,
 	}, nil
