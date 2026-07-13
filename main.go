@@ -11,7 +11,6 @@ import "C"
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,10 +24,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/errdefs"
@@ -38,7 +35,6 @@ import (
 	"github.com/containerd/containerd/runtime/v2/shim"
 	taskapi "github.com/containerd/containerd/runtime/v2/task"
 	"github.com/coreos/go-systemd/v22/activation"
-	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pelletier/go-toml"
@@ -268,95 +264,6 @@ func main() {
 				}
 			}
 			return createCmd(ctx, bundle, flags.Args(), tty, mountCfg != "")
-		},
-		"exit": func(ctx context.Context) error {
-			ctx = log.WithLogger(ctx, log.G(ctx).WithField("unit", os.Getenv("UNIT_NAME")))
-			ctx = WithShimLog(ctx, OpenShimLog(ctx, bundle))
-
-			conn, err := systemd.NewSystemdConnectionContext(ctx)
-			if err != nil {
-				return err
-			}
-
-			var st pState
-			statusData, err := os.ReadFile(os.Getenv("EXIT_STATE_PATH"))
-			if err != nil {
-				if !os.IsNotExist(err) {
-					log.G(ctx).WithError(err).Error("Error reading status")
-				}
-			} else {
-				if err := json.Unmarshal(statusData, &st); err != nil {
-					return fmt.Errorf("error unmarshaling status: %v", err)
-				}
-
-				if st.Exited() {
-					return nil
-				}
-			}
-
-			code, err := strconv.Atoi(os.Getenv("EXIT_STATUS"))
-			if err != nil {
-				code = 255
-				if os.Getenv("EXIT_STATUS") == "" {
-					log.G(ctx).WithError(err).Errorf("Error reading exit status, falling back to file: %s", flags.Arg(0))
-
-					// Fallback to exit status written by our `create` subcommand
-					// This is currently needed for type=forking where the exec'd process exits quickly.
-					exitData, err := os.ReadFile(flags.Arg(0))
-					if err == nil {
-						c, err := strconv.Atoi(string(exitData))
-						if err != nil {
-							log.G(ctx).WithError(err).Warn("Error parsing exit code from file")
-							code = 255
-						} else {
-							code = c
-						}
-					} else {
-						log.G(ctx).WithError(err).Warn("Error reading exit code from file")
-					}
-				}
-			}
-
-			if st.Pid == 0 {
-				pidData, err := os.ReadFile(os.Getenv("PIDFILE"))
-				if err != nil {
-					return fmt.Errorf("error reading pidfile: %v", err)
-				}
-				pid, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
-				if err != nil {
-					return fmt.Errorf("error parsing pid: %v", err)
-				}
-				st.Pid = uint32(pid)
-			}
-
-			st.Status = os.Getenv("EXIT_CODE")
-			st.ExitedAt = time.Now()
-			st.ExitCode = uint32(code)
-
-			if st.ExitCode == 255 {
-				log.G(ctx).Debug("Falling back to reading exit status from systemd api")
-				var st2 pState
-				if err := getUnitState(ctx, conn, os.Getenv("UNIT_NAME"), &st); err != nil {
-					log.G(ctx).WithError(err).Error("Error reading unit state")
-				}
-				if st2.ExitCode > 0 {
-					st.ExitCode = st2.ExitCode
-				}
-			}
-
-			data, err := json.Marshal(st)
-			if err != nil {
-				return err
-			}
-
-			if err := os.WriteFile(os.Getenv("EXIT_STATE_PATH"), data, 0600); err != nil {
-				return fmt.Errorf("error writing status: %v", err)
-			}
-
-			// The shim observes this exit over D-Bus (the unit only reaches
-			// inactive/failed after this ExecStopPost completes, so the state
-			// file above is already in place when it reconciles).
-			return nil
 		},
 	}
 

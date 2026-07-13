@@ -298,6 +298,19 @@ func reconcileUnit(ctx context.Context, units processLookup, pathBase string) er
 	if err := p.LoadState(ctx); err != nil {
 		return err
 	}
+
+	// The exit signal says the unit stopped, but create persists only a running
+	// state file: the terminal exit code lives in systemd's ExecMainStatus, which
+	// the Unit-interface signal does not carry. When the persisted state is not
+	// yet terminal for a started process, read the real exit from the
+	// still-loaded unit. A Pid of 0 means the unit never started (the leading
+	// pre-start inactive/dead event), so there is nothing to read and systemd's
+	// "dead" substate must not be mistaken for an exit.
+	if !p.ProcessState().Exited() && p.Pid() > 0 {
+		if err := p.LoadExitState(ctx); err != nil {
+			return err
+		}
+	}
 	log.G(ctx).WithField("state", p.ProcessState()).Debug("Reconciled unit after exit event")
 	return nil
 }

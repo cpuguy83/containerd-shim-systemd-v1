@@ -217,6 +217,99 @@ func TestReactToUnitEvents(t *testing.T) {
 		}
 	})
 
+	t.Run("a started process whose persisted state is not terminal reads the exit code from systemd", func(t *testing.T) {
+		p := &fakeProcess{
+			name: unit,
+			loadStateFn: func(f *fakeProcess) error {
+				f.setState(pState{Pid: 42, Status: "running"}) // create's running-state file
+				return nil
+			},
+			loadExitStateFn: func(f *fakeProcess) error {
+				f.setState(pState{Pid: 42, ExitCode: 7, ExitedAt: time.Now()})
+				return nil
+			},
+		}
+		units := &fakeLookup{m: map[string]Process{unit: p}}
+
+		updates := make(chan unitUpdate, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
+
+		updates <- exitUpdate(unit)
+
+		if !eventually(2*time.Second, time.Millisecond, func() bool { return p.ProcessState().Exited() }) {
+			t.Fatal("reactor never read the terminal exit from systemd")
+		}
+		if got := p.ProcessState().ExitCode; got != 7 {
+			t.Fatalf("expected exit code 7 from systemd, got %d", got)
+		}
+		if got := p.LoadExitStateCalls(); got != 1 {
+			t.Fatalf("expected exactly one systemd exit read, got %d", got)
+		}
+		cancel()
+		<-done
+	})
+
+	t.Run("an unstarted process does not read the exit code from systemd", func(t *testing.T) {
+		p := &fakeProcess{name: unit, loadStateFn: func(f *fakeProcess) error {
+			return nil // models LoadState no-op for a not-yet-started process (pid==0)
+		}}
+		units := &fakeLookup{m: map[string]Process{unit: p}}
+
+		updates := make(chan unitUpdate, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
+
+		updates <- exitUpdate(unit) // pre-start inactive/dead
+
+		if !eventually(2*time.Second, time.Millisecond, func() bool { return p.LoadStateCalls() >= 1 }) {
+			t.Fatal("reactor never reconciled the pre-start event")
+		}
+		if got := p.LoadExitStateCalls(); got != 0 {
+			t.Fatalf("expected no systemd exit read for an unstarted unit, got %d", got)
+		}
+		if p.ProcessState().Exited() {
+			t.Fatal("pre-start event spuriously marked the process exited")
+		}
+		cancel()
+		<-done
+	})
+
+	t.Run("a persisted terminal exit is not re-read from systemd", func(t *testing.T) {
+		p := &fakeProcess{name: unit, loadStateFn: func(f *fakeProcess) error {
+			f.setState(pState{Pid: 9, ExitCode: 2, ExitedAt: time.Now()}) // create's fast-exit file
+			return nil
+		}}
+		units := &fakeLookup{m: map[string]Process{unit: p}}
+
+		updates := make(chan unitUpdate, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
+
+		updates <- exitUpdate(unit)
+
+		if !eventually(2*time.Second, time.Millisecond, func() bool { return p.LoadStateCalls() >= 1 }) {
+			t.Fatal("reactor never reconciled the unit")
+		}
+		if got := p.LoadExitStateCalls(); got != 0 {
+			t.Fatalf("expected no systemd exit read when the file is already terminal, got %d", got)
+		}
+		if got := p.ProcessState().ExitCode; got != 2 {
+			t.Fatalf("expected the persisted exit code 2 to stand, got %d", got)
+		}
+		cancel()
+		<-done
+	})
+
 	t.Run("a non-exit event does not trigger a state read", func(t *testing.T) {
 		p := &fakeProcess{name: unit}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
@@ -651,11 +744,13 @@ func (l *fakeLookup) remove(name string) {
 }
 
 type fakeProcess struct {
-	name        string
-	mu          sync.Mutex
-	state       pState
-	loadCalls   int32
-	loadStateFn func(*fakeProcess) error
+	name            string
+	mu              sync.Mutex
+	state           pState
+	loadCalls       int32
+	loadExitCalls   int32
+	loadStateFn     func(*fakeProcess) error
+	loadExitStateFn func(*fakeProcess) error
 }
 
 // LoadState mirrors the real implementations, which do NOT hold the process lock
@@ -672,6 +767,20 @@ func (f *fakeProcess) LoadState(context.Context) error {
 
 func (f *fakeProcess) LoadStateCalls() int {
 	return int(atomic.LoadInt32(&f.loadCalls))
+}
+
+// LoadExitState mirrors the real reconcile-path systemd read. Like LoadState it
+// does not hold the process lock while running loadExitStateFn.
+func (f *fakeProcess) LoadExitState(context.Context) error {
+	atomic.AddInt32(&f.loadExitCalls, 1)
+	if f.loadExitStateFn != nil {
+		return f.loadExitStateFn(f)
+	}
+	return nil
+}
+
+func (f *fakeProcess) LoadExitStateCalls() int {
+	return int(atomic.LoadInt32(&f.loadExitCalls))
 }
 
 func (f *fakeProcess) setState(st pState) {

@@ -137,6 +137,41 @@ func awaitQuiet(timeout, step time.Duration, maxPerStep int64, total func() int6
 
 // --- integration helpers ---
 
+// TestLoadExitFromUnitReadsRealExitCode is the load-bearing check for removing
+// the ExecStopPost exit helper: with no helper writing the state file on stop,
+// the reconcile path's only source of the terminal code is systemd's
+// ExecMainStatus. This confirms it is populated and read for a real exit.
+// Signal, tty, and mount-cleanup behaviour is exercised by the container-level
+// integration harness, where the unit wraps a real runc container rather than a
+// bare shell (a self-signalled transient unit does not faithfully model it).
+func TestLoadExitFromUnitReadsRealExitCode(t *testing.T) {
+	ctx := context.Background()
+	path := privateBusPath(t)
+	reg := newUnitRegistry(t, path)
+	conn := dialPrivate(t, ctx, path)
+	defer conn.Close()
+
+	t.Run("a non-zero exit is read from ExecMainStatus", func(t *testing.T) {
+		unit := reg.unit("exit-nonzero")
+		startTransient(t, ctx, conn, unit, []string{"/bin/sh", "-c", "exit 7"})
+
+		var st pState
+		if !eventually(10*time.Second, 20*time.Millisecond, func() bool {
+			s, err := loadExitFromUnit(ctx, conn, unit)
+			if err != nil {
+				return false
+			}
+			st = s
+			return st.Exited()
+		}) {
+			t.Fatalf("unit %s never reported an exit via systemd", unit)
+		}
+		if st.ExitCode != 7 {
+			t.Fatalf("expected exit code 7 from systemd, got %d", st.ExitCode)
+		}
+	})
+}
+
 // privateBusPath returns the address of a systemd private bus to test against,
 // or skips the test when one is not available. It skips in -short mode (these
 // tests talk to a real systemd and create transient units) and when no private
