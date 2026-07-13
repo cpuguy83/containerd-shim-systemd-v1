@@ -1,4 +1,4 @@
-.PHONY: build mod install
+.PHONY: build mod install generate
 
 PREFIX ?= /usr/local
 INSTALL ?= install
@@ -28,6 +28,11 @@ clean:
 
 mod:
 	$(GO) mod tidy
+
+# Regenerate the flake's Go module lock (gomod2nix.toml) after a go.mod/go.sum
+# change. Uses only the Go toolchain -- no Nix required.
+generate:
+	$(GO) generate ./...
 
 ifeq ($(ALL), 1)
 install: build

@@ -1,2 +1,6 @@
 bin/
 *.test
+result
+result-*
+.direnv/
+*.qcow2
