@@ -125,6 +125,12 @@ type Process interface {
 	// identifier the event reactor matches incoming signals against.
 	PathName() string
 	LoadState(context.Context) error
+	// LoadExitState refreshes the process state from systemd's record of the
+	// unit (ExecMainStatus/SubState). The exit reactor uses it to obtain the
+	// terminal exit code on a real exit -- the persisted state file only carries
+	// a running state -- so the GetAll it performs stays off the hot LoadState
+	// path.
+	LoadExitState(context.Context) error
 	SetState(context.Context, pState) pState
 	ProcessState() pState
 	LogWriter() io.Writer
