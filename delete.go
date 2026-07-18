@@ -147,7 +147,7 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 	// By this point waitForExit has returned, so p.state is Exited(): the unit
 	// event reactor's Exited() guard will short-circuit before any read, so
 	// unloading the unit here cannot provoke a not-found GetAll feedback loop.
-	if err := os.Remove("/run/systemd/system/" + p.Name()); err != nil {
+	if err := os.Remove(p.unitPath()); err != nil {
 		return pState{}, err
 	}
 	if err := p.systemd.ReloadContext(ctx); err != nil {
@@ -158,7 +158,6 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		// Just a debug message since this is just precautionary and the unit may not even be failed.
 		log.G(ctx).WithError(err).Debug("Failed to reset systemd unit")
 	}
-
 	p.mu.Lock()
 	p.deleted = true
 	p.cond.Broadcast()
@@ -220,7 +219,7 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	p.mu.Unlock()
 
 	p.parent.execs.Delete(p.execID)
-	if err := os.Remove("/run/systemd/system/" + p.Name()); err != nil {
+	if err := os.Remove(p.unitPath()); err != nil {
 		log.G(ctx).WithError(err).Debug("Failed to remove exec unit")
 	}
 
@@ -228,7 +227,6 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 		log.G(ctx).WithError(err).Error("systemd reload failed")
 	}
 	p.systemd.ResetFailedUnitContext(ctx, p.Name())
-
 	if err := os.RemoveAll(p.stateDir()); err != nil && !os.IsNotExist(err) {
 		log.G(ctx).WithError(err).Debug("Failed to remove exec state dir")
 	}

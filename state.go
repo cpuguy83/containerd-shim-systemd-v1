@@ -174,11 +174,9 @@ func (p *execProcess) LoadState(ctx context.Context) error {
 	return nil
 }
 
-// loadExitFromUnit reads a unit's terminal exit from systemd (ExecMainStatus and
-// SubState via GetAll). It is the reconcile path's exit-code source: no
-// ExecStopPost helper writes the state file on stop anymore, and create persists
-// only a running state, so on a real exit the code must come from systemd's
-// still-loaded unit. getUnitState leaves ExitedAt unset, so stamp it for a clean
+// loadExitFromUnit is the fallback when the signal stream did not record a
+// terminal Service update. It reads ExecMainStatus and SubState while the unit
+// is still loaded. getUnitState leaves ExitedAt unset, so stamp it for a clean
 // exit whose code is 0 (its exited status still comes through SubState).
 func loadExitFromUnit(ctx context.Context, conn *dbus.Conn, name string) (pState, error) {
 	var st pState
@@ -193,6 +191,10 @@ func loadExitFromUnit(ctx context.Context, conn *dbus.Conn, name string) (pState
 }
 
 func (p *initProcess) LoadExitState(ctx context.Context) error {
+	if st, ok := p.loadRecordedSystemdExitState(); ok {
+		p.SetState(ctx, st)
+		return nil
+	}
 	st, err := loadExitFromUnit(ctx, p.systemd, p.Name())
 	if err != nil {
 		return err
@@ -202,6 +204,10 @@ func (p *initProcess) LoadExitState(ctx context.Context) error {
 }
 
 func (p *execProcess) LoadExitState(ctx context.Context) error {
+	if st, ok := p.loadRecordedSystemdExitState(); ok {
+		p.SetState(ctx, st)
+		return nil
+	}
 	st, err := loadExitFromUnit(ctx, p.systemd, p.Name())
 	if err != nil {
 		return err

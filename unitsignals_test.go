@@ -9,11 +9,11 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
-func TestDecodeUnitPropertiesChanged(t *testing.T) {
+func TestDecodeSystemdPropertiesChanged(t *testing.T) {
 	changed := changedProps(map[string]string{"ActiveState": "failed", "SubState": "failed"})
 
 	t.Run("a Unit PropertiesChanged signal decodes to its escaped path base and changed set", func(t *testing.T) {
-		u, ok := decodeUnitPropertiesChanged(unitSignal("foo_2eservice", changed))
+		u, ok := decodeSystemdPropertiesChanged(unitSignal("foo_2eservice", changed))
 		if !ok {
 			t.Fatal("expected a Unit PropertiesChanged signal to decode")
 		}
@@ -23,20 +23,32 @@ func TestDecodeUnitPropertiesChanged(t *testing.T) {
 		if v, ok := u.changed["ActiveState"]; !ok || v.Value() != "failed" {
 			t.Fatalf("changed[ActiveState] = %v, want failed", u.changed["ActiveState"])
 		}
+		if u.interfaceName != unitInterface {
+			t.Fatalf("interface = %q, want %q", u.interfaceName, unitInterface)
+		}
 	})
 
-	t.Run("a PropertiesChanged for a non-Unit interface is ignored", func(t *testing.T) {
-		sig := unitSignal("foo_2eservice", changed)
-		sig.Body[0] = "org.freedesktop.systemd1.Service"
-		if _, ok := decodeUnitPropertiesChanged(sig); ok {
-			t.Fatal("expected a non-Unit interface to be ignored")
+	t.Run("a Service PropertiesChanged signal decodes with its interface", func(t *testing.T) {
+		u, ok := decodeSystemdPropertiesChanged(serviceSignal("foo_2eservice", changed))
+		if !ok {
+			t.Fatal("expected a Service PropertiesChanged signal to decode")
+		}
+		if u.interfaceName != serviceInterface {
+			t.Fatalf("interface = %q, want %q", u.interfaceName, serviceInterface)
+		}
+	})
+
+	t.Run("a PropertiesChanged for another interface is ignored", func(t *testing.T) {
+		sig := propertiesSignal("foo_2eservice", "org.freedesktop.systemd1.Socket", changed)
+		if _, ok := decodeSystemdPropertiesChanged(sig); ok {
+			t.Fatal("expected an unrelated interface to be ignored")
 		}
 	})
 
 	t.Run("a signal that is not PropertiesChanged is ignored", func(t *testing.T) {
 		sig := unitSignal("foo_2eservice", changed)
 		sig.Name = "org.freedesktop.systemd1.Manager.UnitNew"
-		if _, ok := decodeUnitPropertiesChanged(sig); ok {
+		if _, ok := decodeSystemdPropertiesChanged(sig); ok {
 			t.Fatal("expected a non-PropertiesChanged signal to be ignored")
 		}
 	})
@@ -44,7 +56,7 @@ func TestDecodeUnitPropertiesChanged(t *testing.T) {
 	t.Run("a signal with a short body is ignored", func(t *testing.T) {
 		sig := unitSignal("foo_2eservice", changed)
 		sig.Body = sig.Body[:1]
-		if _, ok := decodeUnitPropertiesChanged(sig); ok {
+		if _, ok := decodeSystemdPropertiesChanged(sig); ok {
 			t.Fatal("expected a short body to be ignored")
 		}
 	})
@@ -52,14 +64,57 @@ func TestDecodeUnitPropertiesChanged(t *testing.T) {
 	t.Run("a signal whose changed set is not a property map is ignored", func(t *testing.T) {
 		sig := unitSignal("foo_2eservice", changed)
 		sig.Body[1] = "not a map"
-		if _, ok := decodeUnitPropertiesChanged(sig); ok {
+		if _, ok := decodeSystemdPropertiesChanged(sig); ok {
 			t.Fatal("expected a malformed changed set to be ignored")
 		}
 	})
 
 	t.Run("a nil signal is ignored", func(t *testing.T) {
-		if _, ok := decodeUnitPropertiesChanged(nil); ok {
+		if _, ok := decodeSystemdPropertiesChanged(nil); ok {
 			t.Fatal("expected a nil signal to be ignored")
+		}
+	})
+}
+
+func TestServiceExitState(t *testing.T) {
+	t.Run("terminal service properties preserve the pid, exit code, and timestamp", func(t *testing.T) {
+		exitedAt := time.Date(2026, time.July, 16, 12, 0, 0, 123000000, time.Local)
+		changed := map[string]dbus.Variant{
+			"ExecMainPID":           dbus.MakeVariant(uint32(42)),
+			"ExecMainStatus":        dbus.MakeVariant(int32(17)),
+			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(exitedAt.UnixMicro())),
+		}
+
+		state, ok := serviceExitState(changed)
+		if !ok {
+			t.Fatal("terminal service properties were not recognized")
+		}
+		if state.Pid != 42 || state.ExitCode != 17 || !state.ExitedAt.Equal(exitedAt) || state.Status != "exited" {
+			t.Fatalf("state = %s, want pid 42, exit 17, timestamp %s, status exited", state, exitedAt)
+		}
+	})
+
+	t.Run("service properties without an exit timestamp are not terminal", func(t *testing.T) {
+		changed := map[string]dbus.Variant{
+			"ExecMainPID":           dbus.MakeVariant(uint32(42)),
+			"ExecMainStatus":        dbus.MakeVariant(int32(0)),
+			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(0)),
+		}
+
+		if _, ok := serviceExitState(changed); ok {
+			t.Fatal("running service properties were recognized as an exit")
+		}
+	})
+
+	t.Run("service properties with a negative exit status are invalid", func(t *testing.T) {
+		changed := map[string]dbus.Variant{
+			"ExecMainPID":           dbus.MakeVariant(uint32(42)),
+			"ExecMainStatus":        dbus.MakeVariant(int32(-1)),
+			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(time.Now().UnixMicro())),
+		}
+
+		if _, ok := serviceExitState(changed); ok {
+			t.Fatal("a negative service exit status was accepted")
 		}
 	})
 }
@@ -67,12 +122,13 @@ func TestDecodeUnitPropertiesChanged(t *testing.T) {
 func TestUnitUpdates(t *testing.T) {
 	changed := changedProps(map[string]string{"ActiveState": "failed"})
 
-	t.Run("only Unit PropertiesChanged signals reach the consumer", func(t *testing.T) {
+	t.Run("only Unit and Service PropertiesChanged signals reach the consumer", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		sigs := make(chan *dbus.Signal, 8)
 		sigs <- unitSignal("keep_2eservice", changed)
+		sigs <- serviceSignal("service_2eservice", changed)
 		other := unitSignal("drop_2eservice", changed)
 		other.Name = "org.freedesktop.systemd1.Manager.UnitNew"
 		sigs <- other
@@ -83,8 +139,8 @@ func TestUnitUpdates(t *testing.T) {
 		for u := range unitUpdates(ctx, sigs) {
 			got = append(got, u.pathBase)
 		}
-		if len(got) != 2 || got[0] != "keep_2eservice" || got[1] != "also_2eservice" {
-			t.Fatalf("got %v, want [keep_2eservice also_2eservice]", got)
+		if len(got) != 3 || got[0] != "keep_2eservice" || got[1] != "service_2eservice" || got[2] != "also_2eservice" {
+			t.Fatalf("got %v, want [keep_2eservice service_2eservice also_2eservice]", got)
 		}
 	})
 
@@ -151,6 +207,11 @@ func TestSignalIntakeDoesNotAllocate(t *testing.T) {
 		unitSignal("dbus_2eservice", active),
 		unitSignal("systemd_2djournald_2eservice", failed), // a foreign unit's exit
 		unitSignal(systemd.PathBusEscape(ours), active),
+		serviceSignal(systemd.PathBusEscape(ours), map[string]dbus.Variant{
+			"ExecMainPID":           dbus.MakeVariant(uint32(42)),
+			"ExecMainStatus":        dbus.MakeVariant(int32(3)),
+			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(time.Now().UnixMicro())),
+		}),
 		unitSignal(systemd.PathBusEscape(ours), failed),
 	}
 
@@ -163,7 +224,7 @@ func TestSignalIntakeDoesNotAllocate(t *testing.T) {
 
 	got := testing.AllocsPerRun(100, func() {
 		for _, s := range sigs {
-			if u, ok := decodeUnitPropertiesChanged(s); ok {
+			if u, ok := decodeSystemdPropertiesChanged(s); ok {
 				enqueueIfExit(q, units, u)
 			}
 		}
@@ -176,9 +237,17 @@ func TestSignalIntakeDoesNotAllocate(t *testing.T) {
 // unitSignal builds a Unit PropertiesChanged signal for the given escaped unit
 // path element and changed property set.
 func unitSignal(escapedUnit string, changed map[string]dbus.Variant) *dbus.Signal {
+	return propertiesSignal(escapedUnit, unitInterface, changed)
+}
+
+func serviceSignal(escapedUnit string, changed map[string]dbus.Variant) *dbus.Signal {
+	return propertiesSignal(escapedUnit, serviceInterface, changed)
+}
+
+func propertiesSignal(escapedUnit, interfaceName string, changed map[string]dbus.Variant) *dbus.Signal {
 	return &dbus.Signal{
 		Path: dbus.ObjectPath("/org/freedesktop/systemd1/unit/" + escapedUnit),
 		Name: propertiesChangedSignal,
-		Body: []interface{}{unitInterface, changed, []string{}},
+		Body: []interface{}{interfaceName, changed, []string{}},
 	}
 }

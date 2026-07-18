@@ -152,6 +152,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			},
 			exe:        s.exe,
 			root:       r.Bundle,
+			unitDir:    s.unitDir,
 			shimCgroup: opts.ShimCgroup,
 		},
 		Bundle:           r.Bundle,
@@ -249,6 +250,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 			Terminal: r.Terminal,
 			systemd:  s.conn,
 			exe:      s.exe,
+			unitDir:  s.unitDir,
 			opts:     CreateOptions{LogMode: s.defaultLogMode.String()},
 			runc: &runc.Runc{
 				Debug:         s.debug,
@@ -314,7 +316,7 @@ func (p *execProcess) Create(ctx context.Context) error {
 		return err
 	}
 
-	if err := writeUnit(p.Name(), opts); err != nil {
+	if err := writeUnit(p.unitPath(), opts); err != nil {
 		return err
 	}
 	if err := p.systemd.ReloadContext(ctx); err != nil {
@@ -393,7 +395,7 @@ func (p *initProcess) createRestore(ctx context.Context) error {
 		return err
 	}
 
-	if err := writeUnit(p.Name(), unitOpts); err != nil {
+	if err := writeUnit(p.unitPath(), unitOpts); err != nil {
 		return err
 	}
 	if err := p.systemd.ReloadContext(ctx); err != nil {
@@ -466,7 +468,7 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 		}()
 	}
 
-	if err := writeUnit(p.Name(), unitOpts); err != nil {
+	if err := writeUnit(p.unitPath(), unitOpts); err != nil {
 		return 0, err
 	}
 	if err := p.systemd.ReloadContext(ctx); err != nil {
@@ -484,6 +486,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 	uName := p.Name()
 
 	do := func() error {
+		p.clearRecordedSystemdExitState()
 		ch := make(chan string, 1)
 		p.systemd.ResetFailedUnitContext(ctx, p.Name())
 		if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
@@ -578,7 +581,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 			ret := err
 			if p.runc.Debug {
 				ret = fmt.Errorf("%w:\n%s", err, p.Name())
-				unitData, err := os.ReadFile("/run/systemd/system/" + uName)
+				unitData, err := os.ReadFile(p.unitPath())
 				if err == nil {
 					ret = fmt.Errorf("%w:\n%s", ret, string(unitData))
 				}
@@ -617,14 +620,7 @@ func waitAny(ws *unix.WaitStatus) (int, error) {
 	}
 }
 
-func reap(ctx context.Context, chChld chan os.Signal, wait chan waitStatus, chProc <-chan *os.Process) {
-	// wait for process start
-	var proc *os.Process
-	select {
-	case <-ctx.Done():
-	case proc = <-chProc:
-	}
-
+func reap(ctx context.Context, chChld chan os.Signal, wait chan waitStatus) {
 	for range chChld {
 		var ws unix.WaitStatus
 
@@ -632,17 +628,6 @@ func reap(ctx context.Context, chChld chan os.Signal, wait chan waitStatus, chPr
 		if pid <= 0 {
 			log.G(ctx).WithError(err).WithField("pid", pid).Warn("Error waiting for child")
 			continue
-		}
-
-		if pid == proc.Pid {
-			// This is the runc process
-			// If runc returns 0 we still need to give some time to see if the container process is stable.
-			// If non-zero then runc exited before bringing up the container.
-			log.G(ctx).WithField("pid", pid).WithField("code", ws.ExitStatus()).Debug("runc exited")
-			if ws.ExitStatus() != 0 {
-				wait <- waitStatus{Status: ws.ExitStatus(), Pid: uint32(pid)}
-			}
-			return
 		}
 
 		wait <- waitStatus{Status: ws.ExitStatus(), Pid: uint32(pid)}
@@ -722,13 +707,11 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 
 	wait := make(chan waitStatus, 1)
 	chChld := make(chan os.Signal, 1)
-	chProc := make(chan *os.Process, 1)
 	defer signal.Stop(chChld)
 
 	var readPid uint32
 	if !noReap {
 		signal.Notify(chChld, syscall.SIGCHLD)
-		go reap(ctx, chChld, wait, chProc)
 
 		var i uintptr = 1
 		if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, i, 0, 0, 0); err != nil {
@@ -740,10 +723,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		return err
 	}
 
-	chProc <- cmd.Process
 	log.G(ctx).Debugf("runc pid: %d", cmd.Process.Pid)
-
-	defer cmd.Wait()
 
 	chPid := make(chan int)
 	go func() {
@@ -824,6 +804,11 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		sdNotify(ctx, notifyErrno(st.ExitCode), notifyStatus(st.Status))
 		return err
 	}
+	if !noReap {
+		// Cmd.Wait is the sole waiter for runc. Start the subreaper only after it
+		// returns so wait4 cannot consume runc's status first.
+		go reap(ctx, chChld, wait)
+	}
 
 	var notify func()
 
@@ -852,7 +837,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 				st.Pid = status.Pid
 				st.ExitCode = uint32(status.Status)
 				st.ExitedAt = time.Now()
-				st.Status = exitedInit
+				st.Status = "exited"
 				notify = func() { sdNotify(ctx, notifyStatus(st.Status), notifyErrno(st.ExitCode), notifyMainPID(st.Pid)) }
 			default:
 				var status unix.WaitStatus
@@ -861,8 +846,8 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 				if p == pid {
 					st.ExitCode = uint32(status.ExitStatus())
 					st.ExitedAt = time.Now()
-					st.Status = exitedInit
-					notify = func() { sdNotify(ctx, notifyStatus(exitedInit), notifyErrno(st.ExitCode), notifyMainPID(st.Pid)) }
+					st.Status = "exited"
+					notify = func() { sdNotify(ctx, notifyStatus(st.Status), notifyErrno(st.ExitCode), notifyMainPID(st.Pid)) }
 				} else {
 					notify = func() {
 						sdNotify(ctx, daemon.SdNotifyReady, notifyMainPID(st.Pid))
