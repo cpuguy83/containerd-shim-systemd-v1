@@ -112,6 +112,7 @@ func newTestInitProcess(id string) (*initProcess, func() int32) {
 		},
 	}
 	p.cond = sync.NewCond(&p.mu)
+	p.markStartEventPublished()
 	return p, func() int32 { return atomic.LoadInt32(&taskExits) }
 }
 
@@ -122,5 +123,6 @@ func newTestExecProcess(parent *initProcess, execID string) *execProcess {
 		execID:  execID,
 	}
 	ep.cond = sync.NewCond(&ep.mu)
+	ep.markStartEventPublished()
 	return ep
 }

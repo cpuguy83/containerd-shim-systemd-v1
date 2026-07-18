@@ -117,6 +117,25 @@ func TestEnqueueIfExit(t *testing.T) {
 		}
 	})
 
+	t.Run("terminal service properties are recorded before reconciliation is enqueued", func(t *testing.T) {
+		p := &fakeProcess{name: unit}
+		q, units := newQueued(p)
+		exitedAt := time.UnixMicro(time.Now().UnixMicro())
+
+		enqueueIfExit(q, units, serviceExitUpdate(unit, 9, 17, exitedAt))
+
+		if queueLen(q) != 1 {
+			t.Fatalf("expected the exiting service to be enqueued, queue has %d", queueLen(q))
+		}
+		recorded, ok := p.recordedSystemdExitState()
+		if !ok {
+			t.Fatal("terminal service state was not recorded")
+		}
+		if recorded.Pid != 9 || recorded.ExitCode != 17 || !recorded.ExitedAt.Equal(exitedAt) {
+			t.Fatalf("recorded state = %s, want pid 9, exit 17, timestamp %s", recorded, exitedAt)
+		}
+	})
+
 	t.Run("a non-exit transition is not enqueued", func(t *testing.T) {
 		q, units := newQueued(&fakeProcess{name: unit})
 		running := newUpdate(unit, changedProps(map[string]string{"ActiveState": "active", "SubState": "running"}))
@@ -164,6 +183,34 @@ func TestReactToUnitEvents(t *testing.T) {
 
 		if !eventually(2*time.Second, time.Millisecond, func() bool { return p.LoadStateCalls() == 1 }) {
 			t.Fatal("reactor never reconciled the exiting unit")
+		}
+		cancel()
+		<-done
+	})
+
+	t.Run("service exit properties survive until the worker reconciles them", func(t *testing.T) {
+		p := &fakeProcess{name: unit, loadStateFn: func(f *fakeProcess) error {
+			f.setState(pState{Pid: 9, Status: "running"})
+			return nil
+		}}
+		units := &fakeLookup{m: map[string]Process{unit: p}}
+
+		updates := make(chan unitUpdate, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
+
+		updates <- serviceExitUpdate(unit, 9, 17, time.Now())
+
+		if !eventually(2*time.Second, time.Millisecond, func() bool {
+			return p.ProcessState().Exited() && p.ProcessState().ExitCode == 17
+		}) {
+			t.Fatalf("recorded service exit was not reconciled: %s", p.ProcessState())
+		}
+		if got := p.LoadExitStateCalls(); got != 1 {
+			t.Fatalf("expected one recorded exit-state load, got %d", got)
 		}
 		cancel()
 		<-done
@@ -669,11 +716,27 @@ func exitUpdate(unit string) unitUpdate {
 	return newUpdate(unit, changedProps(map[string]string{"ActiveState": "failed", "SubState": "failed"}))
 }
 
+func serviceExitUpdate(unit string, pid, exitCode uint32, exitedAt time.Time) unitUpdate {
+	return unitUpdate{
+		pathBase:      systemd.PathBusEscape(unit),
+		interfaceName: serviceInterface,
+		changed: map[string]dbus.Variant{
+			"ExecMainPID":           dbus.MakeVariant(pid),
+			"ExecMainStatus":        dbus.MakeVariant(int32(exitCode)),
+			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(exitedAt.UnixMicro())),
+		},
+	}
+}
+
 // newUpdate builds a unitUpdate the way the decoder does: the reactor keys off
 // the systemd-escaped object-path base, so tests escape the real unit name here
 // rather than hand-writing escaped paths.
 func newUpdate(unit string, changed map[string]dbus.Variant) unitUpdate {
-	return unitUpdate{pathBase: systemd.PathBusEscape(unit), changed: changed}
+	return unitUpdate{
+		pathBase:      systemd.PathBusEscape(unit),
+		interfaceName: unitInterface,
+		changed:       changed,
+	}
 }
 
 // seqFromChan adapts a channel of updates into the iter.Seq the reactor consumes,
@@ -751,6 +814,8 @@ type fakeProcess struct {
 	loadExitCalls   int32
 	loadStateFn     func(*fakeProcess) error
 	loadExitStateFn func(*fakeProcess) error
+	systemdExit     pState
+	hasSystemdExit  bool
 }
 
 // LoadState mirrors the real implementations, which do NOT hold the process lock
@@ -776,6 +841,9 @@ func (f *fakeProcess) LoadExitState(context.Context) error {
 	if f.loadExitStateFn != nil {
 		return f.loadExitStateFn(f)
 	}
+	if state, ok := f.recordedSystemdExitState(); ok {
+		f.setState(state)
+	}
 	return nil
 }
 
@@ -787,6 +855,21 @@ func (f *fakeProcess) setState(st pState) {
 	f.mu.Lock()
 	f.state = st
 	f.mu.Unlock()
+}
+
+func (f *fakeProcess) RecordSystemdExitState(state pState) {
+	f.mu.Lock()
+	if !f.hasSystemdExit {
+		f.systemdExit = state
+		f.hasSystemdExit = true
+	}
+	f.mu.Unlock()
+}
+
+func (f *fakeProcess) recordedSystemdExitState() (pState, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.systemdExit, f.hasSystemdExit
 }
 
 func (f *fakeProcess) ProcessState() pState {

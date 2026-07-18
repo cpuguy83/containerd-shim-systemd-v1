@@ -91,8 +91,10 @@ jobs:
         # Compile the race-enabled test binary as the normal user so the Go
         # toolchain and module cache are never touched as root.
         run: go test -race -c -o shim.test .
-      - name: run tests
-        # Run as root so the integration tests reach systemd's system private
-        # bus (/run/systemd/private) instead of skipping.
-        run: sudo ./shim.test -test.v
-
+      - name: run tests against system systemd
+        # Run the precompiled binary as root so integration tests use
+        # /run/systemd/private without invoking the Go toolchain through sudo.
+        run: |
+          set -euxo pipefail
+          sudo test -S /run/systemd/private
+          sudo env -u XDG_RUNTIME_DIR ./shim.test -test.v

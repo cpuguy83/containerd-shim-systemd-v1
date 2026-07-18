@@ -30,6 +30,8 @@ import (
 
 const shimName = "io.containerd.systemd.v1"
 
+const systemUnitDir = "/run/systemd/system"
+
 var (
 	timeZero = time.UnixMicro(0)
 )
@@ -49,17 +51,41 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 
 	runcPath, err := exec.LookPath("runc")
 	if err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("error looking up runc path: %w", err)
-	}
-
-	runcRoot := filepath.Join(cfg.Root, "runc")
-	if err := os.MkdirAll(runcRoot, 0710); err != nil {
-		return nil, err
 	}
 
 	exe, err := os.Executable()
 	if err != nil {
 		exe = os.Args[0]
+	}
+
+	s, err := newServiceWithConfig(ctx, serviceConfig{
+		Config:  cfg,
+		conn:    conn,
+		runcBin: runcPath,
+		exe:     exe,
+		unitDir: systemUnitDir,
+	})
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+type serviceConfig struct {
+	Config
+	conn    *systemd.Conn
+	runcBin string
+	exe     string
+	unitDir string
+}
+
+func newServiceWithConfig(ctx context.Context, cfg serviceConfig) (*Service, error) {
+	runcRoot := filepath.Join(cfg.Root, "runc")
+	if err := os.MkdirAll(runcRoot, 0710); err != nil {
+		return nil, err
 	}
 
 	log.L = log.G(ctx).WithFields(logrus.Fields{
@@ -69,9 +95,10 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 
 	debug := logrus.GetLevel() >= logrus.DebugLevel
 	return &Service{
-		conn:           conn,
-		exe:            exe,
+		conn:           cfg.conn,
+		exe:            cfg.exe,
 		root:           cfg.Root,
+		unitDir:        cfg.unitDir,
 		noNewNamespace: cfg.NoNewNamespace,
 		publisher:      cfg.Publisher,
 		events:         make(chan eventEnvelope, 128),
@@ -79,7 +106,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		defaultLogMode: cfg.LogMode,
 		processes:      &processManager{ls: make(map[string]Process)},
 		units:          newUnitManager(),
-		runcBin:        runcPath,
+		runcBin:        cfg.runcBin,
 		debug:          debug,
 	}, nil
 }
@@ -89,6 +116,7 @@ type Service struct {
 	runcBin        string
 	debug          bool
 	root           string
+	unitDir        string
 	noNewNamespace bool
 	publisher      events.Publisher
 	events         chan eventEnvelope

@@ -37,8 +37,8 @@ type connected interface {
 // itself (see unitsignals.go) rather than via go-systemd's Set*Subscriber, which
 // races on its subscriber field and reads unit properties per signal. Reading
 // raw signals never reads properties, so it cannot trigger the historical
-// GetAll feedback storm; a single targeted read happens only for our own units,
-// only when they exit.
+// GetAll feedback storm. Terminal Service properties are retained from the
+// signal itself; a targeted read is only a fallback.
 func (s *Service) watchEvents(ctx context.Context) {
 	go s.runEventReactor(ctx)
 }
@@ -205,27 +205,37 @@ func (r *eventReactor) consume(ctx context.Context, updates iter.Seq[unitUpdate]
 }
 
 // enqueueIfExit is the informer predicate: it enqueues a unit for reconciliation
-// only on an exit transition for a unit we still track and have not already
-// marked exited. It resolves the unit through the escaped-name index, so a
-// signal for a unit we do not track (the private bus broadcasts every unit's
-// changes) is dropped by a map miss without ever unescaping the name. It does no
-// I/O either (the ProcessState read is an in-memory lock), so it cannot trigger
-// the GetAll feedback storm, and it keeps three sources of noise off the queue:
-//
-//   - non-exit transitions (the flood of activating/running changes) and other
-//     units' signals;
-//   - trailing exit events after we have already handled the exit -- a normal
-//     lifecycle emits two exit-matching events (a leading inactive/dead before
-//     the unit starts, then the real inactive/failed), plus more on restarts;
-//   - the leading pre-start inactive/dead is still enqueued (the process is not
-//     yet exited), but reconcileUnit/LoadState is level-driven and no-ops for a
-//     not-yet-started process, so it cannot produce a spurious exit.
+// on a Unit exit transition or a terminal Service update for a process we still
+// track and have not already marked exited. A terminal Service update is copied
+// into the process before enqueueing, so a worker does not lose the exit code if
+// systemd unloads the unit first. Signals for units we do not track are dropped
+// by an escaped-name map miss without unescaping the name. The predicate does no
+// I/O, so it cannot trigger the GetAll feedback storm.
+// Non-exit transitions and trailing events after a recorded exit are dropped.
+// The leading pre-start inactive/dead event is still enqueued, but
+// reconcileUnit/LoadState is level-driven and no-ops while the process has no
+// PID, so it cannot produce a spurious exit.
 func enqueueIfExit(q *unitWorkQueue, units processLookup, u unitUpdate) {
-	if !unitEventIsExit(u.changed) {
-		return
-	}
-	p := units.GetByPath(u.pathBase)
-	if p == nil || p.ProcessState().Exited() {
+	switch u.interfaceName {
+	case serviceInterface:
+		state, ok := serviceExitState(u.changed)
+		if !ok {
+			return
+		}
+		p := units.GetByPath(u.pathBase)
+		if p == nil || p.ProcessState().Exited() {
+			return
+		}
+		p.RecordSystemdExitState(state)
+	case unitInterface:
+		if !unitEventIsExit(u.changed) {
+			return
+		}
+		p := units.GetByPath(u.pathBase)
+		if p == nil || p.ProcessState().Exited() {
+			return
+		}
+	default:
 		return
 	}
 	q.Add(u.pathBase)
@@ -275,12 +285,10 @@ func reconcileWorker(ctx context.Context, q *unitWorkQueue, units processLookup)
 // index; the systemd read inside LoadState uses the process's own name, so the
 // key is only a lookup handle here.
 //
-// The Unit-interface payload that enqueued this work signals that the unit
-// stopped but does not carry the exit code (ExecMainStatus lives on the Service
-// interface, which go-systemd does not forward). LoadState reads the persisted
-// exit file first and otherwise does a single targeted GetAll on our own,
-// still-loaded unit -- safe from the feedback storm because the unit is loaded
-// and the read is scoped to us.
+// LoadState reads the persisted exit file first. If it only contains a running
+// state, LoadExitState consumes terminal properties retained from the Service
+// signal. A targeted GetAll on our own unit is the fallback for a Unit exit
+// signal that arrived without a terminal Service update.
 func reconcileUnit(ctx context.Context, units processLookup, pathBase string) error {
 	p := units.GetByPath(pathBase)
 	if p == nil {
@@ -299,13 +307,10 @@ func reconcileUnit(ctx context.Context, units processLookup, pathBase string) er
 		return err
 	}
 
-	// The exit signal says the unit stopped, but create persists only a running
-	// state file: the terminal exit code lives in systemd's ExecMainStatus, which
-	// the Unit-interface signal does not carry. When the persisted state is not
-	// yet terminal for a started process, read the real exit from the
-	// still-loaded unit. A Pid of 0 means the unit never started (the leading
-	// pre-start inactive/dead event), so there is nothing to read and systemd's
-	// "dead" substate must not be mistaken for an exit.
+	// Create normally persists only a running state. When it is not terminal for
+	// a started process, consume the Service signal's terminal state or fall back
+	// to the still-loaded unit. A Pid of 0 means the unit never started (the
+	// leading pre-start inactive/dead event), so there is nothing to read.
 	if !p.ProcessState().Exited() && p.Pid() > 0 {
 		if err := p.LoadExitState(ctx); err != nil {
 			return err

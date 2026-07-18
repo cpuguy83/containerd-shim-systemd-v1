@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -125,12 +126,10 @@ type Process interface {
 	// identifier the event reactor matches incoming signals against.
 	PathName() string
 	LoadState(context.Context) error
-	// LoadExitState refreshes the process state from systemd's record of the
-	// unit (ExecMainStatus/SubState). The exit reactor uses it to obtain the
-	// terminal exit code on a real exit -- the persisted state file only carries
-	// a running state -- so the GetAll it performs stays off the hot LoadState
-	// path.
+	// LoadExitState refreshes the process from terminal systemd properties
+	// recorded by the signal stream, falling back to GetAll when necessary.
 	LoadExitState(context.Context) error
+	RecordSystemdExitState(pState)
 	SetState(context.Context, pState) pState
 	ProcessState() pState
 	LogWriter() io.Writer
@@ -187,9 +186,10 @@ func (c CreateOptions) RestoreArgs() []string {
 }
 
 type process struct {
-	ns   string
-	id   string
-	root string
+	ns      string
+	id      string
+	root    string
+	unitDir string
 
 	// pathName is the unit's systemd-escaped D-Bus object-path base, computed
 	// once at creation. The event reactor matches incoming signals against it,
@@ -216,6 +216,13 @@ type process struct {
 	deleted      bool
 	exitNotified bool
 
+	eventMu             sync.Mutex
+	startEventPublished bool
+	pendingExitEvent    func()
+
+	systemdExitState    pState
+	hasSystemdExitState bool
+
 	shimCgroup string
 }
 
@@ -232,6 +239,52 @@ func (p *process) claimExitNotification() bool {
 	}
 	p.exitNotified = true
 	return true
+}
+
+func (p *process) sendExitAfterStart(send func()) {
+	p.eventMu.Lock()
+	if !p.startEventPublished {
+		p.pendingExitEvent = send
+		p.eventMu.Unlock()
+		return
+	}
+	p.eventMu.Unlock()
+	send()
+}
+
+func (p *process) markStartEventPublished() {
+	p.eventMu.Lock()
+	p.startEventPublished = true
+	send := p.pendingExitEvent
+	p.pendingExitEvent = nil
+	p.eventMu.Unlock()
+	if send != nil {
+		send()
+	}
+}
+
+func (p *process) RecordSystemdExitState(state pState) {
+	p.mu.Lock()
+	if !p.hasSystemdExitState || state.ExitedAt.After(p.systemdExitState.ExitedAt) {
+		p.systemdExitState = state
+		p.hasSystemdExitState = true
+	}
+	p.mu.Unlock()
+}
+
+func (p *process) clearRecordedSystemdExitState() {
+	p.mu.Lock()
+	p.systemdExitState.Reset()
+	p.hasSystemdExitState = false
+	p.mu.Unlock()
+}
+
+func (p *process) loadRecordedSystemdExitState() (pState, bool) {
+	p.mu.Lock()
+	state := p.systemdExitState
+	ok := p.hasSystemdExitState
+	p.mu.Unlock()
+	return state, ok
 }
 
 func (p *process) ProcessState() pState {
@@ -267,6 +320,14 @@ func (p *initProcess) Name() string {
 // re-escape the name.
 func (p *process) PathName() string {
 	return p.pathName
+}
+
+func (p *initProcess) unitPath() string {
+	return filepath.Join(p.unitDir, p.Name())
+}
+
+func (p *execProcess) unitPath() string {
+	return filepath.Join(p.unitDir, p.Name())
 }
 
 func (p *process) Pid() uint32 {
@@ -362,12 +423,14 @@ func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 		p.cond.Broadcast()
 		// If the init helper process exited, this should not yield a task exit event as the task never actually started.
 		if st.Status != exitedInit {
-			p.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
-				ContainerID: p.id,
-				ID:          p.id,
-				ExitStatus:  st.ExitCode,
-				ExitedAt:    st.ExitedAt,
-				Pid:         st.Pid,
+			p.sendExitAfterStart(func() {
+				p.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
+					ContainerID: p.id,
+					ID:          p.id,
+					ExitStatus:  st.ExitCode,
+					ExitedAt:    st.ExitedAt,
+					Pid:         st.Pid,
+				})
 			})
 		}
 	}
@@ -470,28 +533,40 @@ func (p *execProcess) LogWriter() io.Writer {
 	return p.parent.shimLog
 }
 
-func (p *execProcess) getPid(ctx context.Context) (uint32, error) {
-	if pid := p.ProcessState().Pid; pid > 0 {
-		return pid, nil
+func (p *execProcess) getPid(context.Context) (uint32, error) {
+	data, err := os.ReadFile(p.pidFile())
+	if err != nil {
+		var state pState
+		if stateErr := p.readExitState(&state); stateErr == nil && state.Status == "exited" && state.Pid > 0 {
+			// systemd can remove PIDFile as soon as a pre-READY fast exit makes
+			// the start job fail. The helper's terminal state still proves that
+			// runc created the workload and carries its PID.
+			return state.Pid, nil
+		}
+		return 0, fmt.Errorf("read exec pid file: %w", err)
 	}
-
-	if err := p.LoadState(ctx); err != nil {
-		return 0, err
+	pid, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("parse exec pid: %w", err)
 	}
-
-	return p.ProcessState().Pid, nil
+	if pid == 0 {
+		return 0, fmt.Errorf("exec pid file contains zero")
+	}
+	return uint32(pid), nil
 }
 
 func (p *execProcess) SetState(ctx context.Context, state pState) pState {
 	st := p.process.SetState(ctx, state)
 	if st.Exited() && p.claimExitNotification() {
 		p.cond.Broadcast()
-		p.parent.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
-			ContainerID: p.parent.id,
-			ID:          p.execID,
-			ExitStatus:  st.ExitCode,
-			ExitedAt:    st.ExitedAt,
-			Pid:         st.Pid,
+		p.sendExitAfterStart(func() {
+			p.parent.sendEvent(ctx, p.ns, &eventsapi.TaskExit{
+				ContainerID: p.parent.id,
+				ID:          p.execID,
+				ExitStatus:  st.ExitCode,
+				ExitedAt:    st.ExitedAt,
+				Pid:         st.Pid,
+			})
 		})
 	}
 	return st

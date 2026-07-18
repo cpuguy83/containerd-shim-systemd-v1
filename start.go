@@ -66,6 +66,7 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 			ExecID:      r.ExecID,
 			Pid:         pid,
 		})
+		ep.(*execProcess).markStartEventPublished()
 	} else {
 		pid, err = p.Start(ctx)
 		if err != nil {
@@ -75,6 +76,7 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 			ContainerID: r.ID,
 			Pid:         pid,
 		})
+		p.(*initProcess).markStartEventPublished()
 	}
 
 	return &taskapi.StartResponse{Pid: pid}, nil
@@ -89,10 +91,10 @@ func (p *process) runcCmd(cmd []string) ([]string, error) {
 	return append(root, cmd...), nil
 }
 
-func writeUnit(name string, opts []*unit.UnitOption) error {
+func writeUnit(path string, opts []*unit.UnitOption) error {
 	rdr := unit.Serialize(opts)
 
-	f, err := os.Create(filepath.Join("/run/systemd/system", name))
+	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
@@ -116,6 +118,7 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 		unit.NewUnitOption(svc, "Type", p.unitType()),
 		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
 		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
+		unit.NewUnitOption(svc, "Environment", "PIDFILE="+p.pidFile()),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
 		// Set this as env vars here because we only want these fifos to be used for the container stdio, not the other commands we run.
 		// Otherwise we can run into interesting cases like the client has closeed the fifo and our Pre/Post commands hang
@@ -169,6 +172,7 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", "notify"),
 		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
+		unit.NewUnitOption(svc, "Environment", "PIDFILE="+p.pidFile()),
 		unit.NewUnitOption(svc, "GuessMainPID", "yes"),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
 		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
@@ -252,13 +256,18 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 			}
 
 			if !p.ProcessState().Exited() {
-				p.SetState(ctx, pState{ExitCode: 255, ExitedAt: time.Now()})
+				p.SetState(ctx, pState{
+					Pid:      p.Pid(),
+					ExitCode: 255,
+					ExitedAt: time.Now(),
+					Status:   "failed",
+				})
 			}
 		}
 		p.cond.Broadcast()
 
 		if p.runc.Debug {
-			unitData, err := os.ReadFile("/run/systemd/system/" + p.Name())
+			unitData, err := os.ReadFile(p.unitPath())
 			if err == nil {
 				ret = fmt.Errorf("%w:\n%s\n%s", ret, p.Name(), unitData)
 			}
@@ -289,6 +298,7 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		}
 	}
 
+	pid = p.Pid()
 	return pid, nil
 }
 
@@ -336,6 +346,7 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 		}()
 	}
 
+	p.clearRecordedSystemdExitState()
 	ch := make(chan string, 1)
 	if _, err := p.systemd.StartUnitContext(ctx, p.Name(), "replace", ch); err != nil {
 		return 0, err
@@ -363,7 +374,7 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 			ret := fmt.Errorf("error starting exec process")
 			if p.runc.Debug {
 				ret = fmt.Errorf("%w:\n%s", ret, p.Name())
-				unitData, err := os.ReadFile("/run/systemd/system/" + p.Name())
+				unitData, err := os.ReadFile(p.unitPath())
 				if err == nil {
 					ret = fmt.Errorf("%w:\n%s\n%s", ret, p.Name(), unitData)
 				}
@@ -386,7 +397,7 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 
 	p.LoadState(ctx)
 
-	if p.ProcessState().Status == exitedInit || p.ProcessState().Status == "exit-code" {
+	if p.ProcessState().Status == exitedInit {
 		ret := fmt.Errorf("error starting exec process")
 		if p.runc.Debug {
 			debug, err := os.ReadFile(p.runc.Log)
