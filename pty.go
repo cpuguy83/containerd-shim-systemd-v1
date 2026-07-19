@@ -275,22 +275,7 @@ func (p *process) makePty(ctx context.Context, sockPath string) (_, _ string, re
 			defer f.Close()
 		}
 	}
-	env := []string{
-		ttyHandshakeEnv + "=1",
-		ttySockPathEnv + "=" + sockPath,
-	}
-	if p.shimCgroup != "" {
-		env = append(env, "SHIM_CGROUP="+p.shimCgroup)
-	}
-
-	properties := []systemd.Property{
-		systemd.PropType("notify"),
-		systemd.PropExecStart([]string{p.exe, "tty-handshake"}, false),
-		{Name: "Environment", Value: dbus.MakeVariant(env)},
-		{Name: "StandardInputFile", Value: dbus.MakeVariant(p.Stdin)},
-		{Name: "StandardOutputFile", Value: dbus.MakeVariant(p.Stdout)},
-		{Name: "StandardErrorFile", Value: dbus.MakeVariant(logPath)},
-	}
+	properties := p.ttyServiceProperties(sockPath, logPath)
 
 	ttyUnit := p.ttyUnitName()
 	defer func() {
@@ -323,4 +308,28 @@ func (p *process) makePty(ctx context.Context, sockPath string) (_, _ string, re
 	}
 
 	return ttyUnit, sockPath, nil
+}
+
+func (p *process) ttyServiceProperties(sockPath, logPath string) []systemd.Property {
+	env := []string{
+		ttyHandshakeEnv + "=1",
+		ttySockPathEnv + "=" + sockPath,
+	}
+	if p.shimCgroup != "" {
+		env = append(env, "SHIM_CGROUP="+p.shimCgroup)
+	}
+
+	properties := []systemd.Property{
+		systemd.PropType("notify"),
+		systemd.PropExecStart([]string{p.exe, "tty-handshake"}, false),
+		{Name: "Environment", Value: dbus.MakeVariant(env)},
+		{Name: "StandardErrorFile", Value: dbus.MakeVariant(logPath)},
+	}
+	if p.Stdin != "" {
+		properties = append(properties, systemd.Property{Name: "StandardInputFile", Value: dbus.MakeVariant(p.Stdin)})
+	}
+	if p.Stdout != "" {
+		properties = append(properties, systemd.Property{Name: "StandardOutputFile", Value: dbus.MakeVariant(p.Stdout)})
+	}
+	return properties
 }
