@@ -10,17 +10,18 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/namespaces"
-	taskapi "github.com/containerd/containerd/runtime/v2/task"
+	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/log"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	dbus "github.com/godbus/dbus/v5"
-	ptypes "github.com/gogo/protobuf/types"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 const (
@@ -78,7 +79,7 @@ func (p *process) ResizePTY(ctx context.Context, width, height int, sockPath str
 }
 
 // ResizePty of a process
-func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_ *ptypes.Empty, retErr error) {
+func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_ *emptypb.Empty, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return nil, err
@@ -94,7 +95,7 @@ func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_
 	defer func() {
 		log.G(ctx).WithError(retErr).Info("systemd.ResizePTY end")
 		if retErr != nil {
-			retErr = errdefs.ToGRPC(retErr)
+			retErr = errgrpc.ToGRPC(retErr)
 		}
 	}()
 
@@ -114,7 +115,7 @@ func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_
 		}
 	}
 
-	return &ptypes.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 func (p *execProcess) ResizePTY(ctx context.Context, w, h int) error {
@@ -134,10 +135,10 @@ func (p *initProcess) ResizePTY(ctx context.Context, w, h int) error {
 }
 
 // CloseIO of a process
-func (s *Service) CloseIO(ctx context.Context, r *taskapi.CloseIORequest) (_ *ptypes.Empty, retErr error) {
+func (s *Service) CloseIO(ctx context.Context, r *taskapi.CloseIORequest) (_ *emptypb.Empty, retErr error) {
 	// TODO: I'm not sure what we should do here since we aren't really doing anything with container I/O
 	// Potentially we should signal the tty handler to stop copying stdio?
-	return &ptypes.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 // This is pretty standard stuff but I copied this from github.com/containerd/go-runc, with some minor changes.

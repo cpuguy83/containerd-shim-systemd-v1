@@ -14,16 +14,16 @@ import (
 
 	eventsapi "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types"
+	v2runcopts "github.com/containerd/containerd/api/types/runc/options"
 	"github.com/containerd/containerd/api/types/task"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/runtime/linux/runctypes"
-	v2runcopts "github.com/containerd/containerd/runtime/v2/runc/options"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/go-runc"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/log"
+	"github.com/containerd/typeurl/v2"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
-	ptypes "github.com/gogo/protobuf/types"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type processManager struct {
@@ -143,7 +143,6 @@ type CreateOptions struct {
 	// From runc types
 	BinaryName          string
 	Root                string
-	CriuPath            string
 	NoPivotRoot         bool
 	OpenTcp             bool
 	ExternalUnixSockets bool
@@ -428,7 +427,7 @@ func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 					ContainerID: p.id,
 					ID:          p.id,
 					ExitStatus:  st.ExitCode,
-					ExitedAt:    st.ExitedAt,
+					ExitedAt:    timestamppb.New(st.ExitedAt),
 					Pid:         st.Pid,
 				})
 			})
@@ -437,7 +436,7 @@ func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 	return st
 }
 
-func (p *initProcess) Checkpoint(ctx context.Context, r *ptypes.Any) error {
+func (p *initProcess) Checkpoint(ctx context.Context, r *anypb.Any) error {
 	var opts runc.CheckpointOpts
 	var exit bool
 	if r != nil {
@@ -448,16 +447,6 @@ func (p *initProcess) Checkpoint(ctx context.Context, r *ptypes.Any) error {
 		}
 		switch vv := v.(type) {
 		case *v2runcopts.CheckpointOptions:
-			exit = vv.Exit
-			opts.AllowOpenTCP = vv.OpenTcp
-			opts.AllowExternalUnixSockets = vv.ExternalUnixSockets
-			opts.AllowTerminal = vv.Terminal
-			opts.FileLocks = vv.FileLocks
-			opts.EmptyNamespaces = vv.EmptyNamespaces
-			opts.Cgroups = runc.CgroupMode(vv.CgroupsMode)
-			opts.ImagePath = vv.ImagePath
-			opts.WorkDir = vv.WorkPath
-		case *runctypes.CheckpointOptions:
 			exit = vv.Exit
 			opts.AllowOpenTCP = vv.OpenTcp
 			opts.AllowExternalUnixSockets = vv.ExternalUnixSockets
@@ -524,7 +513,7 @@ func (p *initProcess) Update(ctx context.Context, res specs.LinuxResources) erro
 
 type execProcess struct {
 	*process
-	Spec   *ptypes.Any
+	Spec   *anypb.Any
 	parent *initProcess
 	execID string
 }
@@ -564,7 +553,7 @@ func (p *execProcess) SetState(ctx context.Context, state pState) pState {
 				ContainerID: p.parent.id,
 				ID:          p.execID,
 				ExitStatus:  st.ExitCode,
-				ExitedAt:    st.ExitedAt,
+				ExitedAt:    timestamppb.New(st.ExitedAt),
 				Pid:         st.Pid,
 			})
 		})

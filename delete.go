@@ -9,28 +9,30 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/namespaces"
-	taskapi "github.com/containerd/containerd/runtime/v2/task"
+	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/containerd/go-runc"
+	"github.com/containerd/log"
 	"github.com/coreos/go-systemd/v22/dbus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Delete a process or container
 func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *taskapi.DeleteResponse, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Delete", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "delete")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("delete: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -74,7 +76,7 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 	return &taskapi.DeleteResponse{
 		Pid:        st.Pid,
 		ExitStatus: st.ExitCode,
-		ExitedAt:   st.ExitedAt,
+		ExitedAt:   timestamppb.New(st.ExitedAt),
 	}, nil
 }
 

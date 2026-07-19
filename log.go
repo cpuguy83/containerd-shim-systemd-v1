@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/containerd/containerd/log"
+	"github.com/containerd/log"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -19,14 +19,14 @@ type srvConfig struct {
 
 func setupLogFormat(ctx context.Context, config srvConfig) {
 	if config.Debug.Format == "" {
-		config.Debug.Format = log.TextFormat
+		config.Debug.Format = string(log.TextFormat)
 	}
-	if config.Debug.Format == log.TextFormat {
+	if config.Debug.Format == string(log.TextFormat) {
 		logrus.SetFormatter(&logrus.TextFormatter{
 			TimestampFormat: log.RFC3339NanoFixed,
 			FullTimestamp:   true,
 		})
-	} else if config.Debug.Format == log.JSONFormat {
+	} else if config.Debug.Format == string(log.JSONFormat) {
 		logrus.SetFormatter(&logrus.JSONFormatter{
 			TimestampFormat: log.RFC3339NanoFixed,
 		})

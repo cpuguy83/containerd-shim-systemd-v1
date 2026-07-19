@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -27,19 +28,22 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/containerd/containerd/defaults"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/runtime/v2/shim"
-	taskapi "github.com/containerd/containerd/runtime/v2/task"
+	bootapi "github.com/containerd/containerd/api/runtime/bootstrap/v1"
+	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/defaults"
+	"github.com/containerd/containerd/v2/pkg/atomicfile"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/shim"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/log"
 	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
-	"github.com/gogo/protobuf/proto"
 	"github.com/pelletier/go-toml"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
 )
 
 func newCtx() (context.Context, context.CancelFunc) {
@@ -187,7 +191,7 @@ func main() {
 
 				ctx = namespaces.WithNamespace(ctx, namespace)
 				resp, err = svc.Delete(ctx, &taskapi.DeleteRequest{ID: id})
-				if err != nil && !errdefs.IsNotFound(errdefs.FromGRPC(err)) {
+				if err != nil && !errdefs.IsNotFound(errgrpc.ToNative(err)) {
 					return err
 				}
 
@@ -204,13 +208,7 @@ func main() {
 			return nil
 		},
 		"start": func(ctx context.Context) error {
-			addr := "unix://" + socket
-
-			if err := shim.WriteAddress("address", addr); err != nil {
-				return err
-			}
-			_, err := os.Stdout.WriteString(addr)
-			return err
+			return writeBootstrapResponse(os.Stdin, os.Stdout, socket, id, namespace)
 		},
 		"serve": func(ctx context.Context) error {
 			// read the containerd config so we can match log formats defined there.
@@ -341,6 +339,57 @@ func main() {
 	if err := cmd(ctx); err != nil {
 		errOut(fmt.Errorf("%s: %w", action, err))
 	}
+}
+
+func writeBootstrapResponse(in io.Reader, out io.Writer, socket, id, namespace string) error {
+	input, err := io.ReadAll(io.LimitReader(in, 10<<20))
+	if err != nil {
+		return fmt.Errorf("read bootstrap parameters: %w", err)
+	}
+
+	var params bootapi.BootstrapParams
+	if len(input) == 0 ||
+		proto.Unmarshal(input, &params) != nil ||
+		params.GetInstanceID() != id ||
+		params.GetNamespace() != namespace {
+		address := "unix://" + socket
+		if err := writeAddressFile("address", address); err != nil {
+			return fmt.Errorf("write legacy bootstrap address: %w", err)
+		}
+		if _, err := io.WriteString(out, address); err != nil {
+			return fmt.Errorf("write legacy bootstrap response: %w", err)
+		}
+		return nil
+	}
+
+	result, err := proto.Marshal(&bootapi.BootstrapResult{
+		Version:  3,
+		Address:  "unix://" + socket,
+		Protocol: "ttrpc",
+	})
+	if err != nil {
+		return fmt.Errorf("marshal bootstrap result: %w", err)
+	}
+	if _, err := out.Write(result); err != nil {
+		return fmt.Errorf("write bootstrap result: %w", err)
+	}
+	return nil
+}
+
+func writeAddressFile(path, address string) error {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	file, err := atomicfile.New(path, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(file, address); err != nil {
+		file.Cancel()
+		return err
+	}
+	return file.Close()
 }
 
 func serve(ctx context.Context, cfg Config) error {

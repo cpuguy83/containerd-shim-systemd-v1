@@ -63,7 +63,7 @@ func TestToStatus(t *testing.T) {
 	for sub := range running {
 		sub := sub
 		t.Run("the substate "+sub+" maps to running", func(t *testing.T) {
-			if got := toStatus(sub); got != task.StatusRunning {
+			if got := toStatus(sub); got != task.Status_RUNNING {
 				t.Fatalf("expected %q to map to running, got %v", sub, got)
 			}
 		})
@@ -72,14 +72,14 @@ func TestToStatus(t *testing.T) {
 	for sub := range stopped {
 		sub := sub
 		t.Run("the substate "+sub+" maps to stopped", func(t *testing.T) {
-			if got := toStatus(sub); got != task.StatusStopped {
+			if got := toStatus(sub); got != task.Status_STOPPED {
 				t.Fatalf("expected %q to map to stopped, got %v", sub, got)
 			}
 		})
 	}
 
 	t.Run("an unknown substate maps to unknown", func(t *testing.T) {
-		if got := toStatus("no-such-substate"); got != task.StatusUnknown {
+		if got := toStatus("no-such-substate"); got != task.Status_UNKNOWN {
 			t.Fatalf("expected an unknown substate to map to unknown, got %v", got)
 		}
 	})

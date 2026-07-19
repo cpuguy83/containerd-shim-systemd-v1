@@ -63,7 +63,7 @@ RUN systemctl enable containerd-shim-systemd-v1-install.service
 COPY --link --from=go /usr/local/go /usr/local/go
 ENV GOPATH=/go PATH=/go/bin:/usr/local/go/bin:$PATH
 ARG CONTAINERD_REPO=https://github.com/containerd/containerd.git
-ARG CONTAINERD_COMMIT=9cd3357b7fd7218e4aec3eae239db1f68a5a6ec6 # v1.6.8
+ARG CONTAINERD_COMMIT=v2.3.3
 WORKDIR /go/src/github.com/containerd/containerd
 RUN <<EOF
 set -e
@@ -83,4 +83,3 @@ ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 FROM scratch
 COPY --from=build /go/src/github.com/cpuguy83/containerd-shim-systemd-v1/bin/* /
-

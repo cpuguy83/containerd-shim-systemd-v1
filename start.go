@@ -14,11 +14,12 @@ import (
 	"time"
 
 	eventsapi "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/namespaces"
-	taskapi "github.com/containerd/containerd/runtime/v2/task"
-	"github.com/coreos/go-systemd/unit"
+	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/log"
+	"github.com/coreos/go-systemd/v22/unit"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -29,13 +30,13 @@ import (
 func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskapi.StartResponse, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Start", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "start")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("start: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()

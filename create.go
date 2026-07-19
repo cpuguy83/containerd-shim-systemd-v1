@@ -17,40 +17,41 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/cgroups"
-	cgroupsv2 "github.com/containerd/cgroups/v2"
+	"github.com/containerd/cgroups/v3"
+	cgroupsv1 "github.com/containerd/cgroups/v3/cgroup1"
+	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
 	eventsapi "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/runtime/linux/runctypes"
-	v2runcopts "github.com/containerd/containerd/runtime/v2/runc/options"
-	taskapi "github.com/containerd/containerd/runtime/v2/task"
+	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
+	v2runcopts "github.com/containerd/containerd/api/types/runc/options"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/containerd/go-runc"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/log"
+	"github.com/containerd/typeurl/v2"
 	"github.com/coreos/go-systemd/v22/daemon"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
-	ptypes "github.com/gogo/protobuf/types"
-	"github.com/golang/protobuf/proto"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // Create a new container
 func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *taskapi.CreateTaskResponse, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Create", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "create")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("create: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -80,22 +81,9 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			opts.IoGid = vv.IoGid
 			opts.BinaryName = vv.BinaryName
 			opts.Root = vv.Root
-			opts.CriuPath = vv.CriuPath
 			opts.SystemdCgroup = vv.SystemdCgroup
 			opts.CriuImagePath = vv.CriuImagePath
 			opts.CriuWorkPath = vv.CriuWorkPath
-			opts.ShimCgroup = vv.ShimCgroup
-		case *runctypes.CreateOptions:
-			opts.NoPivotRoot = vv.NoPivotRoot
-			opts.NoNewKeyring = vv.NoNewKeyring
-			opts.IoUid = vv.IoUid
-			opts.IoGid = vv.IoGid
-			opts.CriuImagePath = vv.CriuImagePath
-			opts.CriuWorkPath = vv.CriuWorkPath
-			opts.ExternalUnixSockets = vv.ExternalUnixSockets
-			opts.FileLocks = vv.FileLocks
-			opts.Terminal = vv.Terminal
-			opts.EmptyNamespaces = vv.EmptyNamespaces
 			opts.ShimCgroup = vv.ShimCgroup
 		}
 		log.G(ctx).WithField("typeurl", r.Options.TypeUrl).Debug("Decoding create options")
@@ -209,16 +197,16 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 }
 
 // Exec an additional process inside the container
-func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *ptypes.Empty, retErr error) {
+func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *emptypb.Empty, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Exec", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "exec")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("exec: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -280,7 +268,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *p
 		ContainerID: pInit.id,
 		ExecID:      r.ExecID,
 	})
-	return &ptypes.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 func (p *execProcess) pidFile() string {
@@ -906,7 +894,7 @@ func setCgroup() error {
 	}
 
 	if cgroups.Mode() == cgroups.Unified {
-		cg, err := cgroupsv2.LoadManager("/sys/fs/cgroup", cgPath)
+		cg, err := cgroupsv2.Load(cgPath)
 		if err != nil {
 			return fmt.Errorf("cgroups v2 mode %s: error loading cgroup: %w", cgMode(cgroups.Mode()), err)
 		}
@@ -914,7 +902,7 @@ func setCgroup() error {
 			return fmt.Errorf("error adding proc to cgroup: %v", err)
 		}
 	} else {
-		cg, err := cgroups.Load(cgroups.V1, cgroups.StaticPath(cgPath))
+		cg, err := cgroupsv1.Load(cgroupsv1.StaticPath(cgPath))
 		if err != nil {
 			return fmt.Errorf("cgroups v1 mode %s: error loading cgroup: %w", cgMode(cgroups.Mode()), err)
 		}

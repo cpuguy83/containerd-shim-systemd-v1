@@ -13,16 +13,16 @@ import (
 	"time"
 
 	eventsapi "github.com/containerd/containerd/api/events"
+	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
 	tasktypes "github.com/containerd/containerd/api/types/task"
-	"github.com/containerd/containerd/namespaces"
-	taskapi "github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/typeurl/v2"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
 	"github.com/godbus/dbus/v5"
-	ptypes "github.com/gogo/protobuf/types"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 func TestServiceTaskLifecycleAgainstSystemd(t *testing.T) {
@@ -55,7 +55,7 @@ func TestServiceTaskLifecycleAgainstSystemd(t *testing.T) {
 		if waited.ExitStatus != 7 {
 			t.Fatalf("wait exit status = %d, want 7", waited.ExitStatus)
 		}
-		if !waited.ExitedAt.After(timeZero) {
+		if !waited.ExitedAt.AsTime().After(timeZero) {
 			t.Fatalf("wait exit time = %s, want a real exit time", waited.ExitedAt)
 		}
 
@@ -118,7 +118,7 @@ func TestServiceTaskLifecycleAgainstSystemd(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read failed task state: %v", err)
 		}
-		if state.Status != tasktypes.StatusStopped {
+		if state.Status != tasktypes.Status_STOPPED {
 			t.Fatalf("task status = %s, want stopped", state.Status)
 		}
 		if state.ExitStatus != 255 {
@@ -199,7 +199,7 @@ func TestServiceExecLifecycleAgainstSystemd(t *testing.T) {
 			if waited.ExitStatus != tc.exitCode {
 				t.Fatalf("wait exit status = %d, want %d", waited.ExitStatus, tc.exitCode)
 			}
-			if !waited.ExitedAt.After(timeZero) {
+			if !waited.ExitedAt.AsTime().After(timeZero) {
 				t.Fatalf("wait exit time = %s, want a real exit time", waited.ExitedAt)
 			}
 
@@ -362,7 +362,7 @@ func (h *serviceIntegrationHarness) task(t *testing.T, id string, cfg runcStubCo
 		t.Fatalf("write OCI spec: %v", err)
 	}
 
-	createOptions, err := typeurl.MarshalAny(&options.CreateOptions{
+	createOptions, err := typeurl.MarshalAnyToProto(&options.CreateOptions{
 		LogMode:        options.LogMode_NULL,
 		SdNotifyEnable: true,
 	})
@@ -398,7 +398,7 @@ func (h *serviceIntegrationHarness) exec(t *testing.T, ctx context.Context, task
 	if _, err := h.service.Exec(ctx, &taskapi.ExecProcessRequest{
 		ID:     task.ID,
 		ExecID: execID,
-		Spec:   &ptypes.Any{Value: data},
+		Spec:   &anypb.Any{Value: data},
 	}); err != nil {
 		t.Fatalf("create exec: %v", err)
 	}

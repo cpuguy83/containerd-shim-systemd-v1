@@ -5,27 +5,29 @@ import (
 	"fmt"
 	"path"
 
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/namespaces"
-	taskapi "github.com/containerd/containerd/runtime/v2/task"
+	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/log"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Wait for a process to exit
 func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *taskapi.WaitResponse, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Wait", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "wait")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("wait: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -42,9 +44,6 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 	defer func() {
 		if retResp != nil {
 			log.G(ctx).WithError(retErr).WithField("exitedAt", retResp.ExitedAt).Info("systemd.Wait End")
-		}
-		if retErr != nil {
-			retErr = errdefs.ToGRPC(fmt.Errorf("wait: %w", err))
 		}
 	}()
 
@@ -81,7 +80,7 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 	}
 
 	return &taskapi.WaitResponse{
-		ExitedAt:   st.ExitedAt,
+		ExitedAt:   timestamppb.New(st.ExitedAt),
 		ExitStatus: st.ExitCode,
 	}, nil
 }
