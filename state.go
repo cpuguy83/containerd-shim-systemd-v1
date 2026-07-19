@@ -316,17 +316,15 @@ func (s pState) String() string {
 }
 
 // CopyTo copies the state to the provided destination.
-// It does not override non-zero values (except "Status") in the destination.
+// It does not override non-zero values in the destination or regress a terminal
+// status to a non-terminal status.
 // This is to ensure we don't override real information in the state w/, for instance, state info for a deleted unit.
 func (s *pState) CopyTo(other *pState) {
 	if s.Pid == 0 {
 		return
 	}
-	if !other.ExitedAt.After(timeZero) {
-		// systemd seems to have a habbit of keeping old data around...
-		if s.Status == "dead" || s.Status == "failed" || s.Status == "exited" || s.Status != "stop-post" {
-			other.ExitedAt = s.ExitedAt
-		}
+	if s.ExitedAt.After(timeZero) && !other.ExitedAt.After(timeZero) {
+		other.ExitedAt = s.ExitedAt
 	}
 	if s.ExitCode > 0 && other.ExitCode == 0 {
 		other.ExitCode = s.ExitCode
@@ -334,7 +332,7 @@ func (s *pState) CopyTo(other *pState) {
 	if other.Pid == 0 {
 		other.Pid = s.Pid
 	}
-	if s.Status != "" {
+	if s.Status != "" && (!other.Exited() || s.Exited()) {
 		other.Status = s.Status
 	}
 }

@@ -113,12 +113,29 @@ func TestPStateCopyTo(t *testing.T) {
 		}
 	})
 
-	t.Run("copying always propagates a non-empty status", func(t *testing.T) {
+	t.Run("copying propagates a terminal status", func(t *testing.T) {
 		dst := pState{Pid: 1, Status: "running"}
 		src := pState{Pid: 1, Status: "dead"}
 		src.CopyTo(&dst)
 		if dst.Status != "dead" {
 			t.Fatalf("expected status to be propagated, got %q", dst.Status)
+		}
+	})
+
+	t.Run("copying a stale running state preserves a terminal destination", func(t *testing.T) {
+		exitedAt := time.Now()
+		dst := pState{Pid: 1, Status: "exited", ExitCode: 9, ExitedAt: exitedAt}
+		src := pState{Pid: 1, Status: "running"}
+		src.CopyTo(&dst)
+
+		if dst.Status != "exited" {
+			t.Fatalf("terminal status = %q, want exited", dst.Status)
+		}
+		if dst.ExitCode != 9 {
+			t.Fatalf("exit code = %d, want 9", dst.ExitCode)
+		}
+		if !dst.ExitedAt.Equal(exitedAt) {
+			t.Fatalf("exit time = %s, want %s", dst.ExitedAt, exitedAt)
 		}
 	})
 }

@@ -101,6 +101,7 @@ func main() {
 		ttrpcAddr      = address + ".ttrpc"
 		logMode        = defaultLogMode
 		noNewNamespace bool
+		info           bool
 
 		// create cmd
 		mountCfg string
@@ -118,11 +119,20 @@ func main() {
 	rootFlags.StringVar(&namespace, "namespace", "", "namespace of container")
 	rootFlags.BoolVar(&debug, "debug", debug, "enable debug output in the shim")
 	rootFlags.StringVar(&ttrpcAddr, "ttrpc-address", ttrpcAddr, "address to containerd ttrpc socket")
+	rootFlags.BoolVar(&info, "info", false, "print runtime information and exit")
 
 	if err := rootFlags.Parse(os.Args[1:]); err != nil {
 		fmt.Println(os.Args)
 		rootFlags.Usage()
 		os.Exit(1)
+	}
+
+	if info {
+		if err := writeRuntimeInfo(context.Background(), os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if rootFlags.NArg() == 0 {

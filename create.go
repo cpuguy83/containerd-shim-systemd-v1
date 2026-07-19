@@ -38,8 +38,22 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+const legacyRuncOptionsTypeURL = "containerd.linux.runc.CreateOptions"
+
+func unmarshalCreateOptions(value *anypb.Any) (interface{}, error) {
+	if value.TypeUrl == legacyRuncOptionsTypeURL {
+		var opts v2runcopts.Options
+		if err := proto.Unmarshal(value.Value, &opts); err != nil {
+			return nil, err
+		}
+		return &opts, nil
+	}
+	return typeurl.UnmarshalAny(value)
+}
 
 // Create a new container
 func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *taskapi.CreateTaskResponse, retErr error) {
@@ -63,7 +77,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	var opts CreateOptions
 	if r.Options != nil && r.Options.TypeUrl != "" {
-		v, err := typeurl.UnmarshalAny(r.Options)
+		v, err := unmarshalCreateOptions(r.Options)
 		if err != nil {
 			log.G(ctx).WithError(err).WithField("typeurl", r.Options.TypeUrl).Debug("invalid create options")
 			return nil, fmt.Errorf("error unmarshalling options: %w", err)
@@ -185,6 +199,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	if err != nil {
 		return nil, err
 	}
+	p.SetState(ctx, pState{Pid: pid, Status: "created"})
 	s.units.Add(p)
 
 	s.send(ctx, ns, &eventsapi.TaskCreate{

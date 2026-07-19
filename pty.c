@@ -224,12 +224,14 @@ int handle_pty(void)
 
     pthread_create(&tty_op_thr_id, NULL, handle_tty_ops, (void *)NULL);
 
-    pthread_join(stdin_copy_thr_id, NULL);
-    free(stdin_copy);
-    close(tty_fd);
     pthread_join(stdout_copy_thr_id, NULL);
     free(stdout_copy);
 
+    pthread_cancel(stdin_copy_thr_id);
+    pthread_join(stdin_copy_thr_id, NULL);
+    free(stdin_copy);
+
+    close(tty_fd);
     close(sock_fd);
 
     lmsg("Exiting");

@@ -10,6 +10,24 @@ import (
 	eventsapi "github.com/containerd/containerd/api/events"
 )
 
+func TestProcessLifecycleStatus(t *testing.T) {
+	t.Run("systemd running state remains created until Start succeeds", func(t *testing.T) {
+		p := &process{}
+		p.cond = sync.NewCond(&p.mu)
+
+		state := p.SetState(context.Background(), pState{Pid: 42, Status: "running"})
+		if state.Status != "created" {
+			t.Fatalf("status before Start = %q, want created", state.Status)
+		}
+
+		p.markStarted()
+		state = p.SetState(context.Background(), pState{Pid: 42, Status: "running"})
+		if state.Status != "running" {
+			t.Fatalf("status after Start = %q, want running", state.Status)
+		}
+	})
+}
+
 // These tests exercise the real initProcess/execProcess SetState, so the
 // exactly-once TaskExit guarantee is verified against the actual emit path, not
 // a fake. Every observed exit funnels through SetState, so a single exit must

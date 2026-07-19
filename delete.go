@@ -115,16 +115,15 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		}
 	}()
 
-	ch := make(chan string)
+	ch := make(chan string, 1)
 	if _, err := p.systemd.StopUnitContext(ctx, p.Name(), "replace", ch); err != nil {
 		log.G(ctx).WithError(err).Info("Failed to stop unit")
-	}
-
-	// Try to wait for stop to complete
-	// On context or stop failure we'll use SIGKILL instead.
-	select {
-	case <-ctx.Done():
-	case <-ch:
+	} else {
+		// Try to wait for stop to complete. On context failure we'll use SIGKILL instead.
+		select {
+		case <-ctx.Done():
+		case <-ch:
+		}
 	}
 
 	p.systemd.KillUnitContext(ctx, p.Name(), int32(syscall.SIGKILL))
@@ -190,16 +189,15 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 		return pState{}, fmt.Errorf("exec has not exited: %w", errdefs.ErrFailedPrecondition)
 	}
 
-	ch := make(chan string)
+	ch := make(chan string, 1)
 	if _, err := p.systemd.StopUnitContext(ctx, p.Name(), "replace", ch); err != nil {
 		log.G(ctx).WithError(err).Info("Failed to stop unit")
-	}
-
-	// Try to wait for stop to complete
-	// On context or stop failure we'll use SIGKILL instead.
-	select {
-	case <-ctx.Done():
-	case <-ch:
+	} else {
+		// Try to wait for stop to complete. On context failure we'll use SIGKILL instead.
+		select {
+		case <-ctx.Done():
+		case <-ch:
+		}
 	}
 
 	p.systemd.KillUnitWithTarget(ctx, p.Name(), dbus.Main, 9)

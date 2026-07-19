@@ -214,6 +214,7 @@ type process struct {
 	state        pState
 	deleted      bool
 	exitNotified bool
+	started      bool
 
 	eventMu             sync.Mutex
 	startEventPublished bool
@@ -296,6 +297,9 @@ func (p *process) ProcessState() pState {
 
 func (p *process) SetState(ctx context.Context, state pState) pState {
 	p.mu.Lock()
+	if !p.started && toStatus(state.Status) == task.Status_RUNNING {
+		state.Status = "created"
+	}
 	state.CopyTo(&p.state)
 	if p.state.ExitCode > 0 && !p.state.Exited() {
 		p.state.ExitedAt = time.Now()
@@ -304,6 +308,12 @@ func (p *process) SetState(ctx context.Context, state pState) pState {
 	p.cond.Broadcast()
 	p.mu.Unlock()
 	return state
+}
+
+func (p *process) markStarted() {
+	p.mu.Lock()
+	p.started = true
+	p.mu.Unlock()
 }
 
 func (p *execProcess) Name() string {

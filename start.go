@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -62,6 +61,8 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 			s.units.Delete(ep)
 			return nil, err
 		}
+		ep.(*execProcess).markStarted()
+		ep.SetState(ctx, pState{Pid: pid, Status: "running"})
 		s.send(ctx, ns, &eventsapi.TaskExecStarted{
 			ContainerID: r.ID,
 			ExecID:      r.ExecID,
@@ -73,6 +74,8 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 		if err != nil {
 			return nil, err
 		}
+		p.(*initProcess).markStarted()
+		p.SetState(ctx, pState{Pid: pid, Status: "running"})
 		s.send(ctx, ns, &eventsapi.TaskStart{
 			ContainerID: r.ID,
 			Pid:         pid,
@@ -110,14 +113,10 @@ func writeUnit(path string, opts []*unit.UnitOption) error {
 func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 	const svc = "Service"
 
-	sysctl, err := exec.LookPath("systemctl")
-	if err != nil {
-		return nil, err
-	}
-
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", p.unitType()),
 		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
+		unit.NewUnitOption(svc, "WorkingDirectory", p.Bundle),
 		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
 		unit.NewUnitOption(svc, "Environment", "PIDFILE="+p.pidFile()),
 		unit.NewUnitOption(svc, "Delegate", "yes"),
@@ -149,7 +148,6 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 	}
 
 	if p.Terminal || p.opts.Terminal {
-		opts = append(opts, unit.NewUnitOption("Service", "ExecStopPost", "-"+sysctl+" stop "+p.ttyUnitName()))
 		prefix = append(prefix, "--tty")
 	}
 
@@ -165,13 +163,9 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 	const svc = "Service"
 
-	sysctl, err := exec.LookPath("systemctl")
-	if err != nil {
-		return nil, err
-	}
-
 	opts := []*unit.UnitOption{
 		unit.NewUnitOption(svc, "Type", "notify"),
+		unit.NewUnitOption(svc, "WorkingDirectory", p.parent.Bundle),
 		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
 		unit.NewUnitOption(svc, "Environment", "PIDFILE="+p.pidFile()),
 		unit.NewUnitOption(svc, "GuessMainPID", "yes"),
@@ -203,7 +197,6 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 
 		cmd = append(cmd, "-t")
 		cmd = append(cmd, "--console-socket="+s)
-		opts = append(opts, unit.NewUnitOption(svc, "ExecStopPost", "-"+sysctl+" stop "+p.ttyUnitName()))
 		prefix = append(prefix, "--tty")
 	}
 

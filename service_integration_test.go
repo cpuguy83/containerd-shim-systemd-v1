@@ -38,6 +38,13 @@ func TestServiceTaskLifecycleAgainstSystemd(t *testing.T) {
 		if created.Pid == 0 {
 			t.Fatal("create returned a zero pid")
 		}
+		createdState, err := h.service.State(ctx, &taskapi.StateRequest{ID: req.ID})
+		if err != nil {
+			t.Fatalf("read created task state: %v", err)
+		}
+		if createdState.Status != tasktypes.Status_CREATED {
+			t.Fatalf("created task status = %s, want %s", createdState.Status, tasktypes.Status_CREATED)
+		}
 
 		started, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID})
 		if err != nil {
@@ -140,53 +147,67 @@ func TestServiceTaskLifecycleAgainstSystemd(t *testing.T) {
 }
 
 func TestServiceRuntimeOptionsAgainstSystemd(t *testing.T) {
-	t.Run("a selected runc binary is used by init and exec processes", func(t *testing.T) {
-		h := newServiceIntegrationHarness(t)
-		ctx, req, _ := h.task(t, "selected-runc", runcStubConfig{ExitDelay: 30 * time.Second})
+	tests := []struct {
+		name           string
+		optionsTypeURL string
+	}{
+		{name: "modern runc options select the runtime used by init and exec processes"},
+		{name: "containerd 1.7 runc options select the runtime used by init and exec processes", optionsTypeURL: legacyRuncOptionsTypeURL},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newServiceIntegrationHarness(t)
+			ctx, req, taskUnit := h.task(t, "selected-runc", runcStubConfig{ExitDelay: 30 * time.Second})
 
-		selectedRunc := h.service.runcBin
-		h.service.runcBin = filepath.Join(filepath.Dir(h.service.runcBin), "missing-default-runc")
+			selectedRunc := h.service.runcBin
+			h.service.runcBin = filepath.Join(filepath.Dir(h.service.runcBin), "missing-default-runc")
 
-		createOptions, err := typeurl.MarshalAnyToProto(&v2runcopts.Options{BinaryName: selectedRunc})
-		if err != nil {
-			t.Fatalf("marshal runc options: %v", err)
-		}
-		req.Options = createOptions
+			createOptions, err := typeurl.MarshalAnyToProto(&v2runcopts.Options{BinaryName: selectedRunc})
+			if err != nil {
+				t.Fatalf("marshal runc options: %v", err)
+			}
+			if tc.optionsTypeURL != "" {
+				createOptions.TypeUrl = tc.optionsTypeURL
+			}
+			req.Options = createOptions
 
-		if _, err := h.service.Create(ctx, req); err != nil {
-			t.Fatalf("create task: %v", err)
-		}
-		if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
-			t.Fatalf("start task: %v", err)
-		}
+			if _, err := h.service.Create(ctx, req); err != nil {
+				t.Fatalf("create task: %v", err)
+			}
+			assertUnitWorkingDirectory(t, filepath.Join(h.unitDir, taskUnit), req.Bundle)
+			if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
+				t.Fatalf("start task: %v", err)
+			}
 
-		const execID = "selected-runc-exec"
-		h.exec(t, ctx, req, execID, runcStubConfig{ExitDelay: 100 * time.Millisecond})
-		if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID, ExecID: execID}); err != nil {
-			t.Fatalf("start exec: %v", err)
-		}
+			const execID = "selected-runc-exec"
+			execUnit := h.exec(t, ctx, req, execID, runcStubConfig{ExitDelay: 100 * time.Millisecond})
+			if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID, ExecID: execID}); err != nil {
+				t.Fatalf("start exec: %v", err)
+			}
+			assertUnitWorkingDirectory(t, filepath.Join(h.unitDir, execUnit), req.Bundle)
 
-		execWaitCtx, cancelExecWait := context.WithTimeout(ctx, 10*time.Second)
-		defer cancelExecWait()
-		if _, err := h.service.Wait(execWaitCtx, &taskapi.WaitRequest{ID: req.ID, ExecID: execID}); err != nil {
-			t.Fatalf("wait for exec: %v", err)
-		}
-		if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID, ExecID: execID}); err != nil {
-			t.Fatalf("delete exec: %v", err)
-		}
+			execWaitCtx, cancelExecWait := context.WithTimeout(ctx, 10*time.Second)
+			defer cancelExecWait()
+			if _, err := h.service.Wait(execWaitCtx, &taskapi.WaitRequest{ID: req.ID, ExecID: execID}); err != nil {
+				t.Fatalf("wait for exec: %v", err)
+			}
+			if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID, ExecID: execID}); err != nil {
+				t.Fatalf("delete exec: %v", err)
+			}
 
-		if _, err := h.service.Kill(ctx, &taskapi.KillRequest{ID: req.ID, Signal: uint32(unix.SIGKILL), All: true}); err != nil {
-			t.Fatalf("kill task: %v", err)
-		}
-		taskWaitCtx, cancelTaskWait := context.WithTimeout(ctx, 10*time.Second)
-		defer cancelTaskWait()
-		if _, err := h.service.Wait(taskWaitCtx, &taskapi.WaitRequest{ID: req.ID}); err != nil {
-			t.Fatalf("wait for task: %v", err)
-		}
-		if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID}); err != nil {
-			t.Fatalf("delete task: %v", err)
-		}
-	})
+			if _, err := h.service.Kill(ctx, &taskapi.KillRequest{ID: req.ID, Signal: uint32(unix.SIGKILL), All: true}); err != nil {
+				t.Fatalf("kill task: %v", err)
+			}
+			taskWaitCtx, cancelTaskWait := context.WithTimeout(ctx, 10*time.Second)
+			defer cancelTaskWait()
+			if _, err := h.service.Wait(taskWaitCtx, &taskapi.WaitRequest{ID: req.ID}); err != nil {
+				t.Fatalf("wait for task: %v", err)
+			}
+			if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID}); err != nil {
+				t.Fatalf("delete task: %v", err)
+			}
+		})
+	}
 
 	t.Run("a missing selected runc binary fails create", func(t *testing.T) {
 		h := newServiceIntegrationHarness(t)
@@ -207,6 +228,19 @@ func TestServiceRuntimeOptionsAgainstSystemd(t *testing.T) {
 			t.Fatalf("create error = %q, want missing runc binary", err)
 		}
 	})
+}
+
+func assertUnitWorkingDirectory(t *testing.T, unitPath, workingDirectory string) {
+	t.Helper()
+
+	data, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read unit file %s: %v", unitPath, err)
+	}
+	want := "WorkingDirectory=" + workingDirectory
+	if !strings.Contains(string(data), want) {
+		t.Fatalf("unit file %s does not contain %q:\n%s", unitPath, want, data)
+	}
 }
 
 func TestServiceExecLifecycleAgainstSystemd(t *testing.T) {

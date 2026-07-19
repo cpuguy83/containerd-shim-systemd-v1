@@ -82,6 +82,11 @@ func runShimCreateHelper() error {
 }
 
 func runRuncStub() int {
+	if len(os.Args) == 2 && os.Args[1] == "features" {
+		fmt.Fprint(os.Stdout, `{"ociVersionMin":"1.0.0","ociVersionMax":"1.3.0","mountOptions":["bind","rro"]}`)
+		return 0
+	}
+
 	root, command, args, err := parseRuncStubInvocation(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
