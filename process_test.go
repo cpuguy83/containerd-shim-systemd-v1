@@ -2,12 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	eventsapi "github.com/containerd/containerd/api/events"
+	"github.com/containerd/go-runc"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func TestProcessLifecycleStatus(t *testing.T) {
@@ -24,6 +31,120 @@ func TestProcessLifecycleStatus(t *testing.T) {
 		state = p.SetState(context.Background(), pState{Pid: 42, Status: "running"})
 		if state.Status != "running" {
 			t.Fatalf("status after Start = %q, want running", state.Status)
+		}
+	})
+}
+
+func TestRuncCommandArguments(t *testing.T) {
+	t.Run("a debug log is passed as a separate option value", func(t *testing.T) {
+		p := &process{
+			runc: &runc.Runc{
+				Command: "runc-fp",
+				Debug:   true,
+				Log:     "/tmp/runc.log",
+				Root:    "/tmp/runc",
+			},
+		}
+
+		got, err := p.runcCmd([]string{"state", "container"})
+		if err != nil {
+			t.Fatalf("build runc command: %v", err)
+		}
+		want := []string{
+			"runc-fp",
+			"--debug=true",
+			"--systemd-cgroup=false",
+			"--root", "/tmp/runc",
+			"--log", "/tmp/runc.log",
+			"state", "container",
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("runc command = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestExecProcessPIDFallback(t *testing.T) {
+	for _, status := range []string{"running", "exited"} {
+		t.Run("a "+status+" helper state supplies the workload PID after systemd removes PIDFile", func(t *testing.T) {
+			parent, _ := newTestInitProcess("container")
+			parent.Bundle = t.TempDir()
+			exec := newTestExecProcess(parent, "exec")
+			writeTestProcessState(t, exec.exitStatePath(), pState{Pid: 42, Status: status})
+
+			pid, err := exec.getPid(context.Background())
+			if err != nil {
+				t.Fatalf("get exec PID: %v", err)
+			}
+			if pid != 42 {
+				t.Fatalf("exec PID = %d, want 42", pid)
+			}
+		})
+	}
+
+	t.Run("an init-helper failure cannot masquerade as a workload PID", func(t *testing.T) {
+		parent, _ := newTestInitProcess("container")
+		parent.Bundle = t.TempDir()
+		exec := newTestExecProcess(parent, "exec")
+		writeTestProcessState(t, exec.exitStatePath(), pState{Pid: 42, Status: exitedInit})
+
+		if _, err := exec.getPid(context.Background()); err == nil {
+			t.Fatal("expected missing workload PID to fail")
+		}
+	})
+}
+
+func TestInitExitCleanup(t *testing.T) {
+	t.Run("a private PID namespace relies on kernel cleanup", func(t *testing.T) {
+		spec := &specs.Spec{Linux: &specs.Linux{
+			Namespaces: []specs.LinuxNamespace{{Type: specs.PIDNamespace}},
+		}}
+		if shouldKillAllOnExit(spec) {
+			t.Fatal("private PID namespace unexpectedly requires runtime cleanup")
+		}
+	})
+
+	for name, spec := range map[string]*specs.Spec{
+		"the host PID namespace requires runtime cleanup": {
+			Linux: &specs.Linux{},
+		},
+		"a joined PID namespace requires runtime cleanup": {
+			Linux: &specs.Linux{
+				Namespaces: []specs.LinuxNamespace{{
+					Type: specs.PIDNamespace,
+					Path: "/proc/1/ns/pid",
+				}},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !shouldKillAllOnExit(spec) {
+				t.Fatal("shared PID namespace did not require runtime cleanup")
+			}
+		})
+	}
+
+	t.Run("a started init exit kills remaining processes in a shared PID namespace", func(t *testing.T) {
+		runcPath := newRuncStub(t)
+		runcRoot := t.TempDir()
+		processRoot := filepath.Join(runcRoot, "container")
+		if err := os.MkdirAll(processRoot, 0700); err != nil {
+			t.Fatalf("create runc state directory: %v", err)
+		}
+
+		p, _ := newTestInitProcess("container")
+		p.runc = &runc.Runc{Command: runcPath, Root: runcRoot}
+		p.killAllOnExit = true
+		p.markStarted()
+
+		p.SetState(context.Background(), pState{
+			Pid:      42,
+			Status:   "exited",
+			ExitedAt: time.Now(),
+		})
+
+		if _, err := os.Stat(filepath.Join(processRoot, runcStubKillAllMarker)); err != nil {
+			t.Fatalf("find runc kill-all marker: %v", err)
 		}
 	})
 }
@@ -143,4 +264,31 @@ func newTestExecProcess(parent *initProcess, execID string) *execProcess {
 	ep.cond = sync.NewCond(&ep.mu)
 	ep.markStartEventPublished()
 	return ep
+}
+
+func writeTestProcessState(t *testing.T, path string, state pState) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatalf("create process state directory: %v", err)
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal process state: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write process state: %v", err)
+	}
+}
+
+func newRuncStub(t *testing.T) string {
+	t.Helper()
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("find test executable: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), runcStubHelperName)
+	if err := os.Symlink(testBinary, path); err != nil {
+		t.Fatalf("create runc helper: %v", err)
+	}
+	return path
 }

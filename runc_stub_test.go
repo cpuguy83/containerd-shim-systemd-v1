@@ -32,6 +32,8 @@ const (
 	runcStubExitBeforeDetachEnv = "RUNC_STUB_EXIT_BEFORE_DETACH"
 	runcStubWaitForReleaseEnv   = "RUNC_STUB_WAIT_FOR_RELEASE"
 
+	runcStubKillAllMarker = "kill-all"
+
 	runcStubCreateFailure = 42
 	runcStubStartFailure  = 43
 	runcStubExecFailure   = 45
@@ -103,6 +105,8 @@ func runRuncStub() int {
 		code, err = runRuncStubStart(root, args)
 	case "delete":
 		code, err = runRuncStubDelete(root, args)
+	case "kill":
+		code, err = runRuncStubKill(root, args)
 	default:
 		err = fmt.Errorf("runc stub does not implement %q", command)
 		code = 125
@@ -111,6 +115,13 @@ func runRuncStub() int {
 		fmt.Fprintln(os.Stderr, err)
 	}
 	return code
+}
+
+func runRuncStubKill(root string, args []string) (int, error) {
+	if len(args) != 3 || args[0] != "--all" || args[2] != strconv.Itoa(int(syscall.SIGKILL)) {
+		return 125, fmt.Errorf("invalid runc kill arguments: %q", args)
+	}
+	return 0, os.WriteFile(filepath.Join(root, args[1], runcStubKillAllMarker), nil, 0600)
 }
 
 func parseRuncStubInvocation(args []string) (root, command string, commandArgs []string, retErr error) {

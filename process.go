@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	eventsapi "github.com/containerd/containerd/api/events"
@@ -316,6 +317,13 @@ func (p *process) markStarted() {
 	p.mu.Unlock()
 }
 
+func (p *process) hasStarted() bool {
+	p.mu.Lock()
+	started := p.started
+	p.mu.Unlock()
+	return started
+}
+
 func (p *execProcess) Name() string {
 	return unitName(p.ns, p.parent.id+"-"+p.id, "exec")
 }
@@ -402,6 +410,7 @@ type initProcess struct {
 	parentCheckpoint string
 
 	noNewNamespace bool
+	killAllOnExit  bool
 
 	execs *processManager
 
@@ -420,6 +429,11 @@ func (p *initProcess) pidFile() string {
 func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 	st := p.process.SetState(ctx, state)
 	if st.Exited() && p.claimExitNotification() {
+		if st.Status != exitedInit && p.hasStarted() && p.killAllOnExit {
+			if err := p.runc.Kill(ctx, p.id, int(syscall.SIGKILL), &runc.KillOpts{All: true}); err != nil {
+				log.G(ctx).WithError(err).WithField("id", p.id).Error("failed to kill init's children")
+			}
+		}
 		log.G(ctx).Debugf("EXITED: %s %s", p.Name(), st)
 		p.execs.Each(func(exec Process) {
 			if err := exec.LoadState(ctx); err != nil {
@@ -536,10 +550,10 @@ func (p *execProcess) getPid(context.Context) (uint32, error) {
 	data, err := os.ReadFile(p.pidFile())
 	if err != nil {
 		var state pState
-		if stateErr := p.readExitState(&state); stateErr == nil && state.Status == "exited" && state.Pid > 0 {
-			// systemd can remove PIDFile as soon as a pre-READY fast exit makes
-			// the start job fail. The helper's terminal state still proves that
-			// runc created the workload and carries its PID.
+		if stateErr := p.readExitState(&state); stateErr == nil && state.Pid > 0 &&
+			(state.Status == "running" || state.Status == "exited") {
+			// systemd can remove PIDFile before Start observes it. A running or
+			// exited helper state proves runc created the workload.
 			return state.Pid, nil
 		}
 		return 0, fmt.Errorf("read exec pid file: %w", err)
