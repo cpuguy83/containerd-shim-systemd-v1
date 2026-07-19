@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package containerd.systemd.v1;
 
-import weak "gogoproto/gogo.proto";
-
 option go_package = "github.com/cpuguy83/containerd-shim-systemd-v1/options;options";
 
 enum LogMode {

@@ -9,28 +9,30 @@ import (
 	"path/filepath"
 	"time"
 
+	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/api/types/task"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/namespaces"
-	taskapi "github.com/containerd/containerd/runtime/v2/task"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/log"
 	"github.com/coreos/go-systemd/v22/dbus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // State returns runtime state of a process
 func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskapi.StateResponse, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.State", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID), attribute.String(eIDAttr, r.ExecID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "state")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("state: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -68,7 +70,7 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 		Bundle:     st.Bundle,
 		Pid:        st.State.Pid,
 		ExitStatus: st.State.ExitCode,
-		ExitedAt:   st.State.ExitedAt,
+		ExitedAt:   timestamppb.New(st.State.ExitedAt),
 		Status:     toStatus(st.State.Status),
 		Stdin:      st.Stdin,
 		Stdout:     st.Stdout,
@@ -264,17 +266,17 @@ const (
 func toStatus(s string) task.Status {
 	switch s {
 	case "created", "start-pre":
-		return task.StatusCreated
+		return task.Status_CREATED
 	case "running", "start-post":
-		return task.StatusRunning
+		return task.Status_RUNNING
 	case "pausing":
-		return task.StatusPausing
+		return task.Status_PAUSING
 	case "paused":
-		return task.StatusPaused
+		return task.Status_PAUSED
 	case "stopped", "dead", "failed", "stop-post", "exited", exitedInit, "exit-code":
-		return task.StatusStopped
+		return task.Status_STOPPED
 	default:
-		return task.StatusUnknown
+		return task.Status_UNKNOWN
 	}
 }
 
@@ -296,7 +298,7 @@ func (s pState) Exited() bool {
 	if s.ExitCode > 0 {
 		return true
 	}
-	if toStatus(s.Status) == task.StatusStopped {
+	if toStatus(s.Status) == task.Status_STOPPED {
 		return true
 	}
 	return s.ExitedAt.After(timeZero)

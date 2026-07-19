@@ -27,8 +27,8 @@
       # by default and the C sources only need libc, so the stdenv compiler
       # suffices.
       #
-      # go is passed explicitly because go.mod's floor (1.23) no longer exists in
-      # nixpkgs; without this, gomod2nix would try to resolve the removed go_1_23.
+      # Pass Go explicitly so gomod2nix uses nixpkgs' current toolchain, which
+      # must satisfy the floor declared in go.mod.
       mkShim =
         pkgs:
         (gomod2nix.legacyPackages.${pkgs.stdenv.hostPlatform.system}.buildGoApplication) {
@@ -229,6 +229,7 @@
             pkgs.gnumake
             pkgs.git
             pkgs.gotestsum
+            pkgs.protobuf
             pkgs.containerd
             pkgs.runc
             pkgs.nerdctl

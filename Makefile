@@ -29,8 +29,8 @@ clean:
 mod:
 	$(GO) mod tidy
 
-# Regenerate the flake's Go module lock (gomod2nix.toml) after a go.mod/go.sum
-# change. Uses only the Go toolchain -- no Nix required.
+# Regenerate protobuf bindings and the flake's Go module lock. Run this from
+# `nix develop` so protoc is available.
 generate:
 	$(GO) generate ./...
 

@@ -8,8 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/containerd/containerd/log"
-	shimapi "github.com/containerd/containerd/runtime/v2/task"
+	taskv2 "github.com/containerd/containerd/api/runtime/task/v2"
+	taskv3 "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/log"
 	"github.com/containerd/ttrpc"
 	"github.com/coreos/go-systemd/v22/daemon"
 	"github.com/coreos/go-systemd/v22/dbus"
@@ -22,13 +23,14 @@ const (
 	serviceName    = "containerd-shim-systemd-v1"
 )
 
-func newService(ts shimapi.TaskService) (*service, error) {
+func newService(ts taskv3.TTRPCTaskService) (*service, error) {
 	s, err := ttrpc.NewServer(ttrpc.WithServerHandshaker(ttrpc.UnixSocketRequireSameUser()), ttrpc.WithUnaryServerInterceptor(UnaryServerInterceptor))
 	if err != nil {
 		return nil, err
 	}
 
-	shimapi.RegisterTaskService(s, ts)
+	taskv2.RegisterTTRPCTaskService(s, &taskV2Adapter{service: ts})
+	taskv3.RegisterTTRPCTaskService(s, ts)
 
 	return &service{
 		srv: s,

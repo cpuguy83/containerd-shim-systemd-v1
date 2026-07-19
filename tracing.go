@@ -5,8 +5,8 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/tracing"
+	"github.com/containerd/containerd/v2/pkg/tracing"
+	"github.com/containerd/log"
 	"github.com/containerd/ttrpc"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"

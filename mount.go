@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/containerd/containerd/api/types"
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/mount"
 )
 
 func mountFS(tmounts []*types.Mount, bundle string) (string, error) {

@@ -10,22 +10,24 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/containerd/cgroups"
-	cgroupsv2 "github.com/containerd/cgroups/v2"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/namespaces"
-	taskapi "github.com/containerd/containerd/runtime/v2/task"
-	"github.com/containerd/typeurl"
+	"github.com/containerd/cgroups/v3"
+	cgroupsv1 "github.com/containerd/cgroups/v3/cgroup1"
+	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
+	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
+	"github.com/containerd/log"
+	"github.com/containerd/typeurl/v2"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
-	ptypes "github.com/gogo/protobuf/types"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 const shimName = "io.containerd.systemd.v1"
@@ -152,15 +154,15 @@ func (s *Service) Close() {
 }
 
 // Pause the container
-func (s *Service) Pause(ctx context.Context, r *taskapi.PauseRequest) (_ *ptypes.Empty, retErr error) {
+func (s *Service) Pause(ctx context.Context, r *taskapi.PauseRequest) (_ *emptypb.Empty, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 	ctx, span := StartSpan(ctx, "service.Pause", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "pause")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("pause: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -176,20 +178,20 @@ func (s *Service) Pause(ctx context.Context, r *taskapi.PauseRequest) (_ *ptypes
 	if err != nil {
 		return nil, err
 	}
-	return &ptypes.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 // Resume the container
-func (s *Service) Resume(ctx context.Context, r *taskapi.ResumeRequest) (_ *ptypes.Empty, retErr error) {
+func (s *Service) Resume(ctx context.Context, r *taskapi.ResumeRequest) (_ *emptypb.Empty, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Resume", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "resume")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("resume: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -205,15 +207,15 @@ func (s *Service) Resume(ctx context.Context, r *taskapi.ResumeRequest) (_ *ptyp
 	if err := p.(*initProcess).Resume(ctx); err != nil {
 		return nil, err
 	}
-	return &ptypes.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 // Kill a process
-func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (_ *ptypes.Empty, retErr error) {
+func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (_ *emptypb.Empty, retErr error) {
 	log.G(ctx).Debug("KILL")
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(logrus.Fields{
@@ -225,7 +227,7 @@ func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (_ *ptypes.E
 	ctx, span := StartSpan(ctx, "service.Kill")
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "kill")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("kill: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 			log.G(ctx).WithError(retErr).Error("kill failed")
 		}
@@ -252,20 +254,20 @@ func (s *Service) Kill(ctx context.Context, r *taskapi.KillRequest) (_ *ptypes.E
 			return nil, err
 		}
 	}
-	return &ptypes.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 // Pids returns all pids inside the container
 func (s *Service) Pids(ctx context.Context, r *taskapi.PidsRequest) (_ *taskapi.PidsResponse, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Pids", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "pids")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("pids: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -289,16 +291,16 @@ func (s *Service) Pids(ctx context.Context, r *taskapi.PidsRequest) (_ *taskapi.
 }
 
 // Checkpoint the container
-func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskRequest) (_ *ptypes.Empty, retErr error) {
+func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskRequest) (_ *emptypb.Empty, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Checkpoint")
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "checkpoint")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("checkpoint: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -315,20 +317,20 @@ func (s *Service) Checkpoint(ctx context.Context, r *taskapi.CheckpointTaskReque
 	if err := p.(*initProcess).Checkpoint(ctx, r.Options); err != nil {
 		return nil, err
 	}
-	return &ptypes.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 // Connect returns shim information of the underlying Service
 func (s *Service) Connect(ctx context.Context, r *taskapi.ConnectRequest) (_ *taskapi.ConnectResponse, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Connect", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "connect")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("connect: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -343,9 +345,9 @@ func (s *Service) Connect(ctx context.Context, r *taskapi.ConnectRequest) (_ *ta
 }
 
 // Shutdown is called after the underlying resources of the shim are cleaned up and the Service can be stopped
-func (s *Service) Shutdown(ctx context.Context, r *taskapi.ShutdownRequest) (*ptypes.Empty, error) {
+func (s *Service) Shutdown(ctx context.Context, r *taskapi.ShutdownRequest) (*emptypb.Empty, error) {
 	// We ignore this call because we don't actually want containerd to shut us down since systemd manages our lifecycle.
-	return &ptypes.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
 
 // Stats returns container level system stats for a container and its processes
@@ -354,13 +356,13 @@ func (s *Service) Stats(ctx context.Context, r *taskapi.StatsRequest) (_ *taskap
 
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Stats", trace.WithAttributes(attribute.String(nsAttr, ns), attribute.String(cIDAttr, r.ID)))
 	defer func() {
 		if retErr != nil {
-			retErr = errdefs.ToGRPCf(retErr, "Stats")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("stats: %w", retErr))
 			span.SetStatus(codes.Error, retErr.Error())
 		}
 		span.End()
@@ -382,7 +384,7 @@ func (s *Service) Stats(ctx context.Context, r *taskapi.StatsRequest) (_ *taskap
 		if err != nil {
 			return nil, err
 		}
-		cg, err := cgroupsv2.LoadManager("/sys/fs/cgroup", g)
+		cg, err := cgroupsv2.Load(g)
 		if err != nil {
 			return nil, err
 		}
@@ -392,18 +394,18 @@ func (s *Service) Stats(ctx context.Context, r *taskapi.StatsRequest) (_ *taskap
 		}
 		stats = m
 	} else {
-		cg, err := cgroups.Load(cgroups.V1, cgroups.PidPath(int(pid)))
+		cg, err := cgroupsv1.Load(cgroupsv1.PidPath(int(pid)))
 		if err != nil {
 			return nil, err
 		}
-		m, err := cg.Stat(cgroups.IgnoreNotExist)
+		m, err := cg.Stat(cgroupsv1.IgnoreNotExist)
 		if err != nil {
 			return nil, err
 		}
 		stats = m
 	}
 
-	data, err := typeurl.MarshalAny(stats)
+	data, err := typeurl.MarshalAnyToProto(stats)
 	if err != nil {
 		return nil, err
 	}
@@ -413,17 +415,17 @@ func (s *Service) Stats(ctx context.Context, r *taskapi.StatsRequest) (_ *taskap
 }
 
 // Update the live container
-func (s *Service) Update(ctx context.Context, r *taskapi.UpdateTaskRequest) (_ *ptypes.Empty, retErr error) {
+func (s *Service) Update(ctx context.Context, r *taskapi.UpdateTaskRequest) (_ *emptypb.Empty, retErr error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
-		return nil, errdefs.ToGRPC(err)
+		return nil, errgrpc.ToGRPC(err)
 	}
 
 	ctx, span := StartSpan(ctx, "service.Update")
 	defer func() {
 		if retErr != nil {
 			span.SetStatus(codes.Error, retErr.Error())
-			retErr = errdefs.ToGRPCf(retErr, "update")
+			retErr = errgrpc.ToGRPC(fmt.Errorf("update: %w", retErr))
 		}
 		span.End()
 	}()
@@ -443,5 +445,5 @@ func (s *Service) Update(ctx context.Context, r *taskapi.UpdateTaskRequest) (_ *
 	if err := p.(*initProcess).Update(ctx, res); err != nil {
 		return nil, err
 	}
-	return &ptypes.Empty{}, nil
+	return &emptypb.Empty{}, nil
 }
