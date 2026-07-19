@@ -14,6 +14,7 @@ import (
 
 	eventsapi "github.com/containerd/containerd/api/events"
 	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
+	v2runcopts "github.com/containerd/containerd/api/types/runc/options"
 	tasktypes "github.com/containerd/containerd/api/types/task"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/typeurl/v2"
@@ -134,6 +135,76 @@ func TestServiceTaskLifecycleAgainstSystemd(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(h.unitDir, unit)); !os.IsNotExist(err) {
 			t.Fatalf("unit file still exists after delete: %v", err)
+		}
+	})
+}
+
+func TestServiceRuntimeOptionsAgainstSystemd(t *testing.T) {
+	t.Run("a selected runc binary is used by init and exec processes", func(t *testing.T) {
+		h := newServiceIntegrationHarness(t)
+		ctx, req, _ := h.task(t, "selected-runc", runcStubConfig{ExitDelay: 30 * time.Second})
+
+		selectedRunc := h.service.runcBin
+		h.service.runcBin = filepath.Join(filepath.Dir(h.service.runcBin), "missing-default-runc")
+
+		createOptions, err := typeurl.MarshalAnyToProto(&v2runcopts.Options{BinaryName: selectedRunc})
+		if err != nil {
+			t.Fatalf("marshal runc options: %v", err)
+		}
+		req.Options = createOptions
+
+		if _, err := h.service.Create(ctx, req); err != nil {
+			t.Fatalf("create task: %v", err)
+		}
+		if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
+			t.Fatalf("start task: %v", err)
+		}
+
+		const execID = "selected-runc-exec"
+		h.exec(t, ctx, req, execID, runcStubConfig{ExitDelay: 100 * time.Millisecond})
+		if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID, ExecID: execID}); err != nil {
+			t.Fatalf("start exec: %v", err)
+		}
+
+		execWaitCtx, cancelExecWait := context.WithTimeout(ctx, 10*time.Second)
+		defer cancelExecWait()
+		if _, err := h.service.Wait(execWaitCtx, &taskapi.WaitRequest{ID: req.ID, ExecID: execID}); err != nil {
+			t.Fatalf("wait for exec: %v", err)
+		}
+		if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID, ExecID: execID}); err != nil {
+			t.Fatalf("delete exec: %v", err)
+		}
+
+		if _, err := h.service.Kill(ctx, &taskapi.KillRequest{ID: req.ID, Signal: uint32(unix.SIGKILL), All: true}); err != nil {
+			t.Fatalf("kill task: %v", err)
+		}
+		taskWaitCtx, cancelTaskWait := context.WithTimeout(ctx, 10*time.Second)
+		defer cancelTaskWait()
+		if _, err := h.service.Wait(taskWaitCtx, &taskapi.WaitRequest{ID: req.ID}); err != nil {
+			t.Fatalf("wait for task: %v", err)
+		}
+		if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID}); err != nil {
+			t.Fatalf("delete task: %v", err)
+		}
+	})
+
+	t.Run("a missing selected runc binary fails create", func(t *testing.T) {
+		h := newServiceIntegrationHarness(t)
+		ctx, req, _ := h.task(t, "missing-runc", runcStubConfig{})
+		missingRunc := filepath.Join(t.TempDir(), "missing-runc")
+
+		createOptions, err := typeurl.MarshalAnyToProto(&v2runcopts.Options{BinaryName: missingRunc})
+		if err != nil {
+			t.Fatalf("marshal runc options: %v", err)
+		}
+		req.Options = createOptions
+
+		_, err = h.service.Create(ctx, req)
+		if err == nil {
+			t.Fatal("create succeeded with a missing runc binary")
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("failed to look up runc binary %q", missingRunc)) {
+			t.Fatalf("create error = %q, want missing runc binary", err)
 		}
 	})
 }

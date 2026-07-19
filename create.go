@@ -97,6 +97,14 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		opts.LogMode = s.defaultLogMode.String()
 	}
 
+	runcCommand := s.runcBin
+	if opts.BinaryName != "" {
+		runcCommand, err = exec.LookPath(opts.BinaryName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to look up runc binary %q: %w", opts.BinaryName, err)
+		}
+	}
+
 	var logPath string
 	if s.debug {
 		logPath = filepath.Join(r.Bundle, "init-runc-debug.log")
@@ -132,7 +140,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			systemd:  s.conn,
 			runc: &runc.Runc{
 				Debug:         s.debug,
-				Command:       s.runcBin,
+				Command:       runcCommand,
 				SystemdCgroup: opts.SystemdCgroup,
 				PdeathSignal:  syscall.SIGKILL,
 				Root:          filepath.Join(opts.Root, ns),
@@ -242,7 +250,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *e
 			opts:     CreateOptions{LogMode: s.defaultLogMode.String()},
 			runc: &runc.Runc{
 				Debug:         s.debug,
-				Command:       s.runcBin,
+				Command:       pInit.runc.Command,
 				SystemdCgroup: pInit.runc.SystemdCgroup,
 				PdeathSignal:  syscall.SIGKILL,
 				Root:          pInit.runc.Root,
