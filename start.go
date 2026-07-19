@@ -89,7 +89,7 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 func (p *process) runcCmd(cmd []string) ([]string, error) {
 	root := []string{p.runc.Command, "--debug=" + strconv.FormatBool(p.runc.Debug), "--systemd-cgroup=" + strconv.FormatBool(p.opts.SystemdCgroup), "--root", p.runc.Root}
 	if p.runc.Debug {
-		root = append(root, "--log="+p.runc.Log)
+		root = append(root, "--log", p.runc.Log)
 	}
 
 	return append(root, cmd...), nil

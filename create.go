@@ -128,16 +128,17 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	if err != nil {
 		return nil, fmt.Errorf("error reading spec: %w", err)
 	}
+	var spec specs.Spec
+	if err := json.Unmarshal(specData, &spec); err != nil {
+		return nil, fmt.Errorf("error unmarshalling spec: %w", err)
+	}
+
 	noNewNamespace := s.noNewNamespace
 
 	if !noNewNamespace {
 		// If the container rootfs is set to shared propagation we must not create use a private namespace.
 		// Otherwise this could prevent the container from legitimately propoagating mounts to the host.
-		var spec specs.Spec
-		if err := json.Unmarshal(specData, &spec); err != nil {
-			return nil, fmt.Errorf("error unmarshalling spec: %w", err)
-		}
-		if spec.Linux.RootfsPropagation == "shared" {
+		if spec.Linux != nil && spec.Linux.RootfsPropagation == "shared" {
 			noNewNamespace = true
 		}
 	}
@@ -168,6 +169,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		Bundle:           r.Bundle,
 		Rootfs:           r.Rootfs,
 		noNewNamespace:   noNewNamespace,
+		killAllOnExit:    shouldKillAllOnExit(&spec),
 		checkpoint:       r.Checkpoint,
 		parentCheckpoint: r.ParentCheckpoint,
 		sendEvent:        s.send,
@@ -860,6 +862,7 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 					st.Status = "exited"
 					notify = func() { sdNotify(ctx, notifyStatus(st.Status), notifyErrno(st.ExitCode), notifyMainPID(st.Pid)) }
 				} else {
+					st.Status = "running"
 					notify = func() {
 						sdNotify(ctx, daemon.SdNotifyReady, notifyMainPID(st.Pid))
 						log.G(ctx).Debug("Process is up!")
@@ -875,6 +878,17 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		notify()
 	}
 	return err
+}
+
+func shouldKillAllOnExit(spec *specs.Spec) bool {
+	if spec.Linux != nil {
+		for _, ns := range spec.Linux.Namespaces {
+			if ns.Type == specs.PIDNamespace && ns.Path == "" {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func notifyMainPID(pid uint32) string {
