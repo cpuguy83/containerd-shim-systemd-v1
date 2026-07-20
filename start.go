@@ -235,7 +235,7 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		return 0, fmt.Errorf("process has already exited: %s: %w", p.ProcessState(), errdefs.ErrFailedPrecondition)
 	}
 
-	if err := p.runc.Start(ctx, p.id); err != nil {
+	if err := p.runcForBundle().Start(ctx, p.id); err != nil {
 		log.G(ctx).WithError(err).Error("Error calling runc start")
 		ret := fmt.Errorf("failed runc start: %w", err)
 
