@@ -184,6 +184,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	if err := s.processes.Add(path.Join(ns, r.ID), p); err != nil {
 		return nil, err
 	}
+	s.units.Add(p)
 
 	defer func() {
 		if retErr != nil {
@@ -202,7 +203,6 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		return nil, err
 	}
 	p.SetState(ctx, pState{Pid: pid, Status: "created"})
-	s.units.Add(p)
 
 	s.send(ctx, ns, &eventsapi.TaskCreate{
 		ContainerID: r.ID,
@@ -426,7 +426,7 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	defer func() {
 		if retErr != nil {
 			span.SetStatus(codes.Error, retErr.Error())
-			p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true})
+			p.runcForBundle().Delete(ctx, p.id, &runc.DeleteOpts{Force: true})
 			p.mu.Lock()
 			p.deleted = true
 			p.cond.Broadcast()
@@ -503,7 +503,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 		ch := make(chan string, 1)
 		p.systemd.ResetFailedUnitContext(ctx, p.Name())
 		if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
-			if err := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil && !strings.Contains(err.Error(), "not found") {
+			if err := p.runcForBundle().Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil && !strings.Contains(err.Error(), "not found") {
 				log.G(ctx).WithError(err).Info("Error deleting container in runc")
 			}
 			if err := p.systemd.ResetFailedUnitContext(ctx, uName); err != nil {
@@ -587,7 +587,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 		}
 
 		// Clean up old state and try again
-		if err2 := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err2 != nil {
+		if err2 := p.runcForBundle().Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err2 != nil {
 			log.G(ctx).WithError(err2).Info("Error deleting container in runc")
 		}
 		if err := do(); err != nil {
@@ -608,7 +608,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 					ret = fmt.Errorf("%w\n%s", ret, string(ttyData))
 				}
 			}
-			if err2 := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err2 != nil {
+			if err2 := p.runcForBundle().Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err2 != nil {
 				log.G(ctx).WithError(err2).Debug("Error deleting container in runc")
 			}
 			return 0, ret

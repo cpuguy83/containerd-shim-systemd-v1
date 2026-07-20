@@ -64,6 +64,11 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 	if err := p.LoadState(ctx); err != nil {
 		log.G(ctx).WithError(err).Warning("Error loading process state")
 	}
+	if !p.ProcessState().Exited() && p.Pid() > 0 {
+		if err := p.LoadExitState(ctx); err != nil {
+			log.G(ctx).WithError(err).Warning("Error loading process exit state")
+		}
+	}
 
 	st, err := p.Wait(ctx)
 	if err != nil {

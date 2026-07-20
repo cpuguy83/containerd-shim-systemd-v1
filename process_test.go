@@ -133,6 +133,8 @@ func TestInitExitCleanup(t *testing.T) {
 		}
 
 		p, _ := newTestInitProcess("container")
+		p.exe = testExecutable(t)
+		p.root = t.TempDir()
 		p.runc = &runc.Runc{Command: runcPath, Root: runcRoot}
 		p.killAllOnExit = true
 		p.markStarted()
@@ -282,13 +284,19 @@ func writeTestProcessState(t *testing.T, path string, state pState) {
 
 func newRuncStub(t *testing.T) string {
 	t.Helper()
-	testBinary, err := os.Executable()
-	if err != nil {
-		t.Fatalf("find test executable: %v", err)
-	}
+	testBinary := testExecutable(t)
 	path := filepath.Join(t.TempDir(), runcStubHelperName)
 	if err := os.Symlink(testBinary, path); err != nil {
 		t.Fatalf("create runc helper: %v", err)
 	}
 	return path
+}
+
+func testExecutable(t *testing.T) string {
+	t.Helper()
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("find test executable: %v", err)
+	}
+	return testBinary
 }

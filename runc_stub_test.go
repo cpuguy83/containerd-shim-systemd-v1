@@ -51,6 +51,14 @@ type runcStubConfig struct {
 }
 
 func TestMain(m *testing.M) {
+	if handled, err := runRuncWrapper(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	switch filepath.Base(os.Args[0]) {
 	case shimCreateHelperName:
 		if err := runShimCreateHelper(); err != nil {
@@ -107,6 +115,8 @@ func runRuncStub() int {
 		code, err = runRuncStubDelete(root, args)
 	case "kill":
 		code, err = runRuncStubKill(root, args)
+	case "state":
+		code, err = runRuncStubState(args)
 	default:
 		err = fmt.Errorf("runc stub does not implement %q", command)
 		code = 125
@@ -122,6 +132,29 @@ func runRuncStubKill(root string, args []string) (int, error) {
 		return 125, fmt.Errorf("invalid runc kill arguments: %q", args)
 	}
 	return 0, os.WriteFile(filepath.Join(root, args[1], runcStubKillAllMarker), nil, 0600)
+}
+
+func runRuncStubState(args []string) (int, error) {
+	if _, err := os.Stat("config.json"); err != nil {
+		return 125, fmt.Errorf("read bundle config: %w", err)
+	}
+	id, err := commandID(args)
+	if err != nil {
+		return 125, err
+	}
+	bundle, err := os.Getwd()
+	if err != nil {
+		return 125, err
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
+		"id":     id,
+		"pid":    42,
+		"status": "running",
+		"bundle": bundle,
+	}); err != nil {
+		return 125, err
+	}
+	return 0, nil
 }
 
 func parseRuncStubInvocation(args []string) (root, command string, commandArgs []string, retErr error) {
