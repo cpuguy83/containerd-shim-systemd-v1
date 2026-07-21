@@ -89,14 +89,6 @@ var (
 )
 
 func main() {
-	if handled, err := runRuncWrapper(os.Args[1:]); handled {
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-
 	var (
 		debug          bool
 		socket         = defaultAddress

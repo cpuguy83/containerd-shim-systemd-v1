@@ -375,7 +375,7 @@ func (p *initProcess) Kill(ctx context.Context, sig int, all bool) error {
 		if strings.Contains(err.Error(), "no main process") {
 			return errdefs.ErrNotFound
 		}
-		if _, err2 := p.runcForBundle().State(ctx, p.id); err2 != nil && strings.Contains(err2.Error(), "does not exist") {
+		if _, err2 := p.runc.State(ctx, p.id); err2 != nil && strings.Contains(err2.Error(), "does not exist") {
 			return fmt.Errorf("could not get runc state: %w", errdefs.ErrNotFound)
 		}
 		units, e := p.systemd.ListUnitsByNamesContext(ctx, []string{p.Name()})
@@ -430,7 +430,7 @@ func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 	st := p.process.SetState(ctx, state)
 	if st.Exited() && p.claimExitNotification() {
 		if st.Status != exitedInit && p.hasStarted() && p.killAllOnExit {
-			if err := p.runcForBundle().Kill(ctx, p.id, int(syscall.SIGKILL), &runc.KillOpts{All: true}); err != nil {
+			if err := p.runc.Kill(ctx, p.id, int(syscall.SIGKILL), &runc.KillOpts{All: true}); err != nil {
 				log.G(ctx).WithError(err).WithField("id", p.id).Error("failed to kill init's children")
 			}
 		}
@@ -438,6 +438,12 @@ func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 		p.execs.Each(func(exec Process) {
 			if err := exec.LoadState(ctx); err != nil {
 				log.G(ctx).WithError(err).WithField("exec", p.Name()).Info("Could not load exec state")
+			}
+			// An exec that never started has no process to reap. Leave it in its
+			// Created state so callers see it never ran, rather than synthesizing
+			// a non-zero exit for a process that was only ever set up.
+			if ep, ok := exec.(*execProcess); ok && !ep.hasStarted() {
+				return
 			}
 			if !exec.ProcessState().Exited() {
 				exec.SetState(ctx, pState{ExitedAt: time.Now(), ExitCode: 255})
@@ -498,7 +504,7 @@ func (p *initProcess) Checkpoint(ctx context.Context, r *anypb.Any) error {
 		actions = append(actions, runc.LeaveRunning)
 	}
 
-	if err := p.runcForBundle().Checkpoint(ctx, p.id, &opts, actions...); err != nil {
+	if err := p.runc.Checkpoint(ctx, p.id, &opts, actions...); err != nil {
 		if p.runc.Debug {
 			f, err2 := os.ReadFile(filepath.Join(opts.WorkDir, "dump.log"))
 			if err2 == nil {
@@ -511,15 +517,15 @@ func (p *initProcess) Checkpoint(ctx context.Context, r *anypb.Any) error {
 }
 
 func (p *initProcess) Pause(ctx context.Context) error {
-	return p.runcForBundle().Pause(ctx, p.id)
+	return p.runc.Pause(ctx, p.id)
 }
 
 func (p *initProcess) Resume(ctx context.Context) error {
-	return p.runcForBundle().Resume(ctx, p.id)
+	return p.runc.Resume(ctx, p.id)
 }
 
 func (p *initProcess) Pids(ctx context.Context) ([]*task.ProcessInfo, error) {
-	ls, err := p.runcForBundle().Ps(ctx, p.id)
+	ls, err := p.runc.Ps(ctx, p.id)
 	if err != nil {
 		return nil, err
 	}
@@ -532,7 +538,7 @@ func (p *initProcess) Pids(ctx context.Context) ([]*task.ProcessInfo, error) {
 }
 
 func (p *initProcess) Update(ctx context.Context, res specs.LinuxResources) error {
-	return p.runcForBundle().Update(ctx, p.id, &res)
+	return p.runc.Update(ctx, p.id, &res)
 }
 
 type execProcess struct {

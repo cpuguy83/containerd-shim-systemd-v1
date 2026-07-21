@@ -254,7 +254,20 @@ func (p *execProcess) State(ctx context.Context) (*State, error) {
 
 	p.mu.Lock()
 	p.state.CopyTo(&st.State)
+	started := p.started
 	p.mu.Unlock()
+
+	// An exec reports Created until its process actually runs. If the
+	// container's init died before this exec's process started, runc's exec
+	// init exits (status exited-init) without ever running the process, so
+	// report Created rather than a synthetic exit. An exec that was set up but
+	// never started likewise has no recorded state.
+	initDied := st.State.Status == exitedInit && p.parent.ProcessState().Exited()
+	if initDied || (!started && !st.State.Exited()) {
+		st.State.Status = "created"
+		st.State.ExitCode = 0
+		st.State.ExitedAt = timeZero
+	}
 
 	return st, nil
 }
@@ -320,7 +333,12 @@ func (s pState) String() string {
 // status to a non-terminal status.
 // This is to ensure we don't override real information in the state w/, for instance, state info for a deleted unit.
 func (s *pState) CopyTo(other *pState) {
-	if s.Pid == 0 {
+	// A pid-less, non-terminal state carries no real information (e.g. a read of
+	// a deleted or never-started unit) and must not clobber the destination. A
+	// terminal exit, however, is meaningful even without a pid: systemd reports
+	// ExecMainPID as 0 once the unit is dead, so requiring a pid here would drop
+	// the exit and leave the process wedged in a non-terminal state.
+	if s.Pid == 0 && !s.Exited() {
 		return
 	}
 	if s.ExitedAt.After(timeZero) && !other.ExitedAt.After(timeZero) {
