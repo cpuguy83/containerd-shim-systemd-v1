@@ -128,7 +128,7 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 
 	p.systemd.KillUnitContext(ctx, p.Name(), int32(syscall.SIGKILL))
 
-	if err := p.runcForBundle().Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil {
+	if err := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil {
 		return pState{}, err
 	}
 

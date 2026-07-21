@@ -26,6 +26,10 @@ require (
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 )
 
+// Use the fork that adds Runc.WorkDir so runc runs with the bundle as its
+// working directory, replacing the re-exec wrapper.
+replace github.com/containerd/go-runc => github.com/cpuguy83/go-runc v0.0.0-20260720172958-a43614f93d79
+
 require (
 	github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29 // indirect
 	github.com/Microsoft/hcsshim v0.15.0-rc.1 // indirect
