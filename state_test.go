@@ -86,12 +86,25 @@ func TestToStatus(t *testing.T) {
 }
 
 func TestPStateCopyTo(t *testing.T) {
-	t.Run("copying a zero-pid state leaves the destination untouched", func(t *testing.T) {
+	t.Run("copying a zero-pid non-terminal state leaves the destination untouched", func(t *testing.T) {
 		dst := pState{Pid: 7, Status: "running"}
-		src := pState{Status: "dead"}
+		src := pState{Status: "activating"}
 		src.CopyTo(&dst)
 		if dst.Pid != 7 || dst.Status != "running" {
-			t.Fatalf("expected zero-pid source to be a no-op, got %+v", dst)
+			t.Fatalf("expected zero-pid non-terminal source to be a no-op, got %+v", dst)
+		}
+	})
+
+	t.Run("copying a zero-pid terminal exit records the exit", func(t *testing.T) {
+		exitedAt := time.Now()
+		dst := pState{Pid: 16073, Status: "created"}
+		src := pState{Status: "failed", ExitedAt: exitedAt}
+		src.CopyTo(&dst)
+		if !dst.Exited() {
+			t.Fatalf("expected a pid-less terminal exit to record the exit, got %+v", dst)
+		}
+		if dst.Pid != 16073 {
+			t.Fatalf("expected the destination pid to be preserved, got %d", dst.Pid)
 		}
 	})
 

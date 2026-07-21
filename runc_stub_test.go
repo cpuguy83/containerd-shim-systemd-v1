@@ -51,14 +51,6 @@ type runcStubConfig struct {
 }
 
 func TestMain(m *testing.M) {
-	if handled, err := runRuncWrapper(os.Args[1:]); handled {
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
 	switch filepath.Base(os.Args[0]) {
 	case shimCreateHelperName:
 		if err := runShimCreateHelper(); err != nil {
