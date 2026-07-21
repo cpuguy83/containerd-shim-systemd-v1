@@ -33,6 +33,35 @@ func TestProcessLifecycleStatus(t *testing.T) {
 			t.Fatalf("status after Start = %q, want running", state.Status)
 		}
 	})
+
+	t.Run("a recorded exit is not overwritten by a later non-terminal update", func(t *testing.T) {
+		p := &process{}
+		p.cond = sync.NewCond(&p.mu)
+		p.markStarted()
+
+		p.SetState(context.Background(), pState{Pid: 42, ExitCode: 9, Status: "exited", ExitedAt: time.Now()})
+
+		state := p.SetState(context.Background(), pState{Pid: 42, Status: "created"})
+		if !state.Exited() {
+			t.Fatalf("state after stale created update = %+v, want it to stay exited", state)
+		}
+		if state.ExitCode != 9 {
+			t.Fatalf("exit code after stale created update = %d, want 9", state.ExitCode)
+		}
+	})
+
+	t.Run("a recorded exit can be refined by a later terminal update", func(t *testing.T) {
+		p := &process{}
+		p.cond = sync.NewCond(&p.mu)
+		p.markStarted()
+
+		p.SetState(context.Background(), pState{Pid: 42, Status: "exited", ExitedAt: time.Now()})
+
+		state := p.SetState(context.Background(), pState{Pid: 42, ExitCode: 137, Status: "exited", ExitedAt: time.Now()})
+		if state.ExitCode != 137 {
+			t.Fatalf("exit code after terminal refinement = %d, want 137", state.ExitCode)
+		}
+	})
 }
 
 func TestRuncCommandArguments(t *testing.T) {
@@ -232,6 +261,80 @@ func TestExecProcessTaskExitIsEmittedOnce(t *testing.T) {
 
 		if got := exits(); got != 1 {
 			t.Fatalf("expected exactly one exec TaskExit under concurrency, got %d", got)
+		}
+	})
+}
+
+func TestExecStatusWhenInitExits(t *testing.T) {
+	initExit := pState{Pid: 42, ExitCode: 137, ExitedAt: time.Now(), Status: "exited"}
+
+	t.Run("an exec that was never started reports created", func(t *testing.T) {
+		parent, _ := newTestInitProcess("c-created")
+		ep := newTestExecProcess(parent, "exec1")
+
+		st, err := ep.State(context.Background())
+		if err != nil {
+			t.Fatalf("exec state: %v", err)
+		}
+		if st.State.Status != "created" {
+			t.Fatalf("unstarted exec status = %q, want created", st.State.Status)
+		}
+	})
+
+	t.Run("an init exit leaves a never-started exec created", func(t *testing.T) {
+		parent, _ := newTestInitProcess("c-unstarted")
+		ep := newTestExecProcess(parent, "exec1")
+		if err := parent.execs.Add("exec1", ep); err != nil {
+			t.Fatalf("register exec: %v", err)
+		}
+
+		parent.SetState(context.Background(), initExit)
+
+		st, err := ep.State(context.Background())
+		if err != nil {
+			t.Fatalf("exec state: %v", err)
+		}
+		if st.State.Status != "created" {
+			t.Fatalf("never-started exec status after init exit = %q, want created", st.State.Status)
+		}
+	})
+
+	t.Run("an init exit reaps a started exec", func(t *testing.T) {
+		parent, _ := newTestInitProcess("c-started")
+		ep := newTestExecProcess(parent, "exec1")
+		ep.markStarted()
+		ep.SetState(context.Background(), pState{Pid: 99, Status: "running"})
+		if err := parent.execs.Add("exec1", ep); err != nil {
+			t.Fatalf("register exec: %v", err)
+		}
+
+		parent.SetState(context.Background(), initExit)
+
+		st, err := ep.State(context.Background())
+		if err != nil {
+			t.Fatalf("exec state: %v", err)
+		}
+		if !st.State.Exited() {
+			t.Fatalf("started exec after init exit = %+v, want a recorded exit", st.State)
+		}
+	})
+
+	t.Run("an exec whose init exited before its process ran reports created", func(t *testing.T) {
+		parent, _ := newTestInitProcess("c-exitedinit")
+		ep := newTestExecProcess(parent, "exec1")
+		ep.SetState(context.Background(), pState{Pid: 55, ExitCode: 1, ExitedAt: time.Now(), Status: exitedInit})
+		if err := parent.execs.Add("exec1", ep); err != nil {
+			t.Fatalf("register exec: %v", err)
+		}
+
+		parent.SetState(context.Background(), initExit)
+
+		st, err := ep.State(context.Background())
+		if err != nil {
+			t.Fatalf("exec state: %v", err)
+		}
+		if st.State.Status != "created" {
+			t.Fatalf("exec status after container init died = %q, want created", st.State.Status)
 		}
 	})
 }
