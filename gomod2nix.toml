@@ -41,8 +41,9 @@ schema = 3
     version = "v1.1.0"
     hash = "sha256-pM2hvoAPmJBxHV6psHc7QP2y/j1Ke9z3lHrlqK4Oq7U="
   [mod."github.com/containerd/go-runc"]
-    version = "v1.1.0"
-    hash = "sha256-DvZjx2+l453Jl9MNuRkHai6tF1bNdP5BJ+YRIQlRxg0="
+    version = "v0.0.0-20260720172958-a43614f93d79"
+    hash = "sha256-QaVwJlH/abrYwIlN52vS5CqX6t43xjpt1ZqqvBGwcoo="
+    replaced = "github.com/cpuguy83/go-runc"
   [mod."github.com/containerd/log"]
     version = "v0.1.0"
     hash = "sha256-vuE6Mie2gSxiN3jTKTZovjcbdBd1YEExb7IBe3GM+9s="
