@@ -55,9 +55,10 @@ nix develop
 make build
 ```
 
-The flake builds the shim with gomod2nix for x86_64-linux and aarch64-linux.
-After changing `go.mod` or `go.sum`, run `make generate` (or
-`go generate ./...`) and include the updated `gomod2nix.toml`.
+The flake builds the shim with `buildGoModule` for x86_64-linux and
+aarch64-linux, fetching dependencies via a `vendorHash` in `flake.nix` rather
+than a committed `vendor/` tree. After changing `go.mod` or `go.sum`, refresh it
+by running `scripts/update-vendor-hash.sh` and commit the updated `flake.nix`.
 
 For isolated end-to-end work, `nix run .#vm` boots an x86_64 NixOS VM with
 systemd, containerd, runc, and the shim registered. Validate through `nerdctl`
