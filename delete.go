@@ -164,6 +164,8 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 	p.cond.Broadcast()
 	p.mu.Unlock()
 
+	p.closeTTYControl()
+
 	return ps, nil
 }
 
@@ -217,6 +219,8 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	p.deleted = true
 	p.cond.Broadcast()
 	p.mu.Unlock()
+
+	p.closeTTYControl()
 
 	p.parent.execs.Delete(p.execID)
 	if err := os.Remove(p.unitPath()); err != nil {

@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -20,7 +24,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -29,6 +32,182 @@ const (
 	ttyHandshakeEnv = "_TTY_HANDSHAKE"
 )
 
+// The tty handler protocol is a small newline-framed, text request/response
+// exchanged over a persistent unix socket. A request is "<op> <width> <height>"
+// and a response is a single status line: "0" on success or "1 <message>" on
+// error. These constants are mirrored by op_resize/reply_* in pty.c.
+const (
+	ttyOpResize  = 1
+	ttyStatusOK  = "0"
+	ttyStatusErr = "1"
+
+	// maxTTYResponseLen bounds how many bytes we buffer for a single response
+	// line so a misbehaving handler cannot make us read without limit. It
+	// comfortably exceeds the longest reply pty.c can produce.
+	maxTTYResponseLen = 256
+
+	// ttyRequestBufSize sizes the reusable request buffer. A resize request is
+	// "<op> <width> <height>\n"; width and height arrive as uint32 (at most 10
+	// digits each), so the longest possible request, "1 4294967295 4294967295\n",
+	// is 24 bytes. Rounded up for headroom.
+	ttyRequestBufSize = 32
+
+	// ttyResponseTimeout bounds a single resize exchange. The read runs while the
+	// process lock is held, so without a deadline a stuck handler -- or an old,
+	// pre-framing handler that writes a bare "0" and never sends the newline this
+	// client now waits for -- would hang the whole lifecycle. The timeout is
+	// generous: a healthy handler replies in microseconds.
+	ttyResponseTimeout = 2 * time.Second
+)
+
+// ttyControlClient sends control operations to a container's tty handler over
+// its unix control socket. The handler speaks the small newline-framed
+// request/response protocol described above; this client hides that behind
+// Resize and Close, dialing lazily and reusing the connection across resizes.
+// Its own mutex serializes exchanges, so tty I/O never blocks the process
+// lifecycle lock.
+type ttyControlClient struct {
+	sockPath string
+
+	mu     sync.Mutex
+	conn   net.Conn
+	reader *bufio.Reader
+	limit  *io.LimitedReader
+	// buf is a reusable scratch buffer for encoding each request, so a resize
+	// does not allocate.
+	buf [ttyRequestBufSize]byte
+}
+
+func newTTYControlClient(sockPath string) *ttyControlClient {
+	return &ttyControlClient{sockPath: sockPath}
+}
+
+// Resize sets the tty window size. It dials the handler on first use and reuses
+// the connection thereafter; if the exchange fails it drops the connection so
+// the next resize redials.
+func (c *ttyControlClient) Resize(ctx context.Context, width, height int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn == nil {
+		if err := c.dial(); err != nil {
+			return err
+		}
+	}
+
+	line, err := c.exchange(ctx, appendTTYResizeRequest(c.buf[:0], width, height))
+	if err != nil {
+		// The handler is a transient local unit: a failed exchange means it is
+		// gone, not that a retry would help, so just drop the connection and let
+		// the next resize redial.
+		c.reset()
+		return err
+	}
+	return parseTTYResponse(line)
+}
+
+// Close closes the control connection. It is safe to call more than once and
+// concurrently with Resize. The caller must not hold c.mu.
+func (c *ttyControlClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reset()
+}
+
+// dial establishes the control connection and its bounded reader. The caller
+// holds c.mu.
+func (c *ttyControlClient) dial() error {
+	conn, err := net.Dial("unix", c.sockPath)
+	if err != nil {
+		return fmt.Errorf("could not dial tty sock: %w", err)
+	}
+	c.conn = conn
+	c.limit = &io.LimitedReader{R: conn}
+	c.reader = bufio.NewReader(c.limit)
+	return nil
+}
+
+// reset closes and clears the control connection, returning the close error.
+// The caller holds c.mu.
+func (c *ttyControlClient) reset() error {
+	if c.conn == nil {
+		return nil
+	}
+	err := c.conn.Close()
+	c.conn, c.reader, c.limit = nil, nil, nil
+	return err
+}
+
+// exchange writes req and reads one response line, bounded by ttyResponseTimeout
+// (or an earlier context deadline). The caller holds c.mu.
+func (c *ttyControlClient) exchange(ctx context.Context, req []byte) (string, error) {
+	deadline := time.Now().Add(ttyResponseTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := c.conn.SetDeadline(deadline); err != nil {
+		return "", fmt.Errorf("error setting tty handler deadline: %w", err)
+	}
+
+	if _, err := c.conn.Write(req); err != nil {
+		return "", fmt.Errorf("error writing winsize to the tty handler: %w", err)
+	}
+
+	line, err := c.readMsg()
+	if err != nil {
+		return "", fmt.Errorf("error reading response from tty handler: %w", err)
+	}
+	return line, nil
+}
+
+// readMsg reads one status line from the handler, bounding the read at
+// maxTTYResponseLen bytes via the reusable limit. A well-behaved handler ends
+// the line with a newline. An older, pre-framing handler writes an unframed
+// reply (e.g. a bare "0") then waits for the next request, so no newline
+// arrives; the read then ends by deadline or EOF with the message buffered, and
+// we return it rather than hanging or reporting a failure. The caller holds c.mu.
+func (c *ttyControlClient) readMsg() (string, error) {
+	c.limit.N = maxTTYResponseLen
+	line, err := c.reader.ReadString('\n')
+	if err != nil {
+		if c.limit.N <= 0 {
+			return "", fmt.Errorf("tty handler response exceeded %d bytes without a newline", maxTTYResponseLen)
+		}
+		if len(line) == 0 {
+			return "", err
+		}
+		// Unframed reply: the message is buffered but no newline arrived.
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// appendTTYResizeRequest appends a newline-terminated resize request to buf and
+// returns the extended buffer, so a caller can reuse a single buffer across
+// resizes instead of allocating one per call.
+func appendTTYResizeRequest(buf []byte, width, height int) []byte {
+	buf = strconv.AppendInt(buf, ttyOpResize, 10)
+	buf = append(buf, ' ')
+	buf = strconv.AppendInt(buf, int64(width), 10)
+	buf = append(buf, ' ')
+	buf = strconv.AppendInt(buf, int64(height), 10)
+	return append(buf, '\n')
+}
+
+// parseTTYResponse interprets a single status line from the tty handler.
+func parseTTYResponse(line string) error {
+	line = strings.TrimRight(line, "\r\n")
+	switch {
+	case line == ttyStatusOK:
+		return nil
+	case line == ttyStatusErr:
+		return fmt.Errorf("tty handler returned an unspecified error")
+	case strings.HasPrefix(line, ttyStatusErr+" "):
+		return fmt.Errorf("tty handler returned an error: %s", strings.TrimPrefix(line, ttyStatusErr+" "))
+	default:
+		return fmt.Errorf("tty handler returned an unexpected response: %q", line)
+	}
+}
+
 func (p *process) ResizePTY(ctx context.Context, width, height int, sockPath string) error {
 	if !p.Terminal {
 		// This mimics what the runc shim does, and what the containerd integration tests expect
@@ -36,46 +215,26 @@ func (p *process) ResizePTY(ctx context.Context, width, height int, sockPath str
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if p.ttyControl == nil {
+		p.ttyControl = newTTYControlClient(sockPath)
+	}
+	c := p.ttyControl
+	p.mu.Unlock()
 
-	conn := p.ttyConn
+	return c.Resize(ctx, width, height)
+}
 
-	var noRetry bool
-	if conn == nil {
-		noRetry = true
-		var err error
-		conn, err = net.Dial("unix", sockPath)
-		if err != nil {
-			return fmt.Errorf("could not dial tty sock: %w", err)
-		}
-		p.ttyConn = conn
+// closeTTYControl detaches and closes the process's tty control client, if any.
+// It holds p.mu only to detach the pointer, never across the close, so a slow or
+// stuck resize cannot wedge the lifecycle lock.
+func (p *process) closeTTYControl() {
+	p.mu.Lock()
+	c := p.ttyControl
+	p.ttyControl = nil
+	p.mu.Unlock()
+	if c != nil {
+		c.Close()
 	}
-
-	_, err := conn.Write([]byte("1 " + strconv.Itoa(width) + " " + strconv.Itoa(height)))
-	if err != nil {
-		if !noRetry {
-			p.ttyConn.Close()
-			p.ttyConn = nil
-			return p.ResizePTY(ctx, width, height, sockPath)
-		}
-		return fmt.Errorf("error writing winsize to the tty handler: %w", err)
-	}
-
-	resp := make([]byte, 128)
-	n, err := conn.Read(resp)
-	if err != nil {
-		return fmt.Errorf("error reading ack from tty handler: %w", err)
-	}
-	if n > 1 {
-		return fmt.Errorf("tty handler returned an error: %s", string(resp[:n]))
-	}
-	if n == 0 {
-		return fmt.Errorf("tty handler returned no data")
-	}
-	if resp[0] != '0' {
-		return fmt.Errorf("tty handler returned unknown response code %s", string(resp[:n]))
-	}
-	return nil
 }
 
 // ResizePty of a process
@@ -91,9 +250,9 @@ func (s *Service) ResizePty(ctx context.Context, r *taskapi.ResizePtyRequest) (_
 		"apiAction": "resizePty",
 	}))
 
-	log.G(ctx).Info("systemd.ResizePTY start")
+	log.G(ctx).Debug("systemd.ResizePTY start")
 	defer func() {
-		log.G(ctx).WithError(retErr).Info("systemd.ResizePTY end")
+		log.G(ctx).WithError(retErr).Debug("systemd.ResizePTY end")
 		if retErr != nil {
 			retErr = errgrpc.ToGRPC(retErr)
 		}
@@ -141,47 +300,6 @@ func (s *Service) CloseIO(ctx context.Context, r *taskapi.CloseIORequest) (_ *em
 	return &emptypb.Empty{}, nil
 }
 
-// This is pretty standard stuff but I copied this from github.com/containerd/go-runc, with some minor changes.
-// This receives the pty master fd from runc.
-func recvFd(socket *net.UnixConn) (int, error) {
-	const MaxNameLen = 4096
-	var oobSpace = unix.CmsgSpace(4)
-
-	name := make([]byte, MaxNameLen)
-	oob := make([]byte, oobSpace)
-
-	n, oobn, _, _, err := socket.ReadMsgUnix(name, oob)
-	if err != nil {
-		return -1, err
-	}
-
-	if n >= MaxNameLen || oobn != oobSpace {
-		return -1, fmt.Errorf("recvfd: incorrect number of bytes read (n=%d oobn=%d)", n, oobn)
-	}
-
-	// Truncate.
-	name = name[:n]
-	oob = oob[:oobn]
-
-	scms, err := unix.ParseSocketControlMessage(oob)
-	if err != nil {
-		return -1, err
-	}
-	if len(scms) != 1 {
-		return -1, fmt.Errorf("recvfd: number of SCMs is not 1: %d", len(scms))
-	}
-	scm := scms[0]
-
-	fds, err := unix.ParseUnixRights(&scm)
-	if err != nil {
-		return -1, err
-	}
-	if len(fds) != 1 {
-		return -1, fmt.Errorf("recvfd: number of fds is not 1: %d", len(fds))
-	}
-	return fds[0], nil
-}
-
 func (p *initProcess) ttySockPath() (string, error) {
 	sockInfoPath := filepath.Join(p.root, "tty.sock")
 	b, err := os.ReadFile(sockInfoPath)
@@ -193,12 +311,12 @@ func (p *initProcess) ttySockPath() (string, error) {
 		return "", err
 	}
 
-	tmp, err := ioutil.TempDir(os.Getenv("XDG_RUNTIME_DIR"), "pty")
+	tmp, err := os.MkdirTemp(os.Getenv("XDG_RUNTIME_DIR"), "pty")
 	if err != nil {
 		return "", err
 	}
 	s := filepath.Join(tmp, "s")
-	if err := ioutil.WriteFile(sockInfoPath, []byte(s), 0600); err != nil {
+	if err := os.WriteFile(sockInfoPath, []byte(s), 0600); err != nil {
 		os.RemoveAll(tmp)
 		return "", err
 	}
@@ -217,12 +335,12 @@ func (p *execProcess) ttySockPath() (string, error) {
 		return "", err
 	}
 
-	tmp, err := ioutil.TempDir(os.Getenv("XDG_RUNTIME_DIR"), "pty")
+	tmp, err := os.MkdirTemp(os.Getenv("XDG_RUNTIME_DIR"), "pty")
 	if err != nil {
 		return "", err
 	}
 	s := filepath.Join(tmp, "s")
-	if err := ioutil.WriteFile(sockInfoPath, []byte(s), 0600); err != nil {
+	if err := os.WriteFile(sockInfoPath, []byte(s), 0600); err != nil {
 		os.RemoveAll(tmp)
 		return "", err
 	}
@@ -246,7 +364,7 @@ func (p *process) makePty(ctx context.Context, sockPath string) (_, _ string, re
 	logPath := filepath.Join(p.root, p.id+"-tty.log")
 	defer func() {
 		if retErr != nil {
-			logData, err := ioutil.ReadFile(logPath)
+			logData, err := os.ReadFile(logPath)
 			if err != nil {
 				log.G(ctx).WithError(err).Info("Could not read tty error log")
 			} else {
