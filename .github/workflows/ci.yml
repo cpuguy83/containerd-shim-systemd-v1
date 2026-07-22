@@ -119,3 +119,20 @@ jobs:
           set -euxo pipefail
           sudo test -S /run/systemd/private
           sudo env -u XDG_RUNTIME_DIR ./shim.test -test.v
+
+  generate:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
+      - name: go generate
+        # Run generation in the flake devShell so protoc and the Go toolchain
+        # match the pinned reproducible environment.
+        run: |
+          nix develop --command go generate ./... || exit $?
+          git add -N .
+          if ! git diff --exit-code; then
+            echo "::error::Missing updates to generated files. Please run 'go generate ./...' and commit the changes"
+            exit 1
+          fi
