@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -208,7 +207,8 @@ type process struct {
 
 	systemd *systemd.Conn
 	runc    *runc.Runc
-	ttyConn net.Conn
+
+	ttyControl *ttyControlClient
 
 	mu           sync.Mutex
 	cond         *sync.Cond

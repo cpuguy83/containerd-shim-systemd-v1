@@ -39,100 +39,126 @@ void *copy(void *args)
     return 0;
 }
 
+// write_all writes the whole buffer, looping over short writes.
+// Returns 0 on success and -1 if any write fails.
+int write_all(int fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len)
+    {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n < 0)
+            return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+// The tty client protocol is a newline-framed status line per request:
+//   "0\n"            on success
+//   "1 <message>\n"  on error
+// reply_ok/reply_err write one such line. They return 0 on success and -1 on
+// write failure.
+int reply_ok(int fd)
+{
+    return write_all(fd, "0\n", 2);
+}
+
+int reply_err(int fd, const char *msg)
+{
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "1 %s\n", msg);
+    if (n < 0)
+        return -1;
+    if (n >= (int)sizeof(buf))
+        n = sizeof(buf) - 1;
+    return write_all(fd, buf, (size_t)n);
+}
+
+// handle_tty_request services a single request line (newline already stripped),
+// writing exactly one status line back to the client. It returns 0 when the
+// connection should stay open -- including recoverable errors that were reported
+// to the client -- and -1 when a socket write failed and the caller should close.
+int handle_tty_request(int fd, const char *line)
+{
+    int op, w, h;
+    if (sscanf(line, "%d %d %d", &op, &w, &h) != 3)
+    {
+        lerror("parse");
+        return reply_err(fd, "invalid resize request");
+    }
+
+    if (op != op_resize)
+        return reply_err(fd, "unknown operation");
+
+    struct winsize ws;
+    memset(&ws, 0, sizeof(ws));
+    ws.ws_col = w;
+    ws.ws_row = h;
+
+    if (ioctl(tty_fd, TIOCSWINSZ, &ws) < 0)
+    {
+        lerror("ioctl TIOCSWINSZ");
+        return reply_err(fd, "error setting window size");
+    }
+
+    return reply_ok(fd);
+}
+
 void handle_tty_op_conn(int fd)
 {
-    int nr, nw;
     char buf[256];
+    // len is how many bytes of a not-yet-complete request are buffered. The
+    // socket is a byte stream, so a single read() may return a partial request
+    // or several requests at once; we buffer until each '\n' before parsing so
+    // fragmentation cannot desynchronize requests from responses.
+    size_t len = 0;
 
     while (1)
     {
-        nr = read(fd, buf, sizeof(buf));
+        // Leave room to NUL-terminate for sscanf.
+        ssize_t nr = read(fd, buf + len, sizeof(buf) - 1 - len);
         if (nr < 0)
         {
             lerror("read");
             close(fd);
             return;
         }
-
-        if (nr < 1)
+        if (nr == 0)
         {
-            char *msg = "invalid operation";
-            nw = write(fd, msg, sizeof(msg));
-            if (nw < 0)
-            {
-                lerror("write");
-                close(fd);
-                return;
-            }
-        }
-
-        int op, w, h;
-        int err;
-
-        char op_buf[nr];
-
-        // TODO: this is pretty sloppy
-        // We aren't checking that the data sent is valid and includes everything we expect.
-        memcpy(op_buf, buf, nr);
-        err = sscanf(op_buf, "%d %d %d", &op, &w, &h);
-        if (err < 0)
-        {
-            char *msg = "parse error";
-            nw = write(fd, msg, sizeof(msg));
-            if (nw < 0)
-            {
-                lerror("write");
-                close(fd);
-                return;
-            }
-            lerror("parse");
+            // The client closed the connection.
             close(fd);
             return;
         }
+        len += (size_t)nr;
 
-        if (op != op_resize)
+        // Service every complete, newline-terminated request in the buffer.
+        char *start = buf;
+        char *nl;
+        while ((nl = memchr(start, '\n', (buf + len) - start)) != NULL)
         {
-            char *msg = "invalid operation";
-            nw = write(fd, msg, sizeof(msg));
-            if (nw < 0)
+            *nl = '\0';
+            if (handle_tty_request(fd, start) < 0)
             {
                 lerror("write");
                 close(fd);
                 return;
             }
+            start = nl + 1;
         }
 
-        struct winsize *ws = (struct winsize *)malloc(sizeof(struct winsize));
-        ws->ws_col = w;
-        ws->ws_row = h;
+        // Keep any trailing partial request for the next read.
+        len -= (size_t)(start - buf);
+        memmove(buf, start, len);
 
-        err = ioctl(tty_fd, TIOCSWINSZ, ws);
-        free(ws);
-        if (err < 0)
+        // A request that fills the buffer without a newline is malformed.
+        if (len == sizeof(buf) - 1)
         {
-            lerror("ioctl TIOCSWINSZ");
-            char *msg = "error setting win size";
-            nw = write(fd, msg, sizeof(msg));
-            if (nw < 0)
-            {
-                lerror("write");
-                close(fd);
-                return;
-            }
-        }
-
-        // Send ack
-        nw = write(fd, "0", 1);
-        if (nw < 1)
-        {
-            lerror("write");
+            reply_err(fd, "request too long");
             close(fd);
             return;
         }
     }
-
-    close(fd);
-    return;
 }
 
 void *handle_tty_ops(void *args)
