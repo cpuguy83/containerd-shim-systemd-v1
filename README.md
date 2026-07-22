@@ -74,7 +74,7 @@ and service units natively (see `flake.nix`). Driving the shim through `docker`
 needs a patched dockerd (see `Dockerfile`), so validate with `nerdctl` or `ctr`
 against the VM's system containerd.
 
-The flake builds the shim with [gomod2nix](https://github.com/nix-community/gomod2nix):
-the Go module set is pinned in `gomod2nix.toml`. Regenerate it after a
-`go.mod`/`go.sum` change with `make generate` (or `go generate ./...`), which runs
-gomod2nix's pure-Go generator — no Nix required — and commit the result.
+The flake builds the shim with nixpkgs' `buildGoModule`, fetching dependencies
+into a fixed-output derivation keyed by the `vendorHash` in `flake.nix` — no
+`vendor/` tree is committed. After a `go.mod`/`go.sum` change, refresh the hash
+by running `scripts/update-vendor-hash.sh` and commit the updated `flake.nix`.

@@ -29,8 +29,8 @@ clean:
 mod:
 	$(GO) mod tidy
 
-# Regenerate protobuf bindings and the flake's Go module lock. Run this from
-# `nix develop` so protoc is available.
+# Regenerate protobuf bindings. Run this from `nix develop` so protoc is
+# available.
 generate:
 	$(GO) generate ./...
 
