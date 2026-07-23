@@ -102,8 +102,10 @@ systemd.
 ## Repository conventions
 
 - Most implementation and tests intentionally live in the root `main`
-  package; `options/` contains protobuf-generated configuration types and
-  `contrib/checkexec/` is a small integration helper.
+  package; `options/` contains protobuf-generated configuration types,
+  `contrib/checkexec/` is a small integration helper, and `contrib/bench/` is
+  the benchmark harness that compares this shim against `io.containerd.runc.v2`
+  (`make bench`; see `contrib/bench/README.md`).
 - Format Go changes with `gofmt`. Follow existing context-aware APIs, wrap
   errors with operation details, and preserve containerd's gRPC error
   translation at API boundaries.
