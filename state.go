@@ -80,6 +80,7 @@ func (s *Service) State(ctx context.Context, r *taskapi.StateRequest) (_ *taskap
 }
 
 func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState) error {
+	countState(metricGetUnitCalls)
 	state, err := conn.GetAllPropertiesContext(ctx, unit)
 	if err != nil {
 		return err
@@ -194,12 +195,18 @@ func loadExitFromUnit(ctx context.Context, conn *dbus.Conn, name string) (pState
 
 func (p *initProcess) LoadExitState(ctx context.Context) error {
 	if st, ok := p.loadRecordedSystemdExitState(); ok {
+		countState(metricReactorHits)
 		p.SetState(ctx, st)
 		return nil
 	}
 	st, err := loadExitFromUnit(ctx, p.systemd, p.Name())
 	if err != nil {
 		return err
+	}
+	// Count a fallback only when GetAll actually recovered a terminal exit the
+	// reactor missed; a pre-start / non-terminal read is not a reactor miss.
+	if st.Exited() {
+		countState(metricGetAllFallbacks)
 	}
 	p.SetState(ctx, st)
 	return nil
@@ -207,12 +214,18 @@ func (p *initProcess) LoadExitState(ctx context.Context) error {
 
 func (p *execProcess) LoadExitState(ctx context.Context) error {
 	if st, ok := p.loadRecordedSystemdExitState(); ok {
+		countState(metricReactorHits)
 		p.SetState(ctx, st)
 		return nil
 	}
 	st, err := loadExitFromUnit(ctx, p.systemd, p.Name())
 	if err != nil {
 		return err
+	}
+	// Count a fallback only when GetAll actually recovered a terminal exit the
+	// reactor missed; a pre-start / non-terminal read is not a reactor miss.
+	if st.Exited() {
+		countState(metricGetAllFallbacks)
 	}
 	p.SetState(ctx, st)
 	return nil
@@ -227,7 +240,11 @@ func (p *execProcess) readExitState(st *pState) error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, st)
+	if err := json.Unmarshal(data, st); err != nil {
+		return err
+	}
+	countState(metricOnDiskReads)
+	return nil
 }
 
 func (p *initProcess) exitStatePath() string {
@@ -239,7 +256,11 @@ func (p *initProcess) readExitState(st *pState) error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, st)
+	if err := json.Unmarshal(data, st); err != nil {
+		return err
+	}
+	countState(metricOnDiskReads)
+	return nil
 }
 
 func (p *execProcess) State(ctx context.Context) (*State, error) {

@@ -1,4 +1,5 @@
 bin/
+bench-results/
 *.test
 result
 result-*
