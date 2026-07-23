@@ -23,6 +23,36 @@ OUTPUT ?= bin
 build:
 	$(GO) build -o $(OUTPUT)/ .
 
+.PHONY: bench bench-build
+bench-build:
+	$(GO) build -o $(OUTPUT)/bench ./contrib/bench
+
+# Benchmark this shim against io.containerd.runc.v2. Requires a running
+# containerd with both runtimes registered (the systemd shim installed via
+# `make test-daemon`, or run inside `nix run .#vm`). Reads /proc and the system
+# containerd, so it runs under sudo by default. Override any BENCH_* var or
+# CONTAINERD_ADDRESS; set BENCH_OUT to pin the output dir.
+CONTAINERD_ADDRESS ?= /run/containerd/containerd.sock
+BENCH_RUNTIMES     ?= io.containerd.systemd.v1,io.containerd.runc.v2
+BENCH_ITERATIONS   ?= 50
+BENCH_WARMUP       ?= 5
+BENCH_PARALLEL     ?= 1,4,8,16
+BENCH_SCALE_COUNTS ?= 1,5,10,25,50
+BENCH_SCENARIOS    ?= container,exec,status,container-tty,exec-tty,scale
+BENCH_SUDO         ?= sudo
+BENCH_OUT          ?=
+
+bench: bench-build
+	$(BENCH_SUDO) $(OUTPUT)/bench \
+		-containerd-address=$(CONTAINERD_ADDRESS) \
+		-runtimes=$(BENCH_RUNTIMES) \
+		-iterations=$(BENCH_ITERATIONS) \
+		-warmup=$(BENCH_WARMUP) \
+		-parallel=$(BENCH_PARALLEL) \
+		-scale-counts=$(BENCH_SCALE_COUNTS) \
+		-scenarios=$(BENCH_SCENARIOS) \
+		$(if $(BENCH_OUT),-out=$(BENCH_OUT),) $(BENCH_FLAGS)
+
 clean:
 	rm -rf $(OUTPUT)/*
 

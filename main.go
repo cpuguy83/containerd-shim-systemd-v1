@@ -12,6 +12,7 @@ import "C"
 import (
 	"context"
 	"errors"
+	"expvar"
 	"flag"
 	"fmt"
 	"io"
@@ -407,6 +408,7 @@ func serve(ctx context.Context, cfg Config) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/profile", pprof.Profile)
+	mux.Handle("/debug/vars", expvar.Handler())
 	go func() {
 		if err := http.ListenAndServe("127.0.0.1:8089", mux); err != nil {
 			log.G(ctx).WithError(err).Fatal("ListenAndServe")

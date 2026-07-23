@@ -334,7 +334,7 @@ func (p *execProcess) Create(ctx context.Context) error {
 	if err := writeUnit(p.unitPath(), opts); err != nil {
 		return err
 	}
-	if err := p.systemd.ReloadContext(ctx); err != nil {
+	if err := reloadSystemd(ctx, p.systemd); err != nil {
 		log.G(ctx).WithError(err).Warn("failed to reload systemd")
 	}
 	// Make sure we don't have some old state from a past run.
@@ -413,7 +413,7 @@ func (p *initProcess) createRestore(ctx context.Context) error {
 	if err := writeUnit(p.unitPath(), unitOpts); err != nil {
 		return err
 	}
-	if err := p.systemd.ReloadContext(ctx); err != nil {
+	if err := reloadSystemd(ctx, p.systemd); err != nil {
 		log.G(ctx).WithError(err).Warn("Error reloading systemd")
 	}
 
@@ -486,7 +486,7 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	if err := writeUnit(p.unitPath(), unitOpts); err != nil {
 		return 0, err
 	}
-	if err := p.systemd.ReloadContext(ctx); err != nil {
+	if err := reloadSystemd(ctx, p.systemd); err != nil {
 		log.G(ctx).WithError(err).Warn("Error reloading systemd")
 	}
 	// Make sure we don't have some old state from a past run.

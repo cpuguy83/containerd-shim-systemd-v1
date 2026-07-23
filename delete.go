@@ -151,7 +151,7 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 	if err := os.Remove(p.unitPath()); err != nil {
 		return pState{}, err
 	}
-	if err := p.systemd.ReloadContext(ctx); err != nil {
+	if err := reloadSystemd(ctx, p.systemd); err != nil {
 		log.G(ctx).WithError(err).Error("systemd reload failed")
 	}
 
@@ -227,7 +227,7 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 		log.G(ctx).WithError(err).Debug("Failed to remove exec unit")
 	}
 
-	if err := p.systemd.ReloadContext(ctx); err != nil {
+	if err := reloadSystemd(ctx, p.systemd); err != nil {
 		log.G(ctx).WithError(err).Error("systemd reload failed")
 	}
 	p.systemd.ResetFailedUnitContext(ctx, p.Name())
