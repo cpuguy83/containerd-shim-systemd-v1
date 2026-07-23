@@ -43,11 +43,12 @@
               && !(pkgs.lib.hasSuffix ".test" base);
           };
 
-          vendorHash = "sha256-pdxiz90QkiN3P2dMP+Kv/KQHH+Os8f2mKPtHTDStXKg=";
+          vendorHash = "sha256-Btom6v1OCfXHudfhXLvj17GmzeEiFIUtk6FbWmDWKnA=";
 
           subPackages = [
             "."
             "contrib/checkexec"
+            "contrib/bench"
           ];
 
           # The unit tests need a live systemd bus; run them from the devShell or
@@ -186,6 +187,64 @@
 
           system.stateVersion = "24.11";
         };
+
+      # benchRunnerModule turns the dev VM into a headless benchmark runner: on
+      # boot it runs the shim-vs-runc.v2 benchmark, writes results to a
+      # host-shared directory, then powers the VM off (so `nix run` returns).
+      # The disk is ephemeral and results land on the host at the source path.
+      benchRunnerModule =
+        { pkgs, ... }:
+        let
+          shim = mkShim pkgs;
+          outDir = "/mnt/bench-out";
+        in
+        {
+          virtualisation.diskImage = null;
+
+          virtualisation.sharedDirectories.benchout = {
+            source = "/tmp/shim-bench-out";
+            target = outDir;
+          };
+
+          systemd.services.bench-runner = {
+            description = "Run the shim benchmark headless, then power off";
+            wantedBy = [ "multi-user.target" ];
+            wants = [ "network-online.target" ];
+            after = [
+              "containerd.service"
+              "network-online.target"
+              "containerd-shim-systemd-v1.socket"
+            ];
+            path = [
+              shim
+              pkgs.runc
+              pkgs.iptables
+              pkgs.coreutils
+            ];
+            serviceConfig = {
+              Type = "oneshot";
+              ExecStopPost = "${pkgs.systemd}/bin/systemctl poweroff";
+              StandardOutput = "journal+console";
+              StandardError = "journal+console";
+            };
+            script = ''
+              set -x
+              until [ -S /run/containerd/containerd.sock ]; do sleep 1; done
+              out="${outDir}/run"
+              mkdir -p "$out"
+              bench \
+                -containerd-address=/run/containerd/containerd.sock \
+                -runtimes=io.containerd.runc.v2,io.containerd.systemd.v1 \
+                -iterations=20 -warmup=3 \
+                -parallel=1,4,8 \
+                -scale-counts=1,5,10,25 \
+                -status-loops=300 \
+                -scenarios=container,exec,status,container-tty,exec-tty,scale \
+                -out="$out" > "$out/bench.log" 2>&1 || echo "bench exited $?" >> "$out/bench.log"
+              sync
+            '';
+          };
+        };
     in
     {
       packages = forAllSystems (pkgs: {
@@ -207,9 +266,23 @@
         ];
       };
 
+      nixosConfigurations.benchvm = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          shimModule
+          vmModule
+          benchRunnerModule
+        ];
+      };
+
       apps.x86_64-linux.vm = {
         type = "app";
         program = "${self.nixosConfigurations.vm.config.system.build.vm}/bin/run-shim-dev-vm";
+      };
+
+      apps.x86_64-linux.benchvm = {
+        type = "app";
+        program = "${self.nixosConfigurations.benchvm.config.system.build.vm}/bin/run-shim-dev-vm";
       };
 
       devShells = forAllSystems (pkgs: {
