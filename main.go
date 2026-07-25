@@ -147,25 +147,6 @@ func main() {
 
 	traceCfg := TraceFlags(flags)
 
-	doMount := func(ctx context.Context, p string) error {
-		cfgData, err := os.ReadFile(p)
-		if err != nil {
-			return err
-		}
-
-		var cfg taskapi.CreateTaskRequest
-		if err := proto.Unmarshal(cfgData, &cfg); err != nil {
-			return fmt.Errorf("error unmarshalling task create: %w", err)
-		}
-
-		target, err := mountFS(cfg.Rootfs, cfg.Bundle)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(os.Stderr, "Mounted rootfs to", target)
-		return err
-	}
-
 	containerdConfigPath := filepath.Join(defaults.DefaultConfigDir, "config.toml")
 	commands := map[string]func(context.Context) error{
 		"install": func(ctx context.Context) error {
@@ -258,7 +239,7 @@ func main() {
 			if flags.NArg() != 1 {
 				return errors.New("mount requires exactly one argument")
 			}
-			return doMount(ctx, flag.Arg(0))
+			return mountRootfs(flag.Arg(0))
 		},
 		"unmount": func(ctx context.Context) error {
 			return mount.UnmountAll(flags.Arg(0), 0)
@@ -268,7 +249,7 @@ func main() {
 			ctx = WithShimLog(ctx, OpenShimLog(ctx, bundle))
 
 			if mountCfg != "" {
-				if err := doMount(ctx, mountCfg); err != nil {
+				if err := mountRootfs(mountCfg); err != nil {
 					return err
 				}
 			}

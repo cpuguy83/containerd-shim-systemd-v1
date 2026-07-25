@@ -14,8 +14,10 @@ import (
 
 	eventsapi "github.com/containerd/containerd/api/events"
 	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
+	"github.com/containerd/containerd/api/types"
 	v2runcopts "github.com/containerd/containerd/api/types/runc/options"
 	tasktypes "github.com/containerd/containerd/api/types/task"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/typeurl/v2"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
@@ -420,6 +422,12 @@ func TestServiceExecIDReuseAgainstSystemd(t *testing.T) {
 	if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
 		t.Fatalf("start parent task: %v", err)
 	}
+	// Tear the long-lived parent down on every exit path -- including a failed
+	// subtest that aborts before the loop finishes -- so it never lingers.
+	t.Cleanup(func() {
+		_, _ = h.service.Kill(ctx, &taskapi.KillRequest{ID: req.ID, Signal: uint32(unix.SIGKILL), All: true})
+		_, _ = h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID})
+	})
 
 	const execID = "reused-exec"
 	runs := []struct {
@@ -438,17 +446,127 @@ func TestServiceExecIDReuseAgainstSystemd(t *testing.T) {
 			assertExecRunAndExit(t, h, ctx, req, execID, execUnit, tc.exitCode)
 		})
 	}
+}
 
-	if _, err := h.service.Kill(ctx, &taskapi.KillRequest{ID: req.ID, Signal: uint32(unix.SIGKILL)}); err != nil {
-		t.Fatalf("kill parent task: %v", err)
+// A checkpoint restore is not a from-scratch create: Create records the restore
+// command and defers the runc invocation to Start, which runs
+// `runc restore --image-path=<checkpoint>`. This drives that through the public
+// task API and proves it is a restore -- Create returns no pid (a create would
+// return the runc pid), and the runc stub fails unless it is handed the
+// checkpoint image at --image-path.
+func TestServiceTaskRestoreAgainstSystemd(t *testing.T) {
+	h := newServiceIntegrationHarness(t)
+	ctx, req, _ := h.task(t, "restore-target", runcStubConfig{ExitDelay: 100 * time.Millisecond})
+
+	checkpoint := t.TempDir()
+	if err := os.WriteFile(filepath.Join(checkpoint, runcStubCheckpointImage), nil, 0600); err != nil {
+		t.Fatalf("write checkpoint image: %v", err)
 	}
+	req.Checkpoint = checkpoint
+
+	created, err := h.service.Create(ctx, req)
+	if err != nil {
+		t.Fatalf("create restore task: %v", err)
+	}
+	// Restore defers its runc invocation to Start, so Create returns no pid; a
+	// from-scratch create would return the runc pid here.
+	if created.Pid != 0 {
+		t.Fatalf("restore create returned pid %d, want 0 (restore defers to start)", created.Pid)
+	}
+
+	started, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID})
+	if err != nil {
+		t.Fatalf("start restore task: %v", err)
+	}
+	if started.Pid == 0 {
+		t.Fatal("restore start returned a zero pid")
+	}
+
 	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if _, err := h.service.Wait(waitCtx, &taskapi.WaitRequest{ID: req.ID}); err != nil {
-		t.Fatalf("wait for parent task: %v", err)
+	waited, err := h.service.Wait(waitCtx, &taskapi.WaitRequest{ID: req.ID})
+	if err != nil {
+		t.Fatalf("wait for restored task: %v", err)
 	}
+	if waited.ExitStatus != 0 {
+		t.Fatalf("wait exit status = %d, want 0", waited.ExitStatus)
+	}
+
 	if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID}); err != nil {
-		t.Fatalf("delete parent task: %v", err)
+		t.Fatalf("delete restored task: %v", err)
+	}
+}
+
+// TestServiceTaskRootfsMountAgainstSystemd exercises the no-new-namespace rootfs
+// path end to end: a non-empty Rootfs with "shared" propagation makes the shim
+// mount the rootfs via an ExecStartPre re-exec (in the host namespace) and
+// unmount it via ExecStopPost. Both are hand-built transient exec tuples. The
+// mount is checked from the host and from inside the container (a marker file),
+// and the unmount is checked after delete. (The PrivateMounts variant's property
+// construction is covered by TestInitProcessRootfsMountProperties; its runtime
+// needs cross-namespace runc state the in-process stub cannot model.)
+func TestServiceTaskRootfsMountAgainstSystemd(t *testing.T) {
+	h := newServiceIntegrationHarness(t)
+	requireBindMount(t)
+
+	const marker = "mounted"
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, marker), nil, 0600); err != nil {
+		t.Fatalf("write rootfs marker: %v", err)
+	}
+
+	ctx, req, _ := h.task(t, "rootfs-mount", runcStubConfig{ExitDelay: 100 * time.Millisecond}, func(s *specs.Spec) {
+		s.Annotations[runcStubRootfsMarkerAnnotation] = marker
+		s.Linux.RootfsPropagation = "shared" // selects the no-new-namespace path
+	})
+	req.Rootfs = []*types.Mount{{Type: "bind", Source: src, Options: []string{"rbind"}}}
+	rootfs := filepath.Join(req.Bundle, "rootfs")
+
+	if _, err := h.service.Create(ctx, req); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	// ExecStartPre mounted the rootfs in the host namespace.
+	if _, err := os.Stat(filepath.Join(rootfs, marker)); err != nil {
+		t.Fatalf("rootfs not mounted in host namespace: %v", err)
+	}
+
+	if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
+		t.Fatalf("start task: %v", err)
+	}
+
+	// A clean zero exit proves the container saw its mounted rootfs; a missing
+	// mount would have exited runcStubRootfsMissing instead.
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	waited, err := h.service.Wait(waitCtx, &taskapi.WaitRequest{ID: req.ID})
+	if err != nil {
+		t.Fatalf("wait for task: %v", err)
+	}
+	if waited.ExitStatus != 0 {
+		t.Fatalf("task exit status = %d, want 0 (container saw the rootfs marker)", waited.ExitStatus)
+	}
+
+	if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID}); err != nil {
+		t.Fatalf("delete task: %v", err)
+	}
+	// ExecStopPost unmounted the rootfs, so the host no longer sees it.
+	if _, err := os.Stat(filepath.Join(rootfs, marker)); !os.IsNotExist(err) {
+		t.Fatalf("rootfs still mounted after delete: %v", err)
+	}
+}
+
+// requireBindMount skips the test when this environment cannot bind mount, e.g.
+// a user systemd manager whose units run without CAP_SYS_ADMIN. The shim's
+// rootfs mount runs in a systemd unit with the same privileges as this process,
+// so probing here is representative.
+func requireBindMount(t *testing.T) {
+	t.Helper()
+	src, dst := t.TempDir(), t.TempDir()
+	if err := mount.All([]mount.Mount{{Type: "bind", Source: src, Options: []string{"rbind"}}}, dst); err != nil {
+		t.Skipf("cannot bind mount (need CAP_SYS_ADMIN): %v", err)
+	}
+	if err := mount.UnmountAll(dst, 0); err != nil {
+		t.Logf("unmount probe mount %s: %v", dst, err)
 	}
 }
 
@@ -522,7 +640,7 @@ func newServiceIntegrationHarness(t *testing.T) *serviceIntegrationHarness {
 	}
 }
 
-func (h *serviceIntegrationHarness) task(t *testing.T, id string, cfg runcStubConfig) (context.Context, *taskapi.CreateTaskRequest, string) {
+func (h *serviceIntegrationHarness) task(t *testing.T, id string, cfg runcStubConfig, specOpts ...func(*specs.Spec)) (context.Context, *taskapi.CreateTaskRequest, string) {
 	t.Helper()
 	bundle := t.TempDir()
 	spec := specs.Spec{
@@ -535,6 +653,9 @@ func (h *serviceIntegrationHarness) task(t *testing.T, id string, cfg runcStubCo
 			runcStubExitDelayAnnotation: cfg.ExitDelay.String(),
 			runcStubFailpointAnnotation: cfg.Failpoint,
 		},
+	}
+	for _, o := range specOpts {
+		o(&spec)
 	}
 	data, err := json.Marshal(spec)
 	if err != nil {
