@@ -115,9 +115,6 @@ func writeCharts(b *strings.Builder, r *Report) {
 	section(fmt.Sprintf("CPU by process category — container @ p=%d (breakdown)", maxP),
 		"Per-process attribution. Long-lived (shim daemon, PID1, containerd) is exact; short-lived runc / per-container shims are undercounted by sampling — use the fair total above.",
 		chartCPUByCategory(r, maxP))
-	section("systemd daemon-reload time per container op",
-		"Time in systemd daemon-reload (re-parses every unit), which the shim issues on each create and delete. ms per lifecycle.",
-		chartReload(r))
 
 	// Shim-internal fallback (systemd only).
 	section("Exit-state source: reactor vs GetAll (systemd shim)",
@@ -293,40 +290,6 @@ func chartAttribCPU(r *Report, scenario string) string {
 	return groupedBars("cpu/op", "ms/op", cats, groups)
 }
 
-func chartReload(r *Report) string {
-	order := []string{"container", "exec", "container-tty", "exec-tty", "status", "scale"}
-	type agg struct {
-		ms    float64
-		iters int
-	}
-	sums := map[string]*agg{}
-	for i := range r.Scenarios {
-		s := &r.Scenarios[i]
-		if s.Runtime != runtimeSystemd || s.ShimVars == nil {
-			continue
-		}
-		a := sums[s.Scenario]
-		if a == nil {
-			a = &agg{}
-			sums[s.Scenario] = a
-		}
-		a.ms += s.ShimVars.ReloadTotalMs
-		a.iters += s.Iterations
-	}
-	var cats []string
-	var vals []float64
-	for _, name := range order {
-		if a, ok := sums[name]; ok && a.iters > 0 {
-			cats = append(cats, name)
-			vals = append(vals, a.ms/float64(a.iters))
-		}
-	}
-	if len(cats) == 0 {
-		return ""
-	}
-	return groupedBars("reload", "ms/op", cats, []barGroup{{"systemd daemon-reload", "var(--cat-6)", vals}})
-}
-
 func chartFallback(r *Report) string {
 	// aggregate systemd shim counters per scenario name
 	order := []string{"container", "exec", "exec-tty", "container-tty", "status", "scale"}
@@ -378,7 +341,7 @@ func writeDataTable(b *strings.Builder, r *Report) {
 	b.WriteString(`<section class="tablewrap"><h2>all measurements</h2>`)
 	b.WriteString(`<p class="sub">Full raw data in <code>results.json</code>, <code>latency.csv</code>, <code>resources.csv</code>.</p>`)
 	b.WriteString(`<table><thead><tr>`)
-	for _, h := range []string{"scenario", "runtime", "variant", "P", "N", "iters", "err", "thrpt/s", "hdln p50", "hdln p99", "cpu/op ms", "reload/op ms", "shim peak", "hit rate"} {
+	for _, h := range []string{"scenario", "runtime", "variant", "P", "N", "iters", "err", "thrpt/s", "hdln p50", "hdln p99", "cpu/op ms", "shim peak", "hit rate"} {
 		fmt.Fprintf(b, `<th>%s</th>`, h)
 	}
 	b.WriteString(`</tr></thead><tbody>`)
@@ -386,12 +349,8 @@ func writeDataTable(b *strings.Builder, r *Report) {
 		s := &r.Scenarios[i]
 		op := headlineOp(s.Scenario)
 		hitRate := ""
-		reloadPerOp := ""
 		if s.ShimVars != nil {
 			hitRate = fmt.Sprintf("%.0f%%", s.ShimVars.ReactorHitRate*100)
-			if s.Iterations > 0 {
-				reloadPerOp = fmt.Sprintf("%.1f", s.ShimVars.ReloadTotalMs/float64(s.Iterations))
-			}
 		}
 		cpuPerOp := ""
 		if s.Iterations > 0 {
@@ -405,7 +364,6 @@ func writeDataTable(b *strings.Builder, r *Report) {
 			fmt.Sprintf("%.2f", p50Op(s, op)),
 			fmt.Sprintf("%.2f", p99Op(s, op)),
 			cpuPerOp,
-			reloadPerOp,
 			fmtBytes(shimPeakPss(s)),
 			hitRate,
 		}

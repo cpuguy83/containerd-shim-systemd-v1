@@ -9,19 +9,11 @@ import (
 // versus falling back to a systemd GetAll property read or an on-disk exit
 // file. The reactor-hit vs getall-fallback ratio is the event reactor's
 // effective hit rate; on-disk reads are the other fallback source.
-//
-// daemon_reload_* formerly measured time spent in systemd `daemon-reload`, which
-// the shim issued on every create/delete because it wrote unit files to disk.
-// The shim now creates units transiently (StartTransientUnit), so no reload is
-// issued and these counters stay 0. They remain published so the benchmark
-// schema is stable and a run visibly shows reloads eliminated.
 const (
-	metricReactorHits       = "exitstate_reactor_hits"
-	metricGetAllFallbacks   = "exitstate_getall_fallbacks"
-	metricOnDiskReads       = "state_ondisk_reads"
-	metricGetUnitCalls      = "getunitstate_calls"
-	metricDaemonReloadCount = "daemon_reload_count"
-	metricDaemonReloadNanos = "daemon_reload_nanos"
+	metricReactorHits     = "exitstate_reactor_hits"
+	metricGetAllFallbacks = "exitstate_getall_fallbacks"
+	metricOnDiskReads     = "state_ondisk_reads"
+	metricGetUnitCalls    = "getunitstate_calls"
 )
 
 // stateMetrics is published at /debug/vars (wired in serve()). Counters are
@@ -35,8 +27,6 @@ var stateMetrics = func() *expvar.Map {
 		metricGetAllFallbacks,
 		metricOnDiskReads,
 		metricGetUnitCalls,
-		metricDaemonReloadCount,
-		metricDaemonReloadNanos,
 	} {
 		m.Add(k, 0)
 	}
