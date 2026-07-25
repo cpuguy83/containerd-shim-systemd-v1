@@ -174,7 +174,7 @@ func TestServiceRuntimeOptionsAgainstSystemd(t *testing.T) {
 			if _, err := h.service.Create(ctx, req); err != nil {
 				t.Fatalf("create task: %v", err)
 			}
-			assertUnitWorkingDirectory(t, filepath.Join(h.unitDir, taskUnit), req.Bundle)
+			assertUnitWorkingDirectory(t, h.conn, taskUnit, req.Bundle)
 			if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
 				t.Fatalf("start task: %v", err)
 			}
@@ -184,7 +184,7 @@ func TestServiceRuntimeOptionsAgainstSystemd(t *testing.T) {
 			if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID, ExecID: execID}); err != nil {
 				t.Fatalf("start exec: %v", err)
 			}
-			assertUnitWorkingDirectory(t, filepath.Join(h.unitDir, execUnit), req.Bundle)
+			assertUnitWorkingDirectory(t, h.conn, execUnit, req.Bundle)
 
 			execWaitCtx, cancelExecWait := context.WithTimeout(ctx, 10*time.Second)
 			defer cancelExecWait()
@@ -230,16 +230,22 @@ func TestServiceRuntimeOptionsAgainstSystemd(t *testing.T) {
 	})
 }
 
-func assertUnitWorkingDirectory(t *testing.T, unitPath, workingDirectory string) {
+func assertUnitWorkingDirectory(t *testing.T, conn *systemd.Conn, unit, workingDirectory string) {
 	t.Helper()
 
-	data, err := os.ReadFile(unitPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	prop, err := conn.GetUnitTypePropertyContext(ctx, unit, "Service", "WorkingDirectory")
 	if err != nil {
-		t.Fatalf("read unit file %s: %v", unitPath, err)
+		t.Fatalf("get WorkingDirectory for %s: %v", unit, err)
 	}
-	want := "WorkingDirectory=" + workingDirectory
-	if !strings.Contains(string(data), want) {
-		t.Fatalf("unit file %s does not contain %q:\n%s", unitPath, want, data)
+	got, ok := prop.Value.Value().(string)
+	if !ok {
+		t.Fatalf("WorkingDirectory for %s is %T, want string", unit, prop.Value.Value())
+	}
+	if got != workingDirectory {
+		t.Fatalf("unit %s WorkingDirectory = %q, want %q", unit, got, workingDirectory)
 	}
 }
 
@@ -374,6 +380,78 @@ func TestServiceExecLifecycleAgainstSystemd(t *testing.T) {
 	}
 }
 
+// Transient units are registered under the task's unit name, so a task id can
+// only be recreated once the shim's Delete has released the previous unit. These
+// tests reuse a single id across successive runs -- normal, non-zero, and fast
+// (immediate) exits -- driving each run's Delete before the next Create. h.task
+// registers its unit cleanup against the enclosing test, not each subtest, so it
+// is the shim's own Delete that must free the name between runs.
+func TestServiceTaskIDReuseAgainstSystemd(t *testing.T) {
+	h := newServiceIntegrationHarness(t)
+	const id = "reused-task"
+
+	runs := []struct {
+		name     string
+		cfg      runcStubConfig
+		exitCode uint32
+	}{
+		{"a successful zero-exit run reuses the task id", runcStubConfig{ExitDelay: 100 * time.Millisecond}, 0},
+		{"a non-zero exit run reuses the task id", runcStubConfig{ExitCode: 9, ExitDelay: 100 * time.Millisecond}, 9},
+		{"a fast zero-exit run reuses the task id", runcStubConfig{}, 0},
+		{"a fast non-zero exit run reuses the task id", runcStubConfig{ExitCode: 11}, 11},
+	}
+	for _, tc := range runs {
+		ctx, req, unit := h.task(t, id, tc.cfg)
+		t.Run(tc.name, func(t *testing.T) {
+			assertTaskRunAndExit(t, h, ctx, req, unit, tc.exitCode)
+		})
+	}
+}
+
+// TestServiceExecIDReuseAgainstSystemd is the exec analogue: a single exec id is
+// run repeatedly against one long-lived parent, so the shim's exec Delete must
+// release the exec's transient unit before it can be recreated.
+func TestServiceExecIDReuseAgainstSystemd(t *testing.T) {
+	h := newServiceIntegrationHarness(t)
+	ctx, req, _ := h.task(t, "exec-reuse-parent", runcStubConfig{ExitDelay: 30 * time.Second})
+	if _, err := h.service.Create(ctx, req); err != nil {
+		t.Fatalf("create parent task: %v", err)
+	}
+	if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
+		t.Fatalf("start parent task: %v", err)
+	}
+
+	const execID = "reused-exec"
+	runs := []struct {
+		name     string
+		cfg      runcStubConfig
+		exitCode uint32
+	}{
+		{"a successful zero-exit run reuses the exec id", runcStubConfig{ExitDelay: 100 * time.Millisecond}, 0},
+		{"a non-zero exit run reuses the exec id", runcStubConfig{ExitCode: 17, ExitDelay: 100 * time.Millisecond}, 17},
+		{"a fast zero-exit run reuses the exec id", runcStubConfig{ExitBeforeDetach: true}, 0},
+		{"a fast non-zero exit run reuses the exec id", runcStubConfig{ExitCode: 19, ExitBeforeDetach: true}, 19},
+	}
+	for _, tc := range runs {
+		execUnit := h.exec(t, ctx, req, execID, tc.cfg)
+		t.Run(tc.name, func(t *testing.T) {
+			assertExecRunAndExit(t, h, ctx, req, execID, execUnit, tc.exitCode)
+		})
+	}
+
+	if _, err := h.service.Kill(ctx, &taskapi.KillRequest{ID: req.ID, Signal: uint32(unix.SIGKILL)}); err != nil {
+		t.Fatalf("kill parent task: %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if _, err := h.service.Wait(waitCtx, &taskapi.WaitRequest{ID: req.ID}); err != nil {
+		t.Fatalf("wait for parent task: %v", err)
+	}
+	if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID}); err != nil {
+		t.Fatalf("delete parent task: %v", err)
+	}
+}
+
 type serviceIntegrationHarness struct {
 	service   *Service
 	conn      *systemd.Conn
@@ -406,7 +484,6 @@ func newServiceIntegrationHarness(t *testing.T) *serviceIntegrationHarness {
 		conn:    conn,
 		runcBin: filepath.Join(helperDir, runcStubHelperName),
 		exe:     filepath.Join(helperDir, shimCreateHelperName),
-		unitDir: unitDir,
 	})
 	if err != nil {
 		conn.Close()
@@ -646,4 +723,91 @@ func assertNoProcessExit(t *testing.T, events <-chan eventEnvelope, containerID,
 			return
 		}
 	}
+}
+
+func assertTaskRunAndExit(t *testing.T, h *serviceIntegrationHarness, ctx context.Context, req *taskapi.CreateTaskRequest, unit string, wantExit uint32) {
+	t.Helper()
+
+	created, err := h.service.Create(ctx, req)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if created.Pid == 0 {
+		t.Fatal("create returned a zero pid")
+	}
+	if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
+		t.Fatalf("start task: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	waited, err := h.service.Wait(waitCtx, &taskapi.WaitRequest{ID: req.ID})
+	if err != nil {
+		t.Fatalf("wait for task: %v", err)
+	}
+	if waited.ExitStatus != wantExit {
+		t.Fatalf("wait exit status = %d, want %d", waited.ExitStatus, wantExit)
+	}
+
+	exited := waitForProcessExit(t, h.service.events, req.ID, req.ID)
+	if exited.ExitStatus != wantExit {
+		t.Fatalf("event exit status = %d, want %d", exited.ExitStatus, wantExit)
+	}
+
+	deleted, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID})
+	if err != nil {
+		t.Fatalf("delete task: %v", err)
+	}
+	if deleted.ExitStatus != wantExit {
+		t.Fatalf("delete exit status = %d, want %d", deleted.ExitStatus, wantExit)
+	}
+	if _, err := os.Stat(filepath.Join(h.unitDir, unit)); !os.IsNotExist(err) {
+		t.Fatalf("unit file still exists after delete: %v", err)
+	}
+	assertNoProcessExit(t, h.service.events, req.ID, req.ID, 300*time.Millisecond)
+}
+
+func assertExecRunAndExit(t *testing.T, h *serviceIntegrationHarness, ctx context.Context, req *taskapi.CreateTaskRequest, execID, execUnit string, wantExit uint32) {
+	t.Helper()
+
+	started, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID, ExecID: execID})
+	if err != nil {
+		t.Fatalf("start exec: %v", err)
+	}
+	if started.Pid == 0 {
+		t.Fatal("start exec returned a zero pid")
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	waited, err := h.service.Wait(waitCtx, &taskapi.WaitRequest{ID: req.ID, ExecID: execID})
+	if err != nil {
+		t.Fatalf("wait for exec: %v", err)
+	}
+	if waited.ExitStatus != wantExit {
+		t.Fatalf("wait exit status = %d, want %d", waited.ExitStatus, wantExit)
+	}
+
+	startedEvent, exited := waitForExecStartedThenExit(t, h.service.events, req.ID, execID)
+	if startedEvent.Pid != started.Pid {
+		t.Fatalf("started event pid = %d, want %d", startedEvent.Pid, started.Pid)
+	}
+	if exited.ExitStatus != wantExit {
+		t.Fatalf("event exit status = %d, want %d", exited.ExitStatus, wantExit)
+	}
+
+	deleted, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID, ExecID: execID})
+	if err != nil {
+		t.Fatalf("delete exec: %v", err)
+	}
+	if deleted.ExitStatus != wantExit {
+		t.Fatalf("delete exit status = %d, want %d", deleted.ExitStatus, wantExit)
+	}
+	if _, err := os.Stat(filepath.Join(h.unitDir, execUnit)); !os.IsNotExist(err) {
+		t.Fatalf("exec unit file still exists after delete: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(req.Bundle, "execs", execID)); !os.IsNotExist(err) {
+		t.Fatalf("exec state directory still exists after delete: %v", err)
+	}
+	assertNoProcessExit(t, h.service.events, req.ID, execID, 300*time.Millisecond)
 }

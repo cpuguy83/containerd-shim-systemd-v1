@@ -289,9 +289,14 @@ func runRuncStubDelete(root string, args []string) (int, error) {
 		return 125, err
 	}
 	stateDir := filepath.Join(root, id)
+	// Real runc removes the container's state only on a successful delete, and
+	// preserves it on failure. Mirror that: a reused container id then starts from
+	// a clean state directory instead of inheriting the previous run's "started"
+	// marker, while a failed delete keeps state so lifecycle tests can observe it.
 	pidData, err := os.ReadFile(filepath.Join(stateDir, "pid"))
 	if err != nil {
 		if os.IsNotExist(err) {
+			os.RemoveAll(stateDir)
 			return 0, nil
 		}
 		return 125, err
@@ -303,6 +308,7 @@ func runRuncStubDelete(root string, args []string) (int, error) {
 	cmdline, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
 	if err != nil {
 		if os.IsNotExist(err) {
+			os.RemoveAll(stateDir)
 			return 0, nil
 		}
 		return 125, err
@@ -317,6 +323,7 @@ func runRuncStubDelete(root string, args []string) (int, error) {
 	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
 		return 125, err
 	}
+	os.RemoveAll(stateDir)
 	return 0, nil
 }
 

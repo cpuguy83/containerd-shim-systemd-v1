@@ -185,10 +185,9 @@ func (c CreateOptions) RestoreArgs() []string {
 }
 
 type process struct {
-	ns      string
-	id      string
-	root    string
-	unitDir string
+	ns   string
+	id   string
+	root string
 
 	// pathName is the unit's systemd-escaped D-Bus object-path base, computed
 	// once at creation. The event reactor matches incoming signals against it,
@@ -339,14 +338,6 @@ func (p *process) PathName() string {
 	return p.pathName
 }
 
-func (p *initProcess) unitPath() string {
-	return filepath.Join(p.unitDir, p.Name())
-}
-
-func (p *execProcess) unitPath() string {
-	return filepath.Join(p.unitDir, p.Name())
-}
-
 func (p *process) Pid() uint32 {
 	p.mu.Lock()
 	pid := p.state.Pid
@@ -405,6 +396,11 @@ type initProcess struct {
 
 	Bundle string
 	Rootfs []*types.Mount
+
+	// unitProps holds the transient-unit properties computed by Create (or
+	// createRestore) and consumed by startUnit. It bridges the two because a
+	// checkpoint restore builds them at Create but starts the unit later.
+	unitProps []systemd.Property
 
 	checkpoint       string
 	parentCheckpoint string

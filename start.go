@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -18,7 +17,8 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/containerd/log"
-	"github.com/coreos/go-systemd/v22/unit"
+	systemd "github.com/coreos/go-systemd/v22/dbus"
+	dbus "github.com/godbus/dbus/v5"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -95,54 +95,70 @@ func (p *process) runcCmd(cmd []string) ([]string, error) {
 	return append(root, cmd...), nil
 }
 
-func writeUnit(path string, opts []*unit.UnitOption) error {
-	rdr := unit.Serialize(opts)
-
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	if _, err := io.Copy(f, rdr); err != nil {
-		return err
-	}
-	return nil
+// execCommand mirrors systemd's transient exec tuple `(sasb)`: the binary path,
+// the full argv (starting with argv[0]), and whether a non-zero exit is ignored
+// (the unit-file "-" prefix). go-systemd only ships a helper for ExecStart, so
+// this covers ExecStartPre/ExecStopPost uniformly too.
+type execCommand struct {
+	Path       string
+	Args       []string
+	IgnoreFail bool
 }
 
-func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
-	const svc = "Service"
+// propExecCommand builds an Exec* property (ExecStart, ExecStartPre,
+// ExecStopPost, ...) from one or more exec tuples. The value marshals to the
+// `a(sasb)` type systemd expects for transient units.
+func propExecCommand(name string, cmds ...execCommand) systemd.Property {
+	return systemd.Property{Name: name, Value: dbus.MakeVariant(cmds)}
+}
 
-	opts := []*unit.UnitOption{
-		unit.NewUnitOption(svc, "Type", p.unitType()),
-		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
-		unit.NewUnitOption(svc, "WorkingDirectory", p.Bundle),
-		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
-		unit.NewUnitOption(svc, "Environment", "PIDFILE="+p.pidFile()),
-		unit.NewUnitOption(svc, "Delegate", "yes"),
-		// Set this as env vars here because we only want these fifos to be used for the container stdio, not the other commands we run.
-		// Otherwise we can run into interesting cases like the client has closeed the fifo and our Pre/Post commands hang
-		// We already had to open these fifos in process to prevent such hangs with `ExecStart`, now instead it'll open them just before
-		// executing runc.
-		unit.NewUnitOption(svc, "Environment", "STDIN_FIFO="+p.Stdin),
-		unit.NewUnitOption(svc, "Environment", "STDOUT_FIFO="+p.Stdout),
-		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
-		unit.NewUnitOption(svc, "Environment", "UNIT_NAME=%n"), // %n is replaced with the unit name by systemd
-		unit.NewUnitOption(svc, "Environment", "EXIT_STATE_PATH="+p.exitStatePath()),
+// formatUnitProperties renders transient-unit properties for debug output. The
+// shim no longer writes a unit file, so this stands in for reading one back when
+// reporting a failed start.
+func formatUnitProperties(props []systemd.Property) string {
+	var b strings.Builder
+	for _, p := range props {
+		fmt.Fprintf(&b, "%s=%v\n", p.Name, p.Value.Value())
+	}
+	return b.String()
+}
+
+func (p *initProcess) startProperties(rcmd []string) ([]systemd.Property, error) {
+	env := []string{
+		"PIDFILE=" + p.pidFile(),
+		// Set the container stdio fifos as env vars so they are only used for the
+		// container stdio, not the other commands we run. Otherwise we can hit
+		// cases where the client has closed the fifo and our Pre/Post commands
+		// hang. The create re-exec opens them just before executing runc.
+		"STDIN_FIFO=" + p.Stdin,
+		"STDOUT_FIFO=" + p.Stdout,
+		"STDERR_FIFO=" + p.Stderr,
+		"UNIT_NAME=" + p.Name(),
+		"EXIT_STATE_PATH=" + p.exitStatePath(),
 	}
 	if p.shimCgroup != "" {
-		opts = append(opts, unit.NewUnitOption(svc, "Environment", "SHIM_CGROUP="+p.shimCgroup))
+		env = append(env, "SHIM_CGROUP="+p.shimCgroup)
+	}
+
+	props := []systemd.Property{
+		systemd.PropType(p.unitType()),
+		systemd.PropRemainAfterExit(false),
+		{Name: "WorkingDirectory", Value: dbus.MakeVariant(p.Bundle)},
+		{Name: "PIDFile", Value: dbus.MakeVariant(p.pidFile())},
+		{Name: "Delegate", Value: dbus.MakeVariant(true)},
 	}
 
 	prefix := []string{p.exe, "--debug=" + strconv.FormatBool(p.runc.Debug), "--bundle=" + p.Bundle, "create"}
 	if len(p.Rootfs) > 0 {
 		if p.noNewNamespace {
-			opts = append(opts, unit.NewUnitOption(svc, "ExecStartPre", p.exe+" mount "+p.mountConfigPath()))
-			opts = append(opts, unit.NewUnitOption(svc, "ExecStopPost", "-"+p.exe+" unmount "+filepath.Join(p.Bundle, "rootfs")))
+			props = append(props,
+				propExecCommand("ExecStartPre", execCommand{Path: p.exe, Args: []string{p.exe, "mount", p.mountConfigPath()}}),
+				propExecCommand("ExecStopPost", execCommand{Path: p.exe, Args: []string{p.exe, "unmount", filepath.Join(p.Bundle, "rootfs")}, IgnoreFail: true}),
+			)
 		} else {
 			// Unfortunately with PrivateMounts we can't use `ExecStartPre` to mount the rootfs b/c it does not share a mount namespace
 			// with the main process. Instead we re-exec with `create` subcommand which will mount and exec the main process.
-			opts = append(opts, unit.NewUnitOption(svc, "PrivateMounts", "yes"))
+			props = append(props, systemd.Property{Name: "PrivateMounts", Value: dbus.MakeVariant(true)})
 			prefix = append(prefix, "--mounts="+p.mountConfigPath())
 		}
 	}
@@ -155,35 +171,36 @@ func (p *initProcess) startOptions(rcmd []string) ([]*unit.UnitOption, error) {
 	if err != nil {
 		return nil, err
 	}
-	opts = append(opts, unit.NewUnitOption(svc, "ExecStart", strings.Join(append(prefix, execStart...), " ")))
+	argv := append(prefix, execStart...)
+	props = append(props,
+		propExecCommand("ExecStart", execCommand{Path: argv[0], Args: argv}),
+		systemd.Property{Name: "Environment", Value: dbus.MakeVariant(env)},
+	)
 
-	return opts, nil
+	return props, nil
 }
 
-func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
-	const svc = "Service"
-
-	opts := []*unit.UnitOption{
-		unit.NewUnitOption(svc, "Type", "notify"),
-		unit.NewUnitOption(svc, "WorkingDirectory", p.parent.Bundle),
-		unit.NewUnitOption(svc, "PIDFile", p.pidFile()),
-		unit.NewUnitOption(svc, "Environment", "PIDFILE="+p.pidFile()),
-		unit.NewUnitOption(svc, "GuessMainPID", "yes"),
-		unit.NewUnitOption(svc, "Delegate", "yes"),
-		unit.NewUnitOption(svc, "RemainAfterExit", "no"),
-
-		// Set this as env vars here because we only want these fifos to be used for the container stdio, not the other commands we run.
-		// Otherwise we can run into interesting cases like the client has closeed the fifo and our Pre/Post commands hang
-		// We already had to open these fifos in process to prevent such hangs with `ExecStart`, now instead it'll open them just before
-		// executing runc.
-		unit.NewUnitOption(svc, "Environment", "STDIN_FIFO="+p.Stdin),
-		unit.NewUnitOption(svc, "Environment", "STDOUT_FIFO="+p.Stdout),
-		unit.NewUnitOption(svc, "Environment", "STDERR_FIFO="+p.Stderr),
-		unit.NewUnitOption(svc, "Environment", "UNIT_NAME=%n"), // %n is replaced with the unit name by systemd
-		unit.NewUnitOption(svc, "Environment", "EXIT_STATE_PATH="+p.exitStatePath()),
+func (p *execProcess) startProperties() ([]systemd.Property, error) {
+	env := []string{
+		"PIDFILE=" + p.pidFile(),
+		// See the note in initProcess.startProperties on why stdio fifos are env vars.
+		"STDIN_FIFO=" + p.Stdin,
+		"STDOUT_FIFO=" + p.Stdout,
+		"STDERR_FIFO=" + p.Stderr,
+		"UNIT_NAME=" + p.Name(),
+		"EXIT_STATE_PATH=" + p.exitStatePath(),
 	}
 	if p.shimCgroup != "" {
-		opts = append(opts, unit.NewUnitOption(svc, "Environment", "SHIM_CGROUP="+p.shimCgroup))
+		env = append(env, "SHIM_CGROUP="+p.shimCgroup)
+	}
+
+	props := []systemd.Property{
+		systemd.PropType("notify"),
+		systemd.PropRemainAfterExit(false),
+		{Name: "WorkingDirectory", Value: dbus.MakeVariant(p.parent.Bundle)},
+		{Name: "PIDFile", Value: dbus.MakeVariant(p.pidFile())},
+		{Name: "GuessMainPID", Value: dbus.MakeVariant(true)},
+		{Name: "Delegate", Value: dbus.MakeVariant(true)},
 	}
 
 	prefix := []string{p.exe, "--debug=" + strconv.FormatBool(p.runc.Debug), "--bundle=" + p.parent.Bundle, "create"}
@@ -195,8 +212,7 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 			return nil, err
 		}
 
-		cmd = append(cmd, "-t")
-		cmd = append(cmd, "--console-socket="+s)
+		cmd = append(cmd, "-t", "--console-socket="+s)
 		prefix = append(prefix, "--tty")
 	}
 
@@ -204,10 +220,13 @@ func (p *execProcess) startOptions() ([]*unit.UnitOption, error) {
 	if err != nil {
 		return nil, err
 	}
-	execStart = append(prefix, execStart...)
-	opts = append(opts, unit.NewUnitOption(svc, "ExecStart", strings.Join(execStart, " ")))
+	argv := append(prefix, execStart...)
+	props = append(props,
+		propExecCommand("ExecStart", execCommand{Path: argv[0], Args: argv}),
+		systemd.Property{Name: "Environment", Value: dbus.MakeVariant(env)},
+	)
 
-	return opts, nil
+	return props, nil
 }
 
 func (p *process) unitType() string {
@@ -261,10 +280,7 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		p.cond.Broadcast()
 
 		if p.runc.Debug {
-			unitData, err := os.ReadFile(p.unitPath())
-			if err == nil {
-				ret = fmt.Errorf("%w:\n%s\n%s", ret, p.Name(), unitData)
-			}
+			ret = fmt.Errorf("%w:\n%s\n%s", ret, p.Name(), formatUnitProperties(p.unitProps))
 
 			processData, err := os.ReadFile(filepath.Join(p.Bundle, "config.json"))
 			if err == nil {
@@ -340,10 +356,25 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 		}()
 	}
 
+	props, err := p.startProperties()
+	if err != nil {
+		return 0, err
+	}
+
 	p.clearRecordedSystemdExitState()
 	ch := make(chan string, 1)
-	if _, err := p.systemd.StartUnitContext(ctx, p.Name(), "replace", ch); err != nil {
-		return 0, err
+	if _, err := p.systemd.StartTransientUnitContext(ctx, p.Name(), "replace", props, ch); err != nil {
+		// A prior attempt may have left a failed transient unit of the same
+		// name that systemd has not yet garbage-collected; reset it and retry.
+		if e := p.systemd.ResetFailedUnitContext(ctx, p.Name()); e != nil {
+			log.G(ctx).WithField("unit", p.Name()).WithError(e).Warn("Error resetting failed unit")
+		} else {
+			ch = make(chan string, 1)
+			_, err = p.systemd.StartTransientUnitContext(ctx, p.Name(), "replace", props, ch)
+		}
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	select {
@@ -367,11 +398,7 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 
 			ret := fmt.Errorf("error starting exec process")
 			if p.runc.Debug {
-				ret = fmt.Errorf("%w:\n%s", ret, p.Name())
-				unitData, err := os.ReadFile(p.unitPath())
-				if err == nil {
-					ret = fmt.Errorf("%w:\n%s\n%s", ret, p.Name(), unitData)
-				}
+				ret = fmt.Errorf("%w:\n%s\n%s", ret, p.Name(), formatUnitProperties(props))
 
 				processData, err := os.ReadFile(p.processFilePath())
 				if err == nil {

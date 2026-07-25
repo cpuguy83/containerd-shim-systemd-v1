@@ -145,16 +145,9 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		p.systemd.KillUnitContext(ctx, unitName(p.ns, p.id, "tty"), 9)
 	}
 
-	// By this point waitForExit has returned, so p.state is Exited(): the unit
-	// event reactor's Exited() guard will short-circuit before any read, so
-	// unloading the unit here cannot provoke a not-found GetAll feedback loop.
-	if err := os.Remove(p.unitPath()); err != nil {
-		return pState{}, err
-	}
-	if err := reloadSystemd(ctx, p.systemd); err != nil {
-		log.G(ctx).WithError(err).Error("systemd reload failed")
-	}
-
+	// The transient unit leaves nothing on disk; once stopped, systemd
+	// garbage-collects it. ResetFailedUnit forces collection of a unit that was
+	// left in the failed state.
 	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil && !strings.Contains(err.Error(), "not loaded") {
 		// Just a debug message since this is just precautionary and the unit may not even be failed.
 		log.G(ctx).WithError(err).Debug("Failed to reset systemd unit")
@@ -223,13 +216,8 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	p.closeTTYControl()
 
 	p.parent.execs.Delete(p.execID)
-	if err := os.Remove(p.unitPath()); err != nil {
-		log.G(ctx).WithError(err).Debug("Failed to remove exec unit")
-	}
-
-	if err := reloadSystemd(ctx, p.systemd); err != nil {
-		log.G(ctx).WithError(err).Error("systemd reload failed")
-	}
+	// The transient unit leaves nothing on disk; systemd garbage-collects it once
+	// stopped. ResetFailedUnit forces collection if it was left failed.
 	p.systemd.ResetFailedUnitContext(ctx, p.Name())
 	if err := os.RemoveAll(p.stateDir()); err != nil && !os.IsNotExist(err) {
 		log.G(ctx).WithError(err).Debug("Failed to remove exec state dir")
