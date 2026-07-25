@@ -164,7 +164,6 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			},
 			exe:        s.exe,
 			root:       r.Bundle,
-			unitDir:    s.unitDir,
 			shimCgroup: opts.ShimCgroup,
 		},
 		Bundle:           r.Bundle,
@@ -264,7 +263,6 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *e
 			Terminal: r.Terminal,
 			systemd:  s.conn,
 			exe:      s.exe,
-			unitDir:  s.unitDir,
 			opts:     CreateOptions{LogMode: s.defaultLogMode.String()},
 			runc: &runc.Runc{
 				Debug:         s.debug,
@@ -326,22 +324,8 @@ func (p *execProcess) Create(ctx context.Context) error {
 		return err
 	}
 
-	opts, err := p.startOptions()
-	if err != nil {
-		return err
-	}
-
-	if err := writeUnit(p.unitPath(), opts); err != nil {
-		return err
-	}
-	if err := reloadSystemd(ctx, p.systemd); err != nil {
-		log.G(ctx).WithError(err).Warn("failed to reload systemd")
-	}
-	// Make sure we don't have some old state from a past run.
-	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil && !strings.Contains(err.Error(), "not loaded") {
-		log.G(ctx).WithError(err).Warn("Failed to reset systemd unit")
-	}
-
+	// The transient unit is registered and started together in Start; nothing
+	// to create in systemd here.
 	return nil
 }
 
@@ -405,17 +389,12 @@ func (p *initProcess) createRestore(ctx context.Context) error {
 	}
 	execStart = append(execStart, p.opts.RestoreArgs()...)
 
-	unitOpts, err := p.startOptions(execStart)
+	unitProps, err := p.startProperties(execStart)
 	if err != nil {
 		return err
 	}
-
-	if err := writeUnit(p.unitPath(), unitOpts); err != nil {
-		return err
-	}
-	if err := reloadSystemd(ctx, p.systemd); err != nil {
-		log.G(ctx).WithError(err).Warn("Error reloading systemd")
-	}
+	// startUnit runs later (from Start -> restore); hold the properties until then.
+	p.unitProps = unitProps
 
 	return nil
 }
@@ -461,7 +440,7 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 		rcmd = append(rcmd, "--console-socket="+s)
 	}
 
-	unitOpts, err := p.startOptions(rcmd)
+	unitProps, err := p.startProperties(rcmd)
 	if err != nil {
 		return 0, err
 	}
@@ -483,17 +462,7 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 		}()
 	}
 
-	if err := writeUnit(p.unitPath(), unitOpts); err != nil {
-		return 0, err
-	}
-	if err := reloadSystemd(ctx, p.systemd); err != nil {
-		log.G(ctx).WithError(err).Warn("Error reloading systemd")
-	}
-	// Make sure we don't have some old state from a past run.
-	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil && !strings.Contains(err.Error(), "not loaded") {
-		log.G(ctx).WithError(err).Warn("Failed to reset systemd unit")
-	}
-
+	p.unitProps = unitProps
 	return p.startUnit(ctx)
 }
 
@@ -504,7 +473,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 		p.clearRecordedSystemdExitState()
 		ch := make(chan string, 1)
 		p.systemd.ResetFailedUnitContext(ctx, p.Name())
-		if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
+		if _, err := p.systemd.StartTransientUnitContext(ctx, uName, "replace", p.unitProps, ch); err != nil {
 			if err := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil && !strings.Contains(err.Error(), "not found") {
 				log.G(ctx).WithError(err).Info("Error deleting container in runc")
 			}
@@ -513,7 +482,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 			}
 
 			ch = make(chan string, 1)
-			if _, err := p.systemd.StartUnitContext(ctx, uName, "replace", ch); err != nil {
+			if _, err := p.systemd.StartTransientUnitContext(ctx, uName, "replace", p.unitProps, ch); err != nil {
 				return fmt.Errorf("error starting unit: %w", err)
 			}
 		}
@@ -595,11 +564,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 		if err := do(); err != nil {
 			ret := err
 			if p.runc.Debug {
-				ret = fmt.Errorf("%w:\n%s", err, p.Name())
-				unitData, err := os.ReadFile(p.unitPath())
-				if err == nil {
-					ret = fmt.Errorf("%w:\n%s", ret, string(unitData))
-				}
+				ret = fmt.Errorf("%w:\n%s\n%s", err, p.Name(), formatUnitProperties(p.unitProps))
 				logData, err := os.ReadFile(p.runc.Log)
 				if err == nil {
 					ret = fmt.Errorf("%w\n%s", ret, string(logData))

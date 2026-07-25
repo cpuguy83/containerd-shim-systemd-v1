@@ -1,11 +1,7 @@
 package main
 
 import (
-	"context"
 	"expvar"
-	"time"
-
-	"github.com/coreos/go-systemd/v22/dbus"
 )
 
 // State-source metric keys. These count how the shim answers process
@@ -14,10 +10,11 @@ import (
 // file. The reactor-hit vs getall-fallback ratio is the event reactor's
 // effective hit rate; on-disk reads are the other fallback source.
 //
-// daemon_reload_* measure time spent in systemd `daemon-reload` (Reload over
-// D-Bus), which the shim issues on every create/delete because it writes unit
-// files to disk. daemon-reload re-parses every unit, so its cost grows with the
-// number of units on the host — a prime suspect for create/delete latency.
+// daemon_reload_* formerly measured time spent in systemd `daemon-reload`, which
+// the shim issued on every create/delete because it wrote unit files to disk.
+// The shim now creates units transiently (StartTransientUnit), so no reload is
+// issued and these counters stay 0. They remain published so the benchmark
+// schema is stable and a run visibly shows reloads eliminated.
 const (
 	metricReactorHits       = "exitstate_reactor_hits"
 	metricGetAllFallbacks   = "exitstate_getall_fallbacks"
@@ -48,15 +45,3 @@ var stateMetrics = func() *expvar.Map {
 
 // countState increments one of the state-source counters above.
 func countState(key string) { stateMetrics.Add(key, 1) }
-
-// reloadSystemd issues a systemd daemon-reload and records how long it took.
-// The count and cumulative duration are exposed via expvar so the benchmark can
-// attribute create/delete latency to reload cost. Reloads are timed even on
-// error, since the time was still spent.
-func reloadSystemd(ctx context.Context, conn *dbus.Conn) error {
-	start := time.Now()
-	err := conn.ReloadContext(ctx)
-	stateMetrics.Add(metricDaemonReloadCount, 1)
-	stateMetrics.Add(metricDaemonReloadNanos, int64(time.Since(start)))
-	return err
-}

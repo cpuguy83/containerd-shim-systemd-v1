@@ -67,7 +67,6 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		conn:    conn,
 		runcBin: runcPath,
 		exe:     exe,
-		unitDir: systemUnitDir,
 	})
 	if err != nil {
 		conn.Close()
@@ -81,7 +80,6 @@ type serviceConfig struct {
 	conn    *systemd.Conn
 	runcBin string
 	exe     string
-	unitDir string
 }
 
 func newServiceWithConfig(ctx context.Context, cfg serviceConfig) (*Service, error) {
@@ -100,7 +98,6 @@ func newServiceWithConfig(ctx context.Context, cfg serviceConfig) (*Service, err
 		conn:           cfg.conn,
 		exe:            cfg.exe,
 		root:           cfg.Root,
-		unitDir:        cfg.unitDir,
 		noNewNamespace: cfg.NoNewNamespace,
 		publisher:      cfg.Publisher,
 		events:         make(chan eventEnvelope, 128),
@@ -118,7 +115,6 @@ type Service struct {
 	runcBin        string
 	debug          bool
 	root           string
-	unitDir        string
 	noNewNamespace bool
 	publisher      events.Publisher
 	events         chan eventEnvelope
