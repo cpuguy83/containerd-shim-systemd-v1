@@ -120,8 +120,7 @@ func syntheticReport() Report {
 		return map[string]uint64{"shim-systemd": shim, "tty-helper": 0, "shim-runc": shim, "runc": 4 << 20, "systemd": 20 << 20, "containerd": 30 << 20}
 	}
 	vars := func(hit, getall, ondisk int64) *ShimVarsDelta {
-		d := &ShimVarsDelta{ReactorHits: hit, GetAllFallbacks: getall, OnDiskReads: ondisk,
-			ReloadCount: 40, ReloadTotalMs: 400, ReloadMeanMs: 10}
+		d := &ShimVarsDelta{ReactorHits: hit, GetAllFallbacks: getall, OnDiskReads: ondisk}
 		if hit+getall > 0 {
 			d.ReactorHitRate = float64(hit) / float64(hit+getall)
 		}

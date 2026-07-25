@@ -77,7 +77,7 @@ func writeResourceCSV(path string, r *Report) error {
 		header = append(header, "peak_pss_"+string(c))
 	}
 	header = append(header, "reactor_hits", "getall_fallbacks", "ondisk_reads", "reactor_hit_rate",
-		"daemon_reload_count", "daemon_reload_total_ms", "daemon_reload_mean_ms", "shim_go_heap_bytes")
+		"shim_go_heap_bytes")
 	w.Write(header)
 
 	for _, s := range r.Scenarios {
@@ -97,12 +97,9 @@ func writeResourceCSV(path string, r *Report) error {
 			row = append(row, strconv.FormatInt(s.ShimVars.ReactorHits, 10),
 				strconv.FormatInt(s.ShimVars.GetAllFallbacks, 10),
 				strconv.FormatInt(s.ShimVars.OnDiskReads, 10),
-				f2(s.ShimVars.ReactorHitRate),
-				strconv.FormatInt(s.ShimVars.ReloadCount, 10),
-				f2(s.ShimVars.ReloadTotalMs),
-				f2(s.ShimVars.ReloadMeanMs))
+				f2(s.ShimVars.ReactorHitRate))
 		} else {
-			row = append(row, "", "", "", "", "", "", "")
+			row = append(row, "", "", "", "")
 		}
 		row = append(row, strconv.FormatUint(s.ShimGoHeapBytes, 10))
 		w.Write(row)
