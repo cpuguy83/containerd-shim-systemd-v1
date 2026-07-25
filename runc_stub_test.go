@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -25,6 +26,10 @@ const (
 	runcStubExitCodeAnnotation  = "io.containerd.systemd.test.exit-code"
 	runcStubExitDelayAnnotation = "io.containerd.systemd.test.exit-delay"
 	runcStubFailpointAnnotation = "io.containerd.systemd.test.failpoint"
+	// runcStubRootfsMarkerAnnotation names a file the managed process must find
+	// under <bundle>/rootfs, proving the container's rootfs was mounted (in either
+	// the host namespace or the unit's private mount namespace).
+	runcStubRootfsMarkerAnnotation = "io.containerd.systemd.test.rootfs-marker"
 
 	runcStubExitCodeEnv         = "RUNC_STUB_EXIT_CODE"
 	runcStubExitDelayEnv        = "RUNC_STUB_EXIT_DELAY"
@@ -33,10 +38,15 @@ const (
 	runcStubWaitForReleaseEnv   = "RUNC_STUB_WAIT_FOR_RELEASE"
 
 	runcStubKillAllMarker = "kill-all"
+	// runcStubCheckpointImage is a file the test writes into a checkpoint dir;
+	// `runc restore` must be handed that dir via --image-path, proving the shim
+	// took the restore path with the right checkpoint rather than a plain create.
+	runcStubCheckpointImage = "checkpoint.img"
 
 	runcStubCreateFailure = 42
 	runcStubStartFailure  = 43
 	runcStubExecFailure   = 45
+	runcStubRootfsMissing = 66
 )
 
 type runcStubConfig struct {
@@ -48,6 +58,7 @@ type runcStubConfig struct {
 	ExitBeforeDetach bool          `json:"exitBeforeDetach,omitempty"`
 	WaitForRelease   bool          `json:"waitForRelease,omitempty"`
 	ParentPID        int           `json:"parentPid,omitempty"`
+	RootfsCheck      string        `json:"rootfsCheck,omitempty"`
 }
 
 func TestMain(m *testing.M) {
@@ -68,10 +79,22 @@ func TestMain(m *testing.M) {
 }
 
 func runShimCreateHelper() error {
+	// The no-new-namespace rootfs path drives ExecStartPre/ExecStopPost, which
+	// re-exec the shim as `<exe> mount <cfg>` and `<exe> unmount <rootfs>`.
+	if len(os.Args) >= 3 {
+		switch os.Args[1] {
+		case "mount":
+			return mountRootfs(os.Args[2])
+		case "unmount":
+			return mount.UnmountAll(os.Args[2], 0)
+		}
+	}
+
 	flags := flag.NewFlagSet(shimCreateHelperName, flag.ContinueOnError)
 	flags.Bool("debug", false, "")
 	bundle := flags.String("bundle", "", "")
 	tty := flags.Bool("tty", false, "")
+	mounts := flags.String("mounts", "", "")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -80,7 +103,13 @@ func runShimCreateHelper() error {
 	if len(args) < 2 || args[0] != "create" {
 		return fmt.Errorf("invalid shim helper arguments: %q", os.Args[1:])
 	}
-	return createCmd(context.Background(), *bundle, args[1:], *tty, false)
+	// The PrivateMounts path mounts the rootfs in the create re-exec before runc.
+	if *mounts != "" {
+		if err := mountRootfs(*mounts); err != nil {
+			return err
+		}
+	}
+	return createCmd(context.Background(), *bundle, args[1:], *tty, *mounts != "")
 }
 
 func runRuncStub() int {
@@ -99,6 +128,8 @@ func runRuncStub() int {
 	switch command {
 	case "create":
 		code, err = runRuncStubCreate(root, args)
+	case "restore":
+		code, err = runRuncStubRestore(root, args)
 	case "exec":
 		code, err = runRuncStubExec(args)
 	case "start":
@@ -201,6 +232,42 @@ func runRuncStubCreate(root string, args []string) (int, error) {
 		return runcStubCreateFailure, fmt.Errorf("runc create failpoint")
 	}
 
+	stateDir := filepath.Join(root, id)
+	if err := os.MkdirAll(stateDir, 0700); err != nil {
+		return 125, err
+	}
+	return startRuncStubProcess(stateDir, pidFile, cfg)
+}
+
+// runRuncStubRestore models `runc restore`: it starts the restored container
+// immediately (there is no separate start) and reports its pid. restore carries
+// no --pid-file flag, so the pid path comes from the PIDFILE the unit exports.
+func runRuncStubRestore(root string, args []string) (int, error) {
+	bundle, err := commandOption(args, "--bundle")
+	if err != nil {
+		return 125, err
+	}
+	imagePath, err := commandOption(args, "--image-path")
+	if err != nil {
+		return 125, err
+	}
+	// restore must be handed the checkpoint the task was created with.
+	if _, err := os.Stat(filepath.Join(imagePath, runcStubCheckpointImage)); err != nil {
+		return 125, fmt.Errorf("restore image-path %q has no checkpoint: %w", imagePath, err)
+	}
+	id, err := commandID(args)
+	if err != nil {
+		return 125, err
+	}
+	pidFile := os.Getenv("PIDFILE")
+	if pidFile == "" {
+		return 125, fmt.Errorf("runc restore stub: no PIDFILE in environment")
+	}
+	cfg, err := readRuncStubBundleConfig(bundle)
+	if err != nil {
+		return 125, err
+	}
+	cfg.StartImmediately = true
 	stateDir := filepath.Join(root, id)
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return 125, err
@@ -339,6 +406,16 @@ func runManagedProcess() int {
 		return 125
 	}
 
+	// If the container declares a rootfs marker, the shim must have mounted the
+	// rootfs (host-namespace ExecStartPre or private-namespace --mounts) before
+	// the container runs.
+	if cfg.RootfsCheck != "" {
+		if _, err := os.Stat(cfg.RootfsCheck); err != nil {
+			fmt.Fprintln(os.Stderr, "rootfs marker missing:", err)
+			return runcStubRootfsMissing
+		}
+	}
+
 	if !cfg.StartImmediately {
 		started := filepath.Join(stateDir, "started")
 		for {
@@ -382,6 +459,9 @@ func readRuncStubBundleConfig(bundle string) (runcStubConfig, error) {
 	}
 	if err := setRuncStubExitDelay(&cfg, spec.Annotations[runcStubExitDelayAnnotation]); err != nil {
 		return runcStubConfig{}, err
+	}
+	if marker := spec.Annotations[runcStubRootfsMarkerAnnotation]; marker != "" {
+		cfg.RootfsCheck = filepath.Join(bundle, "rootfs", marker)
 	}
 	return cfg, nil
 }
