@@ -66,7 +66,24 @@ func (s *Service) Delete(ctx context.Context, r *taskapi.DeleteRequest) (_ *task
 			return nil, err
 		}
 
+		// Deleting the container force-deletes runc, which kills any surviving
+		// exec process. Release each exec unit's reference (and clear failed
+		// state) so systemd can collect it, rather than leaking it until shim
+		// shutdown; individual exec Delete does the same. Detached from the
+		// request context because the units are untracked just below, leaving no
+		// way to retry a release the caller's cancellation skipped.
 		p.(*initProcess).execs.Each(func(ep Process) {
+			if e, ok := ep.(*execProcess); ok {
+				// Mark before releasing, so an exec Start racing this teardown
+				// either sees the flag and abandons its unit, or created it early
+				// enough that the release below covers it. Each exec gets its own
+				// budget so one slow release cannot starve the rest.
+				e.markDeleting()
+				relCtx, cancel := cleanupContext(ctx)
+				e.releaseUnit(relCtx, e.Name())
+				e.systemd.ResetFailedUnitContext(relCtx, e.Name())
+				cancel()
+			}
 			s.units.Delete(ep)
 		})
 		s.processes.Delete(path.Join(ns, r.ID))
@@ -99,13 +116,33 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 	}()
 
 	if !p.ProcessState().Exited() {
-		var st pState
-		if err := getUnitState(ctx, p.systemd, p.Name(), &st); err == nil {
+		if st, err := loadExitFromUnit(ctx, p.systemd, p.Name()); err == nil {
 			if !st.Exited() {
 				return pState{}, fmt.Errorf("container has not exited: %w, %s", errdefs.ErrFailedPrecondition, p.ProcessState())
 			}
+			// The unit exited but the shim never observed the signal -- the case the
+			// unit reference keeps recoverable. Record it: waitForExit below reads
+			// the in-memory state, so dropping this exit would leave Delete blocked
+			// on an exit that already happened and never publish its task exit.
+			p.SetState(ctx, st)
 		}
 	}
+
+	// Signal teardown before any of it runs, so a Start racing this delete can
+	// see it and not leave a unit behind (see markDeleting).
+	p.markDeleting()
+
+	// Past the precondition check we are committed to tearing the unit down, so
+	// release its reference on every exit path -- including the runc.Delete and
+	// waitForExit failures below -- otherwise systemd keeps the unit pinned until
+	// shim shutdown. Detached from the request context: a successful Delete is
+	// immediately followed by the caller untracking this process, so a release
+	// skipped because the caller canceled could never be retried.
+	defer func() {
+		relCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+		p.releaseUnit(relCtx, p.Name())
+	}()
 
 	defer func() {
 		if retErr != nil {
@@ -145,9 +182,8 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		p.systemd.KillUnitContext(ctx, unitName(p.ns, p.id, "tty"), 9)
 	}
 
-	// The transient unit leaves nothing on disk; once stopped, systemd
-	// garbage-collects it. ResetFailedUnit forces collection of a unit that was
-	// left in the failed state.
+	// Reset any failed state so systemd can collect the transient unit once its
+	// reference is released (see the deferred releaseUnit above).
 	if err := p.systemd.ResetFailedUnitContext(ctx, p.Name()); err != nil && !strings.Contains(err.Error(), "not loaded") {
 		// Just a debug message since this is just precautionary and the unit may not even be failed.
 		log.G(ctx).WithError(err).Debug("Failed to reset systemd unit")
@@ -184,6 +220,21 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 		return pState{}, fmt.Errorf("exec has not exited: %w", errdefs.ErrFailedPrecondition)
 	}
 
+	// Signal teardown before any of it runs, so a Start racing this delete can
+	// see it and not leave a unit behind (see markDeleting).
+	p.markDeleting()
+
+	// Past the precondition check we are committed to teardown; release the unit
+	// reference on every exit path -- including the waitForExit failure below --
+	// so systemd is not left pinning the unit until shim shutdown. Detached from
+	// the request context for the same reason as the init path: the exec is
+	// untracked as soon as this returns, so a skipped release is unrecoverable.
+	defer func() {
+		relCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+		p.releaseUnit(relCtx, p.Name())
+	}()
+
 	ch := make(chan string, 1)
 	if _, err := p.systemd.StopUnitContext(ctx, p.Name(), "replace", ch); err != nil {
 		log.G(ctx).WithError(err).Info("Failed to stop unit")
@@ -216,8 +267,8 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 	p.closeTTYControl()
 
 	p.parent.execs.Delete(p.execID)
-	// The transient unit leaves nothing on disk; systemd garbage-collects it once
-	// stopped. ResetFailedUnit forces collection if it was left failed.
+	// Reset any failed state so systemd can collect the transient unit once its
+	// reference is released (see the deferred releaseUnit above).
 	p.systemd.ResetFailedUnitContext(ctx, p.Name())
 	if err := os.RemoveAll(p.stateDir()); err != nil && !os.IsNotExist(err) {
 		log.G(ctx).WithError(err).Debug("Failed to remove exec state dir")

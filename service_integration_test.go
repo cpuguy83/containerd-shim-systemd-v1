@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -555,6 +556,75 @@ func TestServiceTaskRootfsMountAgainstSystemd(t *testing.T) {
 	}
 }
 
+// TestServiceTaskMissedExitSignalAgainstSystemd asserts a task whose exit signal
+// the shim never observed still reports its real exit status through delete.
+// This is the case the unit reference exists for: with the exited unit kept
+// loaded, delete recovers the terminal state from systemd instead of blocking on
+// an in-memory state that never saw the exit.
+func TestServiceTaskMissedExitSignalAgainstSystemd(t *testing.T) {
+	h := newServiceIntegrationHarness(t)
+	ctx, req, unit := h.task(t, "missed-exit", runcStubConfig{ExitCode: 7, ExitDelay: 300 * time.Millisecond})
+
+	if _, err := h.service.Create(ctx, req); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
+		t.Fatalf("start task: %v", err)
+	}
+
+	// Drop the event stream before the workload exits, so nothing reconciles the
+	// exit into process state.
+	h.stopReactor()
+
+	if !eventually(15*time.Second, 20*time.Millisecond, func() bool {
+		st, err := loadExitFromUnit(ctx, h.conn, unit)
+		return err == nil && st.Exited()
+	}) {
+		t.Fatal("unit never exited in systemd")
+	}
+	state, err := h.service.State(ctx, &taskapi.StateRequest{ID: req.ID})
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	if state.Status == tasktypes.Status_STOPPED {
+		t.Skip("shim recorded the exit without the event stream; cannot exercise the missed-signal path")
+	}
+
+	// Delete must not be left waiting on an exit that already happened. Bound it
+	// here rather than relying on the request context: waitForExit parks in
+	// sync.Cond.Wait, which no context can interrupt, so a regression hangs
+	// forever instead of returning a deadline error.
+	delCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	type deleteResult struct {
+		resp *taskapi.DeleteResponse
+		err  error
+	}
+	done := make(chan deleteResult, 1)
+	go func() {
+		resp, err := h.service.Delete(delCtx, &taskapi.DeleteRequest{ID: req.ID})
+		done <- deleteResult{resp, err}
+	}()
+
+	var deleted *taskapi.DeleteResponse
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("delete task: %v", res.err)
+		}
+		deleted = res.resp
+	case <-time.After(30 * time.Second):
+		t.Fatal("delete blocked: the exit recorded on the still-loaded unit was never applied to the task")
+	}
+
+	if deleted.ExitStatus != 7 {
+		t.Errorf("delete reported exit status %d, want 7 recovered from the still-loaded unit", deleted.ExitStatus)
+	}
+	if !deleted.ExitedAt.AsTime().After(timeZero) {
+		t.Errorf("delete reported exit time %s, want the recovered exit stamped", deleted.ExitedAt.AsTime())
+	}
+}
+
 // requireBindMount skips the test when this environment cannot bind mount, e.g.
 // a user systemd manager whose units run without CAP_SYS_ADMIN. The shim's
 // rootfs mount runs in a systemd unit with the same privileges as this process,
@@ -575,6 +645,10 @@ type serviceIntegrationHarness struct {
 	conn      *systemd.Conn
 	unitDir   string
 	namespace string
+	// stopReactor drops the D-Bus event stream, so unit state changes stop being
+	// reconciled into process state. Tests use it to simulate a missed exit
+	// signal. It is idempotent and also runs at cleanup.
+	stopReactor func()
 }
 
 func newServiceIntegrationHarness(t *testing.T) *serviceIntegrationHarness {
@@ -582,6 +656,11 @@ func newServiceIntegrationHarness(t *testing.T) *serviceIntegrationHarness {
 	busPath, unitDir := integrationSystemdManager(t)
 	ctx := context.Background()
 	conn := dialPrivate(t, ctx, busPath)
+	pinConn, pinRef, err := newPinConnection(ctx)
+	if err != nil {
+		t.Logf("no D-Bus message bus for unit references; pinning disabled: %v", err)
+		pinConn, pinRef = nil, nil
+	}
 
 	helperDir := t.TempDir()
 	testBinary, err := os.Executable()
@@ -600,11 +679,16 @@ func newServiceIntegrationHarness(t *testing.T) *serviceIntegrationHarness {
 			LogMode: options.LogMode_NULL,
 		},
 		conn:    conn,
+		pinConn: pinConn,
+		pinRef:  pinRef,
 		runcBin: filepath.Join(helperDir, runcStubHelperName),
 		exe:     filepath.Join(helperDir, shimCreateHelperName),
 	})
 	if err != nil {
 		conn.Close()
+		if pinConn != nil {
+			pinConn.Close()
+		}
 		t.Fatalf("create service: %v", err)
 	}
 
@@ -621,22 +705,33 @@ func newServiceIntegrationHarness(t *testing.T) *serviceIntegrationHarness {
 		reactor.consume(reactorCtx, unitUpdates(reactorCtx, signals))
 	}()
 
+	var stopReactorOnce sync.Once
+	stopReactor := func() {
+		stopReactorOnce.Do(func() {
+			cancelReactor()
+			select {
+			case <-reactorDone:
+			case <-time.After(5 * time.Second):
+				t.Error("event reactor did not stop")
+			}
+		})
+	}
+
 	t.Cleanup(func() {
-		cancelReactor()
+		stopReactor()
 		signalConn.Close()
-		select {
-		case <-reactorDone:
-		case <-time.After(5 * time.Second):
-			t.Error("event reactor did not stop")
-		}
 		conn.Close()
+		if pinConn != nil {
+			pinConn.Close()
+		}
 	})
 
 	return &serviceIntegrationHarness{
-		service:   service,
-		conn:      conn,
-		unitDir:   unitDir,
-		namespace: fmt.Sprintf("itest-%d-%d", os.Getpid(), time.Now().UnixNano()),
+		service:     service,
+		conn:        conn,
+		unitDir:     unitDir,
+		namespace:   fmt.Sprintf("itest-%d-%d", os.Getpid(), time.Now().UnixNano()),
+		stopReactor: stopReactor,
 	}
 }
 

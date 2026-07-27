@@ -236,6 +236,38 @@ func (p *process) unitType() string {
 	return "forking"
 }
 
+// abandonStartedUnit tears down a unit whose process was deleted while it was
+// starting. The delete already ran its teardown against a unit that did not
+// exist yet, so it is this caller's job to stop the unit and release the
+// reference it just took, or both would outlive the process untracked.
+func (p *process) abandonStartedUnit(ctx context.Context, name string) {
+	// Stopping gets its own budget. Releasing the reference is the part that must
+	// not be skipped, so a unit that refuses to stop must not be able to spend the
+	// time the release needs.
+	stopCtx, cancelStop := cleanupContext(ctx)
+	ch := make(chan string, 1)
+	if _, err := p.systemd.StopUnitContext(stopCtx, name, "replace", ch); err != nil {
+		log.G(ctx).WithField("unit", name).WithError(err).Info("Failed to stop unit for a deleted process")
+	} else {
+		select {
+		case <-stopCtx.Done():
+		case <-ch:
+		}
+	}
+	cancelStop()
+
+	killCtx, cancelKill := cleanupContext(ctx)
+	p.systemd.KillUnitContext(killCtx, name, int32(syscall.SIGKILL))
+	cancelKill()
+
+	// The release gets the last, unshared budget: it is the one step whose
+	// failure is unrecoverable, so no earlier call may spend its time.
+	relCtx, cancel := cleanupContext(ctx)
+	defer cancel()
+	p.releaseUnit(relCtx, name)
+	p.systemd.ResetFailedUnitContext(relCtx, name)
+}
+
 func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	ctx, span := StartSpan(ctx, "InitProcess.Start")
 	defer func() {
@@ -324,14 +356,34 @@ func (p *initProcess) restore(ctx context.Context) (pid uint32, retErr error) {
 		}
 		defer func() {
 			if retErr != nil {
-				p.systemd.KillUnitContext(ctx, u, int32(syscall.SIGKILL))
+				cleanupCtx, cancel := cleanupContext(ctx)
+				defer cancel()
+				p.systemd.KillUnitContext(cleanupCtx, u, int32(syscall.SIGKILL))
 			}
 		}()
 	}
-	return p.startUnit(ctx)
+	// startUnit can leave a unit behind even when it ultimately fails, so check on
+	// every return rather than only on success: a delete racing this start is
+	// already untracked and would never release it.
+	defer func() {
+		if !p.isDeleting() {
+			return
+		}
+		p.abandonStartedUnit(ctx, p.Name())
+		pid = 0
+		if retErr == nil {
+			retErr = fmt.Errorf("task %s was deleted while starting: %w", p.id, errdefs.ErrFailedPrecondition)
+		}
+	}()
+
+	pid, err := p.startUnit(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return pid, nil
 }
 
-func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
+func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 	if !p.parent.ProcessState().Started() {
 		p.parent.LoadState(ctx)
 		if !p.parent.ProcessState().Started() {
@@ -351,7 +403,9 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 
 		defer func() {
 			if retErr != nil {
-				p.systemd.KillUnitContext(ctx, u, int32(syscall.SIGKILL))
+				cleanupCtx, cancel := cleanupContext(ctx)
+				defer cancel()
+				p.systemd.KillUnitContext(cleanupCtx, u, int32(syscall.SIGKILL))
 			}
 		}()
 	}
@@ -362,15 +416,33 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 	}
 
 	p.clearRecordedSystemdExitState()
+
+	// Installed before the unit is created, not after: StartTransientUnit can
+	// fail ambiguously (a lost or cancelled reply) with systemd having already
+	// created the unit and applied AddRef, so even its error paths have to hand
+	// the reference back if a delete raced us here. The delete ran its teardown
+	// against a unit that did not exist yet, and the exec is untracked by now, so
+	// nothing else would ever release it.
+	defer func() {
+		if !p.isDeleting() {
+			return
+		}
+		p.abandonStartedUnit(ctx, p.Name())
+		pid = 0
+		if retErr == nil {
+			retErr = fmt.Errorf("exec %s was deleted while starting: %w", p.execID, errdefs.ErrFailedPrecondition)
+		}
+	}()
+
 	ch := make(chan string, 1)
-	if _, err := p.systemd.StartTransientUnitContext(ctx, p.Name(), "replace", props, ch); err != nil {
+	if err := p.startTransientUnit(ctx, p.Name(), "replace", props, ch); err != nil {
 		// A prior attempt may have left a failed transient unit of the same
 		// name that systemd has not yet garbage-collected; reset it and retry.
 		if e := p.systemd.ResetFailedUnitContext(ctx, p.Name()); e != nil {
 			log.G(ctx).WithField("unit", p.Name()).WithError(e).Warn("Error resetting failed unit")
 		} else {
 			ch = make(chan string, 1)
-			_, err = p.systemd.StartTransientUnitContext(ctx, p.Name(), "replace", props, ch)
+			err = p.startTransientUnit(ctx, p.Name(), "replace", props, ch)
 		}
 		if err != nil {
 			return 0, err
@@ -380,7 +452,9 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 	select {
 	case <-ctx.Done():
 		log.G(ctx).WithError(ctx.Err()).Warn("start: context cancelled, killing exec unit")
-		p.systemd.KillUnitContext(context.TODO(), p.Name(), int32(syscall.SIGKILL))
+		killCtx, cancel := cleanupContext(ctx)
+		defer cancel()
+		p.systemd.KillUnitContext(killCtx, p.Name(), int32(syscall.SIGKILL))
 	case status := <-ch:
 		if status != "done" {
 			if err := p.LoadState(ctx); err != nil {
@@ -429,7 +503,7 @@ func (p *execProcess) Start(ctx context.Context) (_ uint32, retErr error) {
 		return 0, ret
 	}
 
-	pid, err := p.getPid(ctx)
+	pid, err = p.getPid(ctx)
 	if err != nil {
 		return 0, err
 	}

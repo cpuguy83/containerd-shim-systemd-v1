@@ -21,6 +21,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/typeurl/v2"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
+	"github.com/godbus/dbus/v5"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -207,12 +208,22 @@ type process struct {
 	systemd *systemd.Conn
 	runc    *runc.Runc
 
+	// pinConn starts the transient unit with AddRef=true so systemd will not
+	// garbage-collect it after a clean exit, keeping its terminal state queryable
+	// over D-Bus. pinRef is the same message-bus connection's raw method handle,
+	// used to UnrefUnit at Delete. Both are nil when no message bus is available,
+	// in which case the unit starts on the private connection unpinned. They are
+	// shared across all processes.
+	pinConn *systemd.Conn
+	pinRef  *dbus.Conn
+
 	ttyControl *ttyControlClient
 
 	mu           sync.Mutex
 	cond         *sync.Cond
 	state        pState
 	deleted      bool
+	deleting     bool
 	exitNotified bool
 	started      bool
 
@@ -314,6 +325,27 @@ func (p *process) markStarted() {
 	p.mu.Lock()
 	p.started = true
 	p.mu.Unlock()
+}
+
+// markDeleting records that teardown has begun, before any of it runs. A start
+// racing that teardown checks this once its unit exists (see isDeleting): the
+// two orderings are then both safe -- either the unit already existed and
+// teardown tears it down, or it did not and the starter sees the flag and
+// abandons it. Without that, a delete could untrack the process just before a
+// start created its unit, stranding a running, referenced unit that nothing
+// would ever release. It is distinct from deleted, which is set only once
+// teardown finishes because waitForExit uses it to stop waiting.
+func (p *process) markDeleting() {
+	p.mu.Lock()
+	p.deleting = true
+	p.mu.Unlock()
+}
+
+func (p *process) isDeleting() bool {
+	p.mu.Lock()
+	deleting := p.deleting
+	p.mu.Unlock()
+	return deleting
 }
 
 func (p *process) hasStarted() bool {
