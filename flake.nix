@@ -43,7 +43,7 @@
               && !(pkgs.lib.hasSuffix ".test" base);
           };
 
-          vendorHash = "sha256-Btom6v1OCfXHudfhXLvj17GmzeEiFIUtk6FbWmDWKnA=";
+          vendorHash = "sha256-7V9DnwVeUFqrpwpcNMYq/copyRXBWZHGZYBDEEibE0w=";
 
           subPackages = [
             "."
