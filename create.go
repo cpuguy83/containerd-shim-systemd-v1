@@ -153,6 +153,8 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			Stderr:   r.Stderr,
 			Terminal: r.Terminal,
 			systemd:  s.conn,
+			pinConn:  s.pinConn,
+			pinRef:   s.pinRef,
 			runc: &runc.Runc{
 				Debug:         s.debug,
 				Command:       runcCommand,
@@ -188,6 +190,9 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 
 	defer func() {
 		if retErr != nil {
+			ctx, cancel := cleanupContext(ctx)
+			defer cancel()
+
 			p.SetState(ctx, pState{ExitCode: 255, ExitedAt: time.Now(), Status: "failed"})
 			log.G(ctx).WithError(retErr).Debug("Set state to failed")
 			s.processes.Delete(path.Join(ns, r.ID))
@@ -262,6 +267,8 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *e
 			Stderr:   r.Stderr,
 			Terminal: r.Terminal,
 			systemd:  s.conn,
+			pinConn:  s.pinConn,
+			pinRef:   s.pinRef,
 			exe:      s.exe,
 			opts:     CreateOptions{LogMode: s.defaultLogMode.String()},
 			runc: &runc.Runc{
@@ -283,6 +290,18 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *e
 	}
 
 	s.units.Add(ep)
+
+	// The container may have started being deleted while this exec was being
+	// registered, after the delete had already swept the exec list. Registering
+	// then checking means one of the two always sees the other: either the sweep
+	// finds this exec, or this sees the flag the delete set before sweeping. An
+	// exec left behind here would never be reachable to clean up.
+	if pInit.isDeleting() {
+		s.units.Delete(ep)
+		pInit.execs.Delete(r.ExecID)
+		return nil, fmt.Errorf("container %s is being deleted: %w", pInit.id, errdefs.ErrFailedPrecondition)
+	}
+
 	if err := ep.Create(ctx); err != nil {
 		s.units.Delete(ep)
 		pInit.execs.Delete(r.ExecID)
@@ -407,7 +426,9 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 	defer func() {
 		if retErr != nil {
 			span.SetStatus(codes.Error, retErr.Error())
-			p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true})
+			cleanupCtx, cancel := cleanupContext(ctx)
+			defer cancel()
+			p.runc.Delete(cleanupCtx, p.id, &runc.DeleteOpts{Force: true})
 			p.mu.Lock()
 			p.deleted = true
 			p.cond.Broadcast()
@@ -457,13 +478,19 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 
 		defer func() {
 			if retErr != nil {
-				p.systemd.KillUnitContext(ctx, u, int32(syscall.SIGKILL))
+				cleanupCtx, cancel := cleanupContext(ctx)
+				defer cancel()
+				p.systemd.KillUnitContext(cleanupCtx, u, int32(syscall.SIGKILL))
 			}
 		}()
 	}
 
 	p.unitProps = unitProps
-	return p.startUnit(ctx)
+	pid, err := p.startUnit(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return pid, nil
 }
 
 func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
@@ -473,7 +500,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 		p.clearRecordedSystemdExitState()
 		ch := make(chan string, 1)
 		p.systemd.ResetFailedUnitContext(ctx, p.Name())
-		if _, err := p.systemd.StartTransientUnitContext(ctx, uName, "replace", p.unitProps, ch); err != nil {
+		if err := p.startTransientUnit(ctx, uName, "replace", p.unitProps, ch); err != nil {
 			if err := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err != nil && !strings.Contains(err.Error(), "not found") {
 				log.G(ctx).WithError(err).Info("Error deleting container in runc")
 			}
@@ -482,7 +509,7 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 			}
 
 			ch = make(chan string, 1)
-			if _, err := p.systemd.StartTransientUnitContext(ctx, uName, "replace", p.unitProps, ch); err != nil {
+			if err := p.startTransientUnit(ctx, uName, "replace", p.unitProps, ch); err != nil {
 				return fmt.Errorf("error starting unit: %w", err)
 			}
 		}
@@ -556,6 +583,12 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 			return 0, ctx.Err()
 		case <-ch:
 		}
+
+		// The stopped attempt above still holds its AddRef reference, which keeps
+		// the unit loaded and would make the re-create below fail "already exists".
+		// Release it now that the unit is stopped so systemd can collect it; the
+		// retry's start takes a fresh reference.
+		p.releaseUnit(ctx, p.Name())
 
 		// Clean up old state and try again
 		if err2 := p.runc.Delete(ctx, p.id, &runc.DeleteOpts{Force: true}); err2 != nil {

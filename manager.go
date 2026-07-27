@@ -22,6 +22,7 @@ import (
 	"github.com/containerd/typeurl/v2"
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/cpuguy83/containerd-shim-systemd-v1/options"
+	"github.com/godbus/dbus/v5"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
@@ -37,6 +38,20 @@ const systemUnitDir = "/run/systemd/system"
 var (
 	timeZero = time.UnixMicro(0)
 )
+
+// cleanupTimeout bounds teardown work started after a request already failed.
+const cleanupTimeout = 30 * time.Second
+
+// cleanupContext returns a context for teardown that must run even when the
+// request which triggered it was canceled -- a canceled request is itself a
+// common reason to be cleaning up, and teardown is all D-Bus and runc calls that
+// would fail instantly on a dead context, leaving units running and their
+// references stranded (a stranded reference keeps the unit loaded, which blocks
+// reusing its id). It keeps the request's log and trace values, drops only its
+// cancellation, and bounds the result so teardown cannot hang.
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+}
 
 type Config struct {
 	Root           string
@@ -62,14 +77,31 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		exe = os.Args[0]
 	}
 
+	// A single message-bus connection, separate from the private method
+	// connection, used only to pin transient units: they are started with
+	// AddRef=true so they survive collection after a clean exit. Best-effort --
+	// if the message bus is unavailable the shim still runs, but a unit collected
+	// after a missed exit signal could lose its exit code. Shared by every
+	// process.
+	pinConn, pinRef, err := newPinConnection(ctx)
+	if err != nil {
+		log.G(ctx).WithError(err).Warn("No D-Bus message bus for unit references; transient units are not pinned")
+		pinConn, pinRef = nil, nil
+	}
+
 	s, err := newServiceWithConfig(ctx, serviceConfig{
 		Config:  cfg,
 		conn:    conn,
+		pinConn: pinConn,
+		pinRef:  pinRef,
 		runcBin: runcPath,
 		exe:     exe,
 	})
 	if err != nil {
 		conn.Close()
+		if pinConn != nil {
+			pinConn.Close()
+		}
 		return nil, err
 	}
 	return s, nil
@@ -78,6 +110,8 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 type serviceConfig struct {
 	Config
 	conn    *systemd.Conn
+	pinConn *systemd.Conn
+	pinRef  *dbus.Conn
 	runcBin string
 	exe     string
 }
@@ -96,6 +130,8 @@ func newServiceWithConfig(ctx context.Context, cfg serviceConfig) (*Service, err
 	debug := logrus.GetLevel() >= logrus.DebugLevel
 	return &Service{
 		conn:           cfg.conn,
+		pinConn:        cfg.pinConn,
+		pinRef:         cfg.pinRef,
 		exe:            cfg.exe,
 		root:           cfg.Root,
 		noNewNamespace: cfg.NoNewNamespace,
@@ -112,6 +148,8 @@ func newServiceWithConfig(ctx context.Context, cfg serviceConfig) (*Service, err
 
 type Service struct {
 	conn           *systemd.Conn
+	pinConn        *systemd.Conn
+	pinRef         *dbus.Conn
 	runcBin        string
 	debug          bool
 	root           string
@@ -145,6 +183,11 @@ func unitName(ns, id, mod string) string {
 func (s *Service) Close() {
 	s.conn.Unsubscribe()
 	s.conn.Close()
+	if s.pinConn != nil {
+		// Closes both the go-systemd Conn and the underlying method connection
+		// pinRef wraps.
+		s.pinConn.Close()
+	}
 	close(s.events)
 	<-s.waitEvents
 }
