@@ -102,7 +102,7 @@ func (p *process) waitForExit(ctx context.Context) (pState, error) {
 		default:
 		}
 
-		if p.deleted {
+		if p.phase == phaseDeleted {
 			log.G(ctx).Debug("wait: deleted")
 			break
 		}

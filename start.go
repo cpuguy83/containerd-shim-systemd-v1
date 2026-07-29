@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	eventsapi "github.com/containerd/containerd/api/events"
 	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
@@ -61,26 +60,13 @@ func (s *Service) Start(ctx context.Context, r *taskapi.StartRequest) (_ *taskap
 			s.units.Delete(ep)
 			return nil, err
 		}
-		ep.(*execProcess).markStarted()
-		ep.SetState(ctx, pState{Pid: pid, Status: "running"})
-		s.send(ctx, ns, &eventsapi.TaskExecStarted{
-			ContainerID: r.ID,
-			ExecID:      r.ExecID,
-			Pid:         pid,
-		})
-		ep.(*execProcess).markStartEventPublished()
+		ep.(*execProcess).finishStart(ctx, pid)
 	} else {
 		pid, err = p.Start(ctx)
 		if err != nil {
 			return nil, err
 		}
-		p.(*initProcess).markStarted()
-		p.SetState(ctx, pState{Pid: pid, Status: "running"})
-		s.send(ctx, ns, &eventsapi.TaskStart{
-			ContainerID: r.ID,
-			Pid:         pid,
-		})
-		p.(*initProcess).markStartEventPublished()
+		p.(*initProcess).finishStart(ctx, pid)
 	}
 
 	return &taskapi.StartResponse{Pid: pid}, nil
@@ -278,12 +264,20 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		span.End()
 	}()
 
+	// Claim the process for this start before touching runc or systemd, so a
+	// process that has already exited (or been deleted, or is already being
+	// started) is refused rather than half-started.
+	if err := p.beginStart(); err != nil {
+		return 0, fmt.Errorf("start container: %w: %s", err, p.ProcessState())
+	}
+	defer func() {
+		if retErr != nil {
+			p.abortStart(ctx)
+		}
+	}()
+
 	if p.checkpoint != "" {
 		return p.restore(ctx)
-	}
-
-	if p.ProcessState().Exited() {
-		return 0, fmt.Errorf("process has already exited: %s: %w", p.ProcessState(), errdefs.ErrFailedPrecondition)
 	}
 
 	if err := p.runc.Start(ctx, p.id); err != nil {
@@ -384,6 +378,18 @@ func (p *initProcess) restore(ctx context.Context) (pid uint32, retErr error) {
 }
 
 func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
+	// See the note in initProcess.Start: the lifecycle claim comes first so an
+	// exec that already exited, or is already being started, cannot be started
+	// again.
+	if err := p.beginStart(); err != nil {
+		return 0, fmt.Errorf("start exec: %w: %s", err, p.ProcessState())
+	}
+	defer func() {
+		if retErr != nil {
+			p.abortStart(ctx)
+		}
+	}()
+
 	if !p.parent.ProcessState().Started() {
 		p.parent.LoadState(ctx)
 		if !p.parent.ProcessState().Started() {

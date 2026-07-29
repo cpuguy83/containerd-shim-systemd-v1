@@ -188,10 +188,7 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		// Just a debug message since this is just precautionary and the unit may not even be failed.
 		log.G(ctx).WithError(err).Debug("Failed to reset systemd unit")
 	}
-	p.mu.Lock()
-	p.deleted = true
-	p.cond.Broadcast()
-	p.mu.Unlock()
+	p.finishDelete(ctx)
 
 	p.closeTTYControl()
 
@@ -259,10 +256,7 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 			return pState{}, err
 		}
 	}
-	p.mu.Lock()
-	p.deleted = true
-	p.cond.Broadcast()
-	p.mu.Unlock()
+	p.finishDelete(ctx)
 
 	p.closeTTYControl()
 

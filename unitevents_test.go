@@ -664,8 +664,6 @@ func TestEventReactorResync(t *testing.T) {
 	})
 }
 
-// --- helpers ---
-
 // eventually polls cond until it returns true or timeout elapses, sleeping step
 // between checks. It returns true as soon as cond passes, so a passing check
 // returns promptly; only a failing check runs to the full deadline.
