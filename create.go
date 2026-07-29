@@ -148,6 +148,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 			ns:       ns,
 			id:       r.ID,
 			opts:     opts,
+			events:   newEventOutbox(ns, s.send),
 			Stdin:    r.Stdin,
 			Stdout:   r.Stdout,
 			Stderr:   r.Stderr,
@@ -174,7 +175,6 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		killAllOnExit:    shouldKillAllOnExit(&spec),
 		checkpoint:       r.Checkpoint,
 		parentCheckpoint: r.ParentCheckpoint,
-		sendEvent:        s.send,
 		execs: &processManager{
 			ls: make(map[string]Process),
 		},
@@ -209,7 +209,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 	}
 	p.SetState(ctx, pState{Pid: pid, Status: "created"})
 
-	s.send(ctx, ns, &eventsapi.TaskCreate{
+	p.events.Send(ctx, &eventsapi.TaskCreate{
 		ContainerID: r.ID,
 		Bundle:      r.Bundle,
 		Rootfs:      r.Rootfs,
@@ -262,6 +262,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *e
 			ns:       ns,
 			root:     pInit.root,
 			id:       r.ExecID,
+			events:   newEventOutbox(ns, s.send),
 			Stdin:    r.Stdin,
 			Stdout:   r.Stdout,
 			Stderr:   r.Stderr,
@@ -308,7 +309,7 @@ func (s *Service) Exec(ctx context.Context, r *taskapi.ExecProcessRequest) (_ *e
 		return nil, err
 	}
 
-	s.send(ctx, ns, &eventsapi.TaskExecAdded{
+	ep.events.Send(ctx, &eventsapi.TaskExecAdded{
 		ContainerID: pInit.id,
 		ExecID:      r.ExecID,
 	})
@@ -429,10 +430,12 @@ func (p *initProcess) Create(ctx context.Context) (_ uint32, retErr error) {
 			cleanupCtx, cancel := cleanupContext(ctx)
 			defer cancel()
 			p.runc.Delete(cleanupCtx, p.id, &runc.DeleteOpts{Force: true})
-			p.mu.Lock()
-			p.deleted = true
-			p.cond.Broadcast()
-			p.mu.Unlock()
+			// Creation failed, so nothing will ever run under this process.
+			// Record that as its exit: it wakes anyone waiting on a process that
+			// can no longer start, and it leaves the caller's cleanup (which
+			// refines the exit and then tears the unit down) working against a
+			// process that has exited rather than one already marked deleted.
+			p.SetState(cleanupCtx, pState{ExitCode: 255, ExitedAt: time.Now(), Status: "failed"})
 		}
 		span.End()
 	}()

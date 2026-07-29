@@ -27,7 +27,17 @@ func TestProcessLifecycleStatus(t *testing.T) {
 			t.Fatalf("status before Start = %q, want created", state.Status)
 		}
 
-		p.markStarted()
+		if err := p.beginStart(); err != nil {
+			t.Fatalf("begin start: %v", err)
+		}
+		state = p.SetState(context.Background(), pState{Pid: 42, Status: "running"})
+		if state.Status != "created" {
+			t.Fatalf("status while Start is in flight = %q, want created", state.Status)
+		}
+
+		if _, err := p.advance(phaseRunning); err != nil {
+			t.Fatalf("finish start: %v", err)
+		}
 		state = p.SetState(context.Background(), pState{Pid: 42, Status: "running"})
 		if state.Status != "running" {
 			t.Fatalf("status after Start = %q, want running", state.Status)
@@ -37,7 +47,7 @@ func TestProcessLifecycleStatus(t *testing.T) {
 	t.Run("a recorded exit is not overwritten by a later non-terminal update", func(t *testing.T) {
 		p := &process{}
 		p.cond = sync.NewCond(&p.mu)
-		p.markStarted()
+		runTestProcess(t, p)
 
 		p.SetState(context.Background(), pState{Pid: 42, ExitCode: 9, Status: "exited", ExitedAt: time.Now()})
 
@@ -53,7 +63,7 @@ func TestProcessLifecycleStatus(t *testing.T) {
 	t.Run("a recorded exit can be refined by a later terminal update", func(t *testing.T) {
 		p := &process{}
 		p.cond = sync.NewCond(&p.mu)
-		p.markStarted()
+		runTestProcess(t, p)
 
 		p.SetState(context.Background(), pState{Pid: 42, Status: "exited", ExitedAt: time.Now()})
 
@@ -166,7 +176,7 @@ func TestInitExitCleanup(t *testing.T) {
 		p.root = t.TempDir()
 		p.runc = &runc.Runc{Command: runcPath, Root: runcRoot}
 		p.killAllOnExit = true
-		p.markStarted()
+		runTestProcess(t, p.process)
 
 		p.SetState(context.Background(), pState{
 			Pid:      42,
@@ -302,7 +312,7 @@ func TestExecStatusWhenInitExits(t *testing.T) {
 	t.Run("an init exit reaps a started exec", func(t *testing.T) {
 		parent, _ := newTestInitProcess("c-started")
 		ep := newTestExecProcess(parent, "exec1")
-		ep.markStarted()
+		runTestProcess(t, ep.process)
 		ep.SetState(context.Background(), pState{Pid: 99, Status: "running"})
 		if err := parent.execs.Add("exec1", ep); err != nil {
 			t.Fatalf("register exec: %v", err)
@@ -339,35 +349,51 @@ func TestExecStatusWhenInitExits(t *testing.T) {
 	})
 }
 
-// --- helpers ---
+// runTestProcess moves p through the lifecycle a successful Start would: it
+// claims the start and then completes it.
+func runTestProcess(t *testing.T, p *process) {
+	t.Helper()
+	if err := p.beginStart(); err != nil {
+		t.Fatalf("begin start: %v", err)
+	}
+	if _, err := p.advance(phaseRunning); err != nil {
+		t.Fatalf("finish start: %v", err)
+	}
+}
 
 // newTestInitProcess builds an initProcess wired with a TaskExit counter. The
-// returned func reports how many TaskExit events have been emitted so far.
+// returned func reports how many TaskExit events have been emitted so far. Its
+// start has already gone out, so exits publish immediately rather than being
+// held by the outbox.
 func newTestInitProcess(id string) (*initProcess, func() int32) {
 	var taskExits int32
+	send := func(_ context.Context, _ string, evt interface{}) bool {
+		if _, ok := evt.(*eventsapi.TaskExit); ok {
+			atomic.AddInt32(&taskExits, 1)
+		}
+		return true
+	}
 	p := &initProcess{
-		process: &process{ns: "testns", id: id},
+		process: &process{ns: "testns", id: id, events: newEventOutbox("testns", send)},
 		execs:   &processManager{ls: make(map[string]Process)},
 		shimLog: io.Discard,
-		sendEvent: func(_ context.Context, _ string, evt interface{}) {
-			if _, ok := evt.(*eventsapi.TaskExit); ok {
-				atomic.AddInt32(&taskExits, 1)
-			}
-		},
 	}
 	p.cond = sync.NewCond(&p.mu)
-	p.markStartEventPublished()
+	p.events.Send(context.Background(), &eventsapi.TaskStart{ContainerID: id})
 	return p, func() int32 { return atomic.LoadInt32(&taskExits) }
 }
 
+// newTestExecProcess builds an exec with its own outbox feeding the parent's
+// event sink, as Service.Exec does, so the parent's TaskExit counter sees the
+// exec's exits. Its start has already gone out.
 func newTestExecProcess(parent *initProcess, execID string) *execProcess {
 	ep := &execProcess{
-		process: &process{ns: parent.ns, id: execID},
+		process: &process{ns: parent.ns, id: execID, events: newEventOutbox(parent.ns, parent.events.send)},
 		parent:  parent,
 		execID:  execID,
 	}
 	ep.cond = sync.NewCond(&ep.mu)
-	ep.markStartEventPublished()
+	ep.events.Send(context.Background(), &eventsapi.TaskExecStarted{ExecID: execID})
 	return ep
 }
 

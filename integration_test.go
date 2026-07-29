@@ -135,8 +135,6 @@ func awaitQuiet(timeout, step time.Duration, maxPerStep int64, total func() int6
 	return false
 }
 
-// --- integration helpers ---
-
 // TestLoadExitFromUnitReadsRealExitCode is the load-bearing check for removing
 // the ExecStopPost exit helper: with no helper writing the state file on stop,
 // the reconcile path's only source of the terminal code is systemd's

@@ -129,6 +129,7 @@ func newServiceWithConfig(ctx context.Context, cfg serviceConfig) (*Service, err
 
 	debug := logrus.GetLevel() >= logrus.DebugLevel
 	return &Service{
+		publishCtx:     ctx,
 		conn:           cfg.conn,
 		pinConn:        cfg.pinConn,
 		pinRef:         cfg.pinRef,
@@ -155,8 +156,13 @@ type Service struct {
 	root           string
 	noNewNamespace bool
 	publisher      events.Publisher
-	events         chan eventEnvelope
-	waitEvents     chan struct{}
+	// publishCtx is the shim's lifetime, cancelled when the process is shutting
+	// down. Task events are published against it rather than the caller's context:
+	// a client giving up must not stop containerd hearing about something that
+	// already happened, but the shim itself still has to be able to stop the wait.
+	publishCtx context.Context
+	events     chan eventEnvelope
+	waitEvents chan struct{}
 
 	processes *processManager
 	units     *unitManager

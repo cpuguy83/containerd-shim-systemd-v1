@@ -9,8 +9,8 @@ import (
 
 func TestLoadExitStateUsesRecordedSystemdState(t *testing.T) {
 	t.Run("an exec exit remains available after its systemd unit unloads", func(t *testing.T) {
-		parent := &initProcess{process: &process{id: "task"}}
-		process := &process{id: "exec"}
+		parent := &initProcess{process: &process{id: "task", events: discardEvents()}}
+		process := &process{id: "exec", events: discardEvents()}
 		process.cond = sync.NewCond(&process.mu)
 		exec := &execProcess{
 			process: process,
@@ -36,8 +36,8 @@ func TestLoadExitStateUsesRecordedSystemdState(t *testing.T) {
 	})
 
 	t.Run("a later service exit supersedes an earlier terminal signal", func(t *testing.T) {
-		parent := &initProcess{process: &process{id: "task"}}
-		process := &process{id: "exec"}
+		parent := &initProcess{process: &process{id: "task", events: discardEvents()}}
+		process := &process{id: "exec", events: discardEvents()}
 		process.cond = sync.NewCond(&process.mu)
 		exec := &execProcess{
 			process: process,

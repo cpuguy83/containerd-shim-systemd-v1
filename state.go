@@ -275,7 +275,7 @@ func (p *execProcess) State(ctx context.Context) (*State, error) {
 
 	p.mu.Lock()
 	p.state.CopyTo(&st.State)
-	started := p.started
+	beforeRunning := p.phase < phaseRunning
 	p.mu.Unlock()
 
 	// An exec reports Created until its process actually runs. If the
@@ -284,7 +284,7 @@ func (p *execProcess) State(ctx context.Context) (*State, error) {
 	// report Created rather than a synthetic exit. An exec that was set up but
 	// never started likewise has no recorded state.
 	initDied := st.State.Status == exitedInit && p.parent.ProcessState().Exited()
-	if initDied || (!started && !st.State.Exited()) {
+	if initDied || (beforeRunning && !st.State.Exited()) {
 		st.State.Status = "created"
 		st.State.ExitCode = 0
 		st.State.ExitedAt = timeZero
