@@ -92,6 +92,17 @@ func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState)
 	if c := state["ExecMainStatus"]; c != nil {
 		st.ExitCode = uint32(c.(int32))
 	}
+	// systemd reports a killed main process as the bare signal number, with
+	// ExecMainCode carrying the si_code that says so. containerd reports
+	// termination by signal as 128+signal, so translate here -- otherwise the
+	// same kill is reported as 9 or 137 depending only on whether this read or
+	// the create helper's own wait4 got there first.
+	if code := state["ExecMainCode"]; code != nil && st.ExitCode > 0 {
+		switch code.(int32) {
+		case cldKilled, cldDumped:
+			st.ExitCode += exitSignalOffset
+		}
+	}
 
 	// if ts := state["ExecMainExitTimestamp"]; ts != nil {
 	// st.ExitedAt = time.UnixMicro(int64(ts.(uint64)))
@@ -295,6 +306,16 @@ func (p *execProcess) State(ctx context.Context) (*State, error) {
 
 const (
 	exitedInit = "exited-init"
+
+	// exitSignalOffset matches containerd's own reaper: a process terminated by
+	// a signal is reported as 128+signal, which is what its clients render as
+	// e.g. 137 for SIGKILL.
+	exitSignalOffset = 128
+
+	// cldKilled and cldDumped are the si_code values systemd exposes as
+	// ExecMainCode when the main process was terminated by a signal.
+	cldKilled = 2
+	cldDumped = 3
 )
 
 func toStatus(s string) task.Status {

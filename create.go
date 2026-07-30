@@ -3,17 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -621,36 +621,6 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 	return handlePid()
 }
 
-type waitStatus struct {
-	Status int
-	Err    error
-	Pid    uint32
-}
-
-func waitAny(ws *unix.WaitStatus) (int, error) {
-	for {
-		pid, err := unix.Wait4(-1, ws, unix.WNOHANG, nil)
-		if err != unix.EINTR {
-			return pid, err
-		}
-	}
-}
-
-func reap(ctx context.Context, chChld chan os.Signal, wait chan waitStatus) {
-	for range chChld {
-		var ws unix.WaitStatus
-
-		pid, err := waitAny(&ws)
-		if pid <= 0 {
-			log.G(ctx).WithError(err).WithField("pid", pid).Warn("Error waiting for child")
-			continue
-		}
-
-		wait <- waitStatus{Status: ws.ExitStatus(), Pid: uint32(pid)}
-		return
-	}
-}
-
 func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap bool) (retErr error) {
 	log.G(ctx).Debugf("%s %s", cmdLine[0], cmdLine[1:])
 
@@ -721,14 +691,11 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		log.G(ctx).Debug("No stderr pipe")
 	}
 
-	wait := make(chan waitStatus, 1)
-	chChld := make(chan os.Signal, 1)
-	defer signal.Stop(chChld)
-
-	var readPid uint32
 	if !noReap {
-		signal.Notify(chChld, syscall.SIGCHLD)
-
+		// runc detaches, so it exits 0 as soon as the workload is started and its
+		// own status says nothing about the workload. Become the workload's
+		// subreaper so that if it exits before systemd is told about it, its status
+		// is delivered here rather than to a parent that will discard it.
 		var i uintptr = 1
 		if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, i, 0, 0, 0); err != nil {
 			log.G(ctx).WithError(err).Error("failed to set child subreaper")
@@ -740,47 +707,6 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 	}
 
 	log.G(ctx).Debugf("runc pid: %d", cmd.Process.Pid)
-
-	chPid := make(chan int)
-	go func() {
-		pidFile := os.Getenv("PIDFILE")
-		for {
-			done := func() bool {
-				_, err := os.Stat(pidFile)
-				if err != nil {
-					return false
-				}
-
-				f, err := os.Open(pidFile)
-				if err != nil {
-					log.G(ctx).WithError(err).Debug("Error opening pidfile")
-					return false
-				}
-				defer f.Close()
-
-				pidData, err := ioutil.ReadAll(f)
-				if err != nil {
-					log.G(ctx).WithError(err).Debug("Error reading pidfile")
-					return false
-				}
-
-				pid, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
-				if err != nil {
-					log.G(ctx).WithError(err).Debug("Error parsing pidfile")
-					return false
-				}
-
-				atomic.StoreUint32(&readPid, uint32(pid))
-				chPid <- pid
-				return true
-			}()
-
-			if done {
-				return
-			}
-			<-time.After(100 * time.Millisecond)
-		}
-	}()
 
 	var st pState
 
@@ -820,67 +746,132 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		sdNotify(ctx, notifyErrno(st.ExitCode), notifyStatus(st.Status))
 		return err
 	}
-	if !noReap {
-		// Cmd.Wait is the sole waiter for runc. Start the subreaper only after it
-		// returns so wait4 cannot consume runc's status first.
-		go reap(ctx, chChld, wait)
+
+	// runc detaches, so it has written the pid of the process it left behind
+	// before exiting.
+	pid, err := readPidFile(ctx, os.Getenv("PIDFILE"))
+	if err != nil {
+		return err
 	}
 
-	var notify func()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case status := <-wait:
-		st.ExitCode = uint32(status.Status)
-		st.ExitedAt = time.Now()
-		st.Pid = status.Pid
-		st.Status = "exited"
-		notify = func() { sdNotify(ctx, notifyErrno(st.ExitCode), notifyStatus(st.Status), notifyMainPID(st.Pid)) }
-	case pid := <-chPid:
-		st.Pid = uint32(pid)
-		if !noReap {
-			// At this point we have the pid, so we can turn off the subreaper and call wait4 ourselves
-			// to make sure the process did not exit in the meantime.
-			var i uintptr = 0
-			if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, i, 0, 0, 0); err != nil {
-				log.G(ctx).WithError(err).Error("failed to unset child subreaper")
-			}
-
-			select {
-			case status := <-wait:
-				// Looks like we did reap the process, so use this status.
-				st.Pid = status.Pid
-				st.ExitCode = uint32(status.Status)
-				st.ExitedAt = time.Now()
-				st.Status = "exited"
-				notify = func() { sdNotify(ctx, notifyStatus(st.Status), notifyErrno(st.ExitCode), notifyMainPID(st.Pid)) }
-			default:
-				var status unix.WaitStatus
-				// Double check if the process is still running.
-				p, _ := unix.Wait4(pid, &status, unix.WNOHANG, nil)
-				if p == pid {
-					st.ExitCode = uint32(status.ExitStatus())
-					st.ExitedAt = time.Now()
-					st.Status = "exited"
-					notify = func() { sdNotify(ctx, notifyStatus(st.Status), notifyErrno(st.ExitCode), notifyMainPID(st.Pid)) }
-				} else {
-					st.Status = "running"
-					notify = func() {
-						sdNotify(ctx, daemon.SdNotifyReady, notifyMainPID(st.Pid))
-						log.G(ctx).Debug("Process is up!")
-					}
-				}
-			}
-
+	st = pState{Pid: uint32(pid)}
+	if !noReap {
+		if st, err = workloadState(pid); err != nil {
+			return err
 		}
 	}
 
-	err := writeFile()
-	if notify != nil {
-		notify()
+	if err := writeFile(); err != nil {
+		return err
 	}
-	return err
+	notifyWorkload(ctx, st)
+
+	if st.Status != "running" {
+		return nil
+	}
+
+	// sd_notify is a datagram with no reply, so the handoff above is not yet a
+	// fact. Wait for systemd to have processed it, then look once more: systemd
+	// refuses a main pid that has already become a zombie, so a workload that
+	// died while the handoff was in flight is still this process' to report.
+	if err := sdNotifyBarrier(ctx); err != nil {
+		// Without the barrier there is no ordering guarantee, but the re-check
+		// below is what actually recovers a workload that died during the
+		// handoff. Skipping it because the barrier failed would leave that exit
+		// reported by nobody, which is the failure this whole path exists for.
+		log.G(ctx).WithError(err).Warn("Error waiting for systemd to take the main pid; re-checking anyway")
+	}
+	if st, err = workloadState(pid); err != nil {
+		log.G(ctx).WithError(err).Warn("Error re-checking the workload after handoff")
+		return nil
+	}
+	if st.Status == "running" {
+		// systemd has the pid and the pid is alive, so systemd owns its exit.
+		return nil
+	}
+	if err := writeFile(); err != nil {
+		return err
+	}
+	notifyWorkload(ctx, st)
+	return nil
+}
+
+// pidFileTimeout bounds the wait for runc's pid file. runc writes it before it
+// exits, so this only covers a write that has not landed yet.
+const pidFileTimeout = 5 * time.Second
+
+// readPidFile reads the pid runc recorded for the process it left behind.
+func readPidFile(ctx context.Context, path string) (int, error) {
+	deadline := time.Now().Add(pidFileTimeout)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			var pid int
+			if pid, err = strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
+				return pid, nil
+			}
+			err = fmt.Errorf("invalid pid in %s: %w", path, err)
+		}
+
+		if time.Now().After(deadline) {
+			return 0, err
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// workloadState reports the state of the process runc left behind: whether it
+// has already exited, and with what status.
+//
+// This is the only wait4 this process makes. runc always exits 0 once it has
+// detached, so its status says nothing about the workload; the workload was
+// reparented here when runc exited -- this process is its subreaper -- so while
+// it is a child here its exit status is delivered here and nowhere else.
+//
+// A workload that is still running belongs to systemd instead, and must not be
+// waited on again: systemd inherits it when this process exits and reports its
+// exit status, which a later wait4 here would consume and throw away.
+func workloadState(pid int) (pState, error) {
+	var ws unix.WaitStatus
+	reaped, err := unix.Wait4(pid, &ws, unix.WNOHANG, nil)
+	if err != nil {
+		// ECHILD included: the workload is not this process' child, so nothing
+		// here can say whether it ran or what it returned, and reporting that as
+		// an exit status of 0 is the failure worth avoiding.
+		return pState{}, fmt.Errorf("error checking on process %d: %w", pid, err)
+	}
+	if reaped != pid {
+		return pState{Pid: uint32(pid), Status: "running"}, nil
+	}
+
+	st := pState{
+		Pid:      uint32(pid),
+		ExitCode: uint32(ws.ExitStatus()),
+		ExitedAt: time.Now(),
+		Status:   "exited",
+	}
+	if ws.Signaled() {
+		// A killed workload has no exit code. containerd reports termination by
+		// signal as 128+signal (see its reaper's exitStatus), which is what its
+		// clients render as e.g. 137 for SIGKILL, so report the same here rather
+		// than the bare signal number systemd puts in ExecMainStatus.
+		st.ExitCode = uint32(exitSignalOffset + int(ws.Signal()))
+	}
+	return st, nil
+}
+
+func notifyWorkload(ctx context.Context, st pState) {
+	switch st.Status {
+	case "exited":
+		sdNotify(ctx, notifyStatus(st.Status), notifyErrno(st.ExitCode), notifyMainPID(st.Pid))
+	case "running":
+		sdNotify(ctx, daemon.SdNotifyReady, notifyMainPID(st.Pid))
+		log.G(ctx).Debug("Process is up!")
+	}
 }
 
 func shouldKillAllOnExit(spec *specs.Spec) bool {
@@ -910,6 +901,59 @@ func sdNotify(ctx context.Context, status ...string) {
 	if _, err := daemon.SdNotify(false, strings.Join(status, "\n")); err != nil {
 		log.G(ctx).WithError(err).Error("failed to notify systemd")
 	}
+}
+
+// notifyBarrierTimeout bounds the wait for systemd to catch up on this process'
+// notifications. It only has to cover systemd getting round to a queued
+// datagram; a manager too busy for that is a manager whose answer would be stale
+// anyway.
+const notifyBarrierTimeout = 5 * time.Second
+
+// sdNotifyBarrier blocks until systemd has processed every notification this
+// process has sent, implementing sd_notify(3)'s BARRIER=1.
+//
+// A notification is a datagram with no reply, so sending one says nothing about
+// whether systemd has acted on it. systemd holds the pipe end passed here until
+// it has drained everything queued ahead of it, so reading EOF means the earlier
+// notifications have been handled.
+func sdNotifyBarrier(ctx context.Context) error {
+	addr := os.Getenv("NOTIFY_SOCKET")
+	if addr == "" {
+		return nil
+	}
+
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("error opening notify socket: %w", err)
+	}
+	defer unix.Close(fd)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	// A leading '@' is how systemd advertises an abstract socket, which is what
+	// SockaddrUnix takes it to mean too.
+	err = unix.Sendmsg(fd, []byte("BARRIER=1"), unix.UnixRights(int(w.Fd())), &unix.SockaddrUnix{Name: addr}, 0)
+	// Only systemd's copy of the write end may keep the pipe open.
+	w.Close()
+	if err != nil {
+		return fmt.Errorf("error sending notify barrier: %w", err)
+	}
+
+	deadline := time.Now().Add(notifyBarrierTimeout)
+	if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
+		deadline = end
+	}
+	if err := r.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	if _, err := r.Read(make([]byte, 1)); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("error waiting on notify barrier: %w", err)
+	}
+	return nil
 }
 
 type cgMode cgroups.CGMode
