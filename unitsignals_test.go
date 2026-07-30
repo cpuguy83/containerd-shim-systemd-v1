@@ -7,6 +7,7 @@ import (
 
 	systemd "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
+	"golang.org/x/sys/unix"
 )
 
 func TestDecodeSystemdPropertiesChanged(t *testing.T) {
@@ -82,6 +83,7 @@ func TestServiceExitState(t *testing.T) {
 		changed := map[string]dbus.Variant{
 			"ExecMainPID":           dbus.MakeVariant(uint32(42)),
 			"ExecMainStatus":        dbus.MakeVariant(int32(17)),
+			"ExecMainCode":          dbus.MakeVariant(int32(cldExited)),
 			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(exitedAt.UnixMicro())),
 		}
 
@@ -94,10 +96,45 @@ func TestServiceExitState(t *testing.T) {
 		}
 	})
 
+	// The reactor is the shim's primary source of exits, so it has to translate
+	// a signal the same way a property read does -- otherwise the same kill is
+	// reported as 9 or 137 depending only on which of them saw it first.
+	t.Run("a signaled service reports 128 plus the signal", func(t *testing.T) {
+		exitedAt := time.Date(2026, time.July, 16, 12, 0, 0, 123000000, time.Local)
+		changed := map[string]dbus.Variant{
+			"ExecMainPID":           dbus.MakeVariant(uint32(42)),
+			"ExecMainStatus":        dbus.MakeVariant(int32(unix.SIGKILL)),
+			"ExecMainCode":          dbus.MakeVariant(int32(cldKilled)),
+			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(exitedAt.UnixMicro())),
+		}
+
+		state, ok := serviceExitState(changed)
+		if !ok {
+			t.Fatal("terminal service properties were not recognized")
+		}
+		if want := uint32(exitSignalOffset + int(unix.SIGKILL)); state.ExitCode != want {
+			t.Fatalf("state = %s, want exit %d", state, want)
+		}
+	})
+
+	t.Run("service properties without the exit code's si_code are left to the property read", func(t *testing.T) {
+		exitedAt := time.Date(2026, time.July, 16, 12, 0, 0, 123000000, time.Local)
+		changed := map[string]dbus.Variant{
+			"ExecMainPID":           dbus.MakeVariant(uint32(42)),
+			"ExecMainStatus":        dbus.MakeVariant(int32(17)),
+			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(exitedAt.UnixMicro())),
+		}
+
+		if _, ok := serviceExitState(changed); ok {
+			t.Fatal("an exit was recorded without the si_code needed to translate it")
+		}
+	})
+
 	t.Run("service properties without an exit timestamp are not terminal", func(t *testing.T) {
 		changed := map[string]dbus.Variant{
 			"ExecMainPID":           dbus.MakeVariant(uint32(42)),
 			"ExecMainStatus":        dbus.MakeVariant(int32(0)),
+			"ExecMainCode":          dbus.MakeVariant(int32(cldExited)),
 			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(0)),
 		}
 
@@ -110,6 +147,7 @@ func TestServiceExitState(t *testing.T) {
 		changed := map[string]dbus.Variant{
 			"ExecMainPID":           dbus.MakeVariant(uint32(42)),
 			"ExecMainStatus":        dbus.MakeVariant(int32(-1)),
+			"ExecMainCode":          dbus.MakeVariant(int32(cldExited)),
 			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(time.Now().UnixMicro())),
 		}
 
@@ -210,6 +248,7 @@ func TestSignalIntakeDoesNotAllocate(t *testing.T) {
 		serviceSignal(systemd.PathBusEscape(ours), map[string]dbus.Variant{
 			"ExecMainPID":           dbus.MakeVariant(uint32(42)),
 			"ExecMainStatus":        dbus.MakeVariant(int32(3)),
+			"ExecMainCode":          dbus.MakeVariant(int32(cldExited)),
 			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(time.Now().UnixMicro())),
 		}),
 		unitSignal(systemd.PathBusEscape(ours), failed),

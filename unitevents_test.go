@@ -721,6 +721,7 @@ func serviceExitUpdate(unit string, pid, exitCode uint32, exitedAt time.Time) un
 		changed: map[string]dbus.Variant{
 			"ExecMainPID":           dbus.MakeVariant(pid),
 			"ExecMainStatus":        dbus.MakeVariant(int32(exitCode)),
+			"ExecMainCode":          dbus.MakeVariant(int32(cldExited)),
 			"ExecMainExitTimestamp": dbus.MakeVariant(uint64(exitedAt.UnixMicro())),
 		},
 	}
