@@ -136,6 +136,19 @@ func serviceExitState(changed map[string]dbus.Variant) (pState, bool) {
 		return pState{}, false
 	}
 
+	// systemd emits ExecMainCode alongside ExecMainStatus, and it is what tells
+	// a signal number apart from an exit code. Without it the exit cannot be
+	// translated the way containerd expects, so leave the signal to the Unit
+	// ActiveState path, whose reconcile reads every property and gets it right.
+	codeValue, ok := changed["ExecMainCode"]
+	if !ok {
+		return pState{}, false
+	}
+	code, ok := codeValue.Value().(int32)
+	if !ok {
+		return pState{}, false
+	}
+
 	exitValue, ok := changed["ExecMainExitTimestamp"]
 	if !ok {
 		return pState{}, false
@@ -147,7 +160,7 @@ func serviceExitState(changed map[string]dbus.Variant) (pState, bool) {
 
 	return pState{
 		Pid:      pid,
-		ExitCode: uint32(status),
+		ExitCode: exitStatusFor(code, status),
 		ExitedAt: time.UnixMicro(int64(exitedAt)),
 		Status:   "exited",
 	}, true

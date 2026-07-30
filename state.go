@@ -89,19 +89,14 @@ func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState)
 	if p := state["ExecMainPID"]; p != nil {
 		st.Pid = uint32(p.(uint32))
 	}
-	if c := state["ExecMainStatus"]; c != nil {
-		st.ExitCode = uint32(c.(int32))
-	}
 	// systemd reports a killed main process as the bare signal number, with
-	// ExecMainCode carrying the si_code that says so. containerd reports
-	// termination by signal as 128+signal, so translate here -- otherwise the
-	// same kill is reported as 9 or 137 depending only on whether this read or
-	// the create helper's own wait4 got there first.
-	if code := state["ExecMainCode"]; code != nil && st.ExitCode > 0 {
-		switch code.(int32) {
-		case cldKilled, cldDumped:
-			st.ExitCode += exitSignalOffset
+	// ExecMainCode carrying the si_code that says so.
+	if c := state["ExecMainStatus"]; c != nil {
+		var mainCode int32
+		if v := state["ExecMainCode"]; v != nil {
+			mainCode = v.(int32)
 		}
+		st.ExitCode = exitStatusFor(mainCode, c.(int32))
 	}
 
 	// if ts := state["ExecMainExitTimestamp"]; ts != nil {
@@ -312,11 +307,32 @@ const (
 	// e.g. 137 for SIGKILL.
 	exitSignalOffset = 128
 
-	// cldKilled and cldDumped are the si_code values systemd exposes as
-	// ExecMainCode when the main process was terminated by a signal.
+	// cldExited, cldKilled and cldDumped are the si_code values systemd exposes
+	// as ExecMainCode: whether the main process returned an exit code or was
+	// terminated by a signal.
+	cldExited = 1
 	cldKilled = 2
 	cldDumped = 3
 )
+
+// exitStatusFor turns a systemd (ExecMainCode, ExecMainStatus) pair into the
+// exit status containerd expects. systemd reports a process terminated by a
+// signal as the bare signal number, distinguished only by the si_code in
+// ExecMainCode; containerd reports it as 128+signal.
+//
+// Both places the shim learns an exit from systemd -- the reactor's signal
+// decoder and the GetAll fallback -- go through this, so the same kill cannot
+// come out as 9 or 137 depending on which of them saw it first.
+func exitStatusFor(mainCode, mainStatus int32) uint32 {
+	if mainStatus <= 0 {
+		return 0
+	}
+	switch mainCode {
+	case cldKilled, cldDumped:
+		return uint32(mainStatus) + exitSignalOffset
+	}
+	return uint32(mainStatus)
+}
 
 func toStatus(s string) task.Status {
 	switch s {
