@@ -16,6 +16,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -523,24 +524,30 @@ func waitForRuncStubFile(path string, timeout time.Duration) error {
 	return fmt.Errorf("timed out waiting for %s", path)
 }
 
+// waitForRuncStubProcessExit blocks until pid is reapable, without reaping it --
+// the exited workload is left for whoever is meant to collect its status.
+//
+// It asks waitid rather than polling /proc/<pid>/stat for state Z, because those
+// are different questions: the child is this binary re-executed and so is
+// multi-threaded, and its main thread is Z while the rest of the thread group is
+// still exiting, which is a window where wait4 will not yet reap it.
 func waitForRuncStubProcessExit(pid int, timeout time.Duration) error {
-	path := filepath.Join("/proc", strconv.Itoa(pid), "stat")
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(path)
-		if err != nil {
+	for {
+		var info unix.Siginfo
+		if err := unix.Waitid(unix.P_PID, pid, &info, unix.WEXITED|unix.WNOWAIT|unix.WNOHANG, nil); err != nil {
 			return err
 		}
-		endCommand := strings.LastIndexByte(string(data), ')')
-		if endCommand >= 0 {
-			fields := strings.Fields(string(data[endCommand+1:]))
-			if len(fields) > 0 && fields[0] == "Z" {
-				return nil
-			}
+		// With WNOHANG a child that is not yet reapable leaves the siginfo
+		// zeroed rather than reporting an error.
+		if info.Signo != 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for process %d to exit", pid)
 		}
 		time.Sleep(time.Millisecond)
 	}
-	return fmt.Errorf("timed out waiting for process %d to exit", pid)
 }
 
 func setRuncStubExitCode(cfg *runcStubConfig, value string) error {
