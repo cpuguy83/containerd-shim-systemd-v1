@@ -147,9 +147,29 @@ func startTestChild(t *testing.T, cfg runcStubConfig) int {
 	return pid
 }
 
+// waitForTestChildExit blocks until the child is reapable, without reaping it --
+// that is the job of the code under test. A zombie main thread is not enough:
+// the helper is this test binary re-executed, so it is multi-threaded, and
+// /proc/<pid>/stat reports Z while the rest of the thread group is still exiting
+// even though wait4 will not yet reap it. WNOWAIT asks the question directly.
 func waitForTestChildExit(t *testing.T, pid int) {
 	t.Helper()
-	if err := waitForRuncStubProcessExit(pid, 30*time.Second); err != nil {
-		t.Fatalf("wait for child %d to exit: %v", pid, err)
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var info unix.Siginfo
+		err := unix.Waitid(unix.P_PID, pid, &info, unix.WEXITED|unix.WNOWAIT|unix.WNOHANG, nil)
+		if err != nil {
+			t.Fatalf("wait for child %d to exit: %v", pid, err)
+		}
+		// With WNOHANG a child that is not yet reapable leaves the siginfo
+		// zeroed rather than reporting an error.
+		if info.Signo != 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for child %d to become reapable", pid)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
