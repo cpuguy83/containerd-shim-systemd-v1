@@ -61,12 +61,14 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 		}
 	}
 
-	if err := p.LoadState(ctx); err != nil {
-		log.G(ctx).WithError(err).Warning("Error loading process state")
-	}
-	if !p.ProcessState().Exited() && p.Pid() > 0 {
-		if err := p.LoadExitState(ctx); err != nil {
-			log.G(ctx).WithError(err).Warning("Error loading process exit state")
+	// A read here is only worth making when the shim has reason to doubt its own
+	// state. While the signal stream is up it does not: no unit event can have
+	// been missed, so an exit that has happened is already applied (and
+	// waitForExit returns without parking) or will arrive and wake the waiter.
+	// With the stream down, nothing will deliver it, so look once on the way in.
+	if !p.ProcessState().Exited() && !s.reactorUp.Load() && !p.LoadRecordedExitState(ctx) {
+		if err := p.LoadState(ctx); err != nil {
+			log.G(ctx).WithError(err).Warning("Error loading process state")
 		}
 	}
 
@@ -76,10 +78,12 @@ func (s *Service) Wait(ctx context.Context, r *taskapi.WaitRequest) (retResp *ta
 	}
 	log.G(ctx).Debugf("%+v", st)
 
-	if !st.ExitedAt.After(timeZero) {
-		getUnitState(ctx, s.conn, p.Name(), &st)
-	}
-
+	// Every terminal state carries an exit time by construction:
+	// applyUnitProperties stamps one for any state it reports as exited, and the
+	// synthetic exits the shim records set it explicitly. So there is nothing to
+	// repair here -- if this fires, an exit reached the process by a path that
+	// skipped that, which is a bug rather than something to paper over with a
+	// read.
 	if !st.ExitedAt.After(timeZero) {
 		log.G(ctx).Error("No exit time set")
 	}

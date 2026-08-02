@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -127,10 +126,14 @@ type Process interface {
 	// identifier the event reactor matches incoming signals against.
 	PathName() string
 	LoadState(context.Context) error
-	// LoadExitState refreshes the process from terminal systemd properties
-	// recorded by the signal stream, falling back to GetAll when necessary.
-	LoadExitState(context.Context) error
+	// LoadRecordedExitState applies the terminal state the reactor decoded from
+	// the unit's signal, and reports whether there was one. It does no I/O, so
+	// it is what a reconcile asks before it considers reading systemd.
+	LoadRecordedExitState(context.Context) bool
 	RecordSystemdExitState(pState)
+	// RecordHelperExitState records the create re-exec's own report of an exit,
+	// which outranks anything systemd publishes for the unit afterwards.
+	RecordHelperExitState(pState)
 	SetState(context.Context, pState) pState
 	ProcessState() pState
 	LogWriter() io.Writer
@@ -138,8 +141,7 @@ type Process interface {
 
 type CreateOptions struct {
 	// Native config
-	LogMode        string
-	SdNotifyEnable bool
+	LogMode string
 
 	// From runc types
 	BinaryName          string
@@ -237,6 +239,10 @@ type process struct {
 
 	systemdExitState    pState
 	hasSystemdExitState bool
+	// helperExitState records that systemdExitState came from the create
+	// re-exec rather than from systemd's own account of the unit, which makes
+	// it the last word on the workload's exit.
+	helperExitState bool
 
 	shimCgroup string
 }
@@ -303,12 +309,32 @@ func (p *process) abortStart(ctx context.Context) {
 	}
 }
 
+// RecordSystemdExitState records terminal properties systemd published for the
+// unit. A later update refines an earlier one.
+//
+// Nothing systemd publishes can replace the create re-exec's own report. Once
+// the re-exec has reported an exit systemd never witnessed, the re-exec is
+// still the unit's main process, so the ExecMain properties systemd goes on to
+// publish describe the re-exec's exit rather than the workload's.
 func (p *process) RecordSystemdExitState(state pState) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.helperExitState {
+		return
+	}
 	if !p.hasSystemdExitState || state.ExitedAt.After(p.systemdExitState.ExitedAt) {
 		p.systemdExitState = state
 		p.hasSystemdExitState = true
 	}
+}
+
+// RecordHelperExitState records the create re-exec's report of an exit systemd
+// never witnessed, which is the only account of that exit there is.
+func (p *process) RecordHelperExitState(state pState) {
+	p.mu.Lock()
+	p.systemdExitState = state
+	p.hasSystemdExitState = true
+	p.helperExitState = true
 	p.mu.Unlock()
 }
 
@@ -316,6 +342,7 @@ func (p *process) clearRecordedSystemdExitState() {
 	p.mu.Lock()
 	p.systemdExitState.Reset()
 	p.hasSystemdExitState = false
+	p.helperExitState = false
 	p.mu.Unlock()
 }
 
@@ -553,21 +580,29 @@ func (p *initProcess) SetState(ctx context.Context, state pState) pState {
 	u := p.applyState(ctx, state)
 	st := u.state
 	if u.justExited() {
-		if st.Status != exitedInit && u.wasRunning() && p.killAllOnExit {
+		if u.wasRunning() && p.killAllOnExit {
 			if err := p.runc.Kill(ctx, p.id, int(syscall.SIGKILL), &runc.KillOpts{All: true}); err != nil {
 				log.G(ctx).WithError(err).WithField("id", p.id).Error("failed to kill init's children")
 			}
 		}
 		log.G(ctx).Debugf("EXITED: %s %s", p.Name(), st)
 		p.execs.Each(func(exec Process) {
-			if err := exec.LoadState(ctx); err != nil {
-				log.G(ctx).WithError(err).WithField("exec", p.Name()).Info("Could not load exec state")
-			}
-			// An exec that never started has no process to reap. Leave it in its
-			// Created state so callers see it never ran, rather than synthesizing
-			// a non-zero exit for a process that was only ever set up.
-			if ep, ok := exec.(*execProcess); ok && ep.currentPhase() < phaseRunning {
-				return
+			if ep, ok := exec.(*execProcess); ok {
+				// An exec that never started has no process to reap. Leave it in
+				// its Created state so callers see it never ran, rather than
+				// synthesizing a non-zero exit for a process that was only ever
+				// set up.
+				if ep.currentPhase() < phaseRunning {
+					return
+				}
+				// The container's exit takes every exec with it, but an exec that
+				// exited on its own has a real exit code worth keeping. Take one
+				// the reactor has already recorded; do not read systemd per exec
+				// here, because those units are dying too and each has its own
+				// reconcile queued to do exactly that.
+				if st, ok := ep.loadRecordedSystemdExitState(); ok {
+					ep.SetState(ctx, st)
+				}
 			}
 			if !exec.ProcessState().Exited() {
 				exec.SetState(ctx, pState{ExitedAt: time.Now(), ExitCode: 255})
@@ -675,25 +710,18 @@ func (p *execProcess) LogWriter() io.Writer {
 }
 
 func (p *execProcess) getPid(context.Context) (uint32, error) {
-	data, err := os.ReadFile(p.pidFile())
+	pid, err := parsePidFile(p.pidFile())
 	if err != nil {
-		var state pState
-		if stateErr := p.readExitState(&state); stateErr == nil && state.Pid > 0 &&
-			(state.Status == "running" || state.Status == "exited") {
-			// systemd can remove PIDFile before Start observes it. A running or
-			// exited helper state proves runc created the workload.
+		// systemd removes PIDFile once the unit is dead, which a workload that
+		// exits immediately reaches before Start observes it. The state loaded
+		// from systemd still names the workload -- except for an exited-init,
+		// where runc never produced one and a pid must not be invented.
+		if state := p.ProcessState(); state.Pid > 0 && state.Status != exitedInit {
 			return state.Pid, nil
 		}
 		return 0, fmt.Errorf("read exec pid file: %w", err)
 	}
-	pid, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 32)
-	if err != nil {
-		return 0, fmt.Errorf("parse exec pid: %w", err)
-	}
-	if pid == 0 {
-		return 0, fmt.Errorf("exec pid file contains zero")
-	}
-	return uint32(pid), nil
+	return pid, nil
 }
 
 // finishStart mirrors initProcess.finishStart for an exec process.

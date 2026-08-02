@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -104,12 +103,12 @@ func TestRuncCommandArguments(t *testing.T) {
 }
 
 func TestExecProcessPIDFallback(t *testing.T) {
-	for _, status := range []string{"running", "exited"} {
-		t.Run("a "+status+" helper state supplies the workload PID after systemd removes PIDFile", func(t *testing.T) {
+	for _, status := range []string{"running", "exited", "failed"} {
+		t.Run("a "+status+" state supplies the workload PID after systemd removes PIDFile", func(t *testing.T) {
 			parent, _ := newTestInitProcess("container")
 			parent.Bundle = t.TempDir()
 			exec := newTestExecProcess(parent, "exec")
-			writeTestProcessState(t, exec.exitStatePath(), pState{Pid: 42, Status: status})
+			exec.SetState(context.Background(), pState{Pid: 42, Status: status})
 
 			pid, err := exec.getPid(context.Background())
 			if err != nil {
@@ -125,7 +124,17 @@ func TestExecProcessPIDFallback(t *testing.T) {
 		parent, _ := newTestInitProcess("container")
 		parent.Bundle = t.TempDir()
 		exec := newTestExecProcess(parent, "exec")
-		writeTestProcessState(t, exec.exitStatePath(), pState{Pid: 42, Status: exitedInit})
+		exec.SetState(context.Background(), pState{Pid: 42, Status: exitedInit})
+
+		if _, err := exec.getPid(context.Background()); err == nil {
+			t.Fatal("expected missing workload PID to fail")
+		}
+	})
+
+	t.Run("a process that never ran reports no PID", func(t *testing.T) {
+		parent, _ := newTestInitProcess("container")
+		parent.Bundle = t.TempDir()
+		exec := newTestExecProcess(parent, "exec")
 
 		if _, err := exec.getPid(context.Background()); err == nil {
 			t.Fatal("expected missing workload PID to fail")
@@ -395,20 +404,6 @@ func newTestExecProcess(parent *initProcess, execID string) *execProcess {
 	ep.cond = sync.NewCond(&ep.mu)
 	ep.events.Send(context.Background(), &eventsapi.TaskExecStarted{ExecID: execID})
 	return ep
-}
-
-func writeTestProcessState(t *testing.T, path string, state pState) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		t.Fatalf("create process state directory: %v", err)
-	}
-	data, err := json.Marshal(state)
-	if err != nil {
-		t.Fatalf("marshal process state: %v", err)
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatalf("write process state: %v", err)
-	}
 }
 
 func newRuncStub(t *testing.T) string {

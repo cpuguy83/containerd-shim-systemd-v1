@@ -84,7 +84,9 @@ func (s *Service) runEventReactor(ctx context.Context) {
 		// that exited during the gap.
 		r.resync()
 
+		s.reactorUp.Store(true)
 		r.consume(runCtx, unitUpdates(runCtx, sigs))
+		s.reactorUp.Store(false)
 
 		cancel()
 		conn.Close()
@@ -218,6 +220,14 @@ func (r *eventReactor) consume(ctx context.Context, updates iter.Seq[unitUpdate]
 func enqueueIfExit(q *unitWorkQueue, units processLookup, u unitUpdate) {
 	switch u.interfaceName {
 	case serviceInterface:
+		if state, ok := helperExitReport(u.changed); ok {
+			p := units.GetByPath(u.pathBase)
+			if p == nil || p.ProcessState().Exited() {
+				return
+			}
+			p.RecordHelperExitState(state)
+			break
+		}
 		state, ok := serviceExitState(u.changed)
 		if !ok {
 			return
@@ -275,20 +285,20 @@ func reconcileWorker(ctx context.Context, q *unitWorkQueue, units processLookup)
 }
 
 // reconcileUnit brings the shim's cached state for a unit up to date with
-// systemd. It is level-driven: rather than acting on a specific event it reads
-// current state, so coalesced or repeated events converge on the same result and
-// SetState emits at most one TaskExit. It returns an error only when the state
-// read itself failed, so the caller can retry; an untracked or already-exited
+// systemd. It is level-driven: rather than acting on a specific event it
+// resolves current state, so coalesced or repeated events converge on the same
+// result and SetState emits at most one TaskExit. It returns an error only when
+// a systemd read failed, so the caller can retry; an untracked or already-exited
 // unit is nothing to do and returns nil.
 //
 // pathBase is the unit's escaped object-path base, resolved through the reactor's
-// index; the systemd read inside LoadState uses the process's own name, so the
-// key is only a lookup handle here.
+// index; the systemd read uses the process's own name, so the key is only a
+// lookup handle here.
 //
-// LoadState reads the persisted exit file first. If it only contains a running
-// state, LoadExitState consumes terminal properties retained from the Service
-// signal. A targeted GetAll on our own unit is the fallback for a Unit exit
-// signal that arrived without a terminal Service update.
+// The reactor's own recording comes first. The signal that enqueued this unit
+// already carried its terminal state, so reading systemd before consulting that
+// spends a property read to compute an answer the shim was handed for free --
+// and then, because the read resolves the exit on its own, never looks at it.
 func reconcileUnit(ctx context.Context, units processLookup, pathBase string) error {
 	p := units.GetByPath(pathBase)
 	if p == nil {
@@ -303,18 +313,23 @@ func reconcileUnit(ctx context.Context, units processLookup, pathBase string) er
 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("unit", p.Name()))
 	ctx = WithShimLog(ctx, p.LogWriter())
 
+	if p.LoadRecordedExitState(ctx) {
+		log.G(ctx).WithField("state", p.ProcessState()).Debug("Reconciled unit from the recorded exit")
+		return nil
+	}
+
+	// Nothing recorded: the exit arrived as a Unit ActiveState transition with
+	// no terminal Service update, or this is the leading pre-start event, or a
+	// reconnect resync is sweeping units whose signals were missed entirely.
+	// Only a read can tell those apart, and the resync case is the one the unit
+	// reference exists to keep recoverable.
 	if err := p.LoadState(ctx); err != nil {
 		return err
 	}
-
-	// Create normally persists only a running state. When it is not terminal for
-	// a started process, consume the Service signal's terminal state or fall back
-	// to the still-loaded unit. A Pid of 0 means the unit never started (the
-	// leading pre-start inactive/dead event), so there is nothing to read.
-	if !p.ProcessState().Exited() && p.Pid() > 0 {
-		if err := p.LoadExitState(ctx); err != nil {
-			return err
-		}
+	// Count a fallback only when the read actually recovered a terminal exit the
+	// reactor missed; a pre-start / non-terminal read is not a reactor miss.
+	if p.ProcessState().Exited() {
+		countState(metricGetAllFallbacks)
 	}
 	log.G(ctx).WithField("state", p.ProcessState()).Debug("Reconciled unit after exit event")
 	return nil

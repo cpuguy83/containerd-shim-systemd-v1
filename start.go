@@ -120,14 +120,14 @@ func (p *initProcess) startProperties(rcmd []string) ([]systemd.Property, error)
 		"STDOUT_FIFO=" + p.Stdout,
 		"STDERR_FIFO=" + p.Stderr,
 		"UNIT_NAME=" + p.Name(),
-		"EXIT_STATE_PATH=" + p.exitStatePath(),
 	}
 	if p.shimCgroup != "" {
 		env = append(env, "SHIM_CGROUP="+p.shimCgroup)
 	}
 
 	props := []systemd.Property{
-		systemd.PropType(p.unitType()),
+		systemd.PropType("notify"),
+		propNotifyAccess(),
 		systemd.PropRemainAfterExit(false),
 		{Name: "WorkingDirectory", Value: dbus.MakeVariant(p.Bundle)},
 		{Name: "PIDFile", Value: dbus.MakeVariant(p.pidFile())},
@@ -174,7 +174,6 @@ func (p *execProcess) startProperties() ([]systemd.Property, error) {
 		"STDOUT_FIFO=" + p.Stdout,
 		"STDERR_FIFO=" + p.Stderr,
 		"UNIT_NAME=" + p.Name(),
-		"EXIT_STATE_PATH=" + p.exitStatePath(),
 	}
 	if p.shimCgroup != "" {
 		env = append(env, "SHIM_CGROUP="+p.shimCgroup)
@@ -182,6 +181,7 @@ func (p *execProcess) startProperties() ([]systemd.Property, error) {
 
 	props := []systemd.Property{
 		systemd.PropType("notify"),
+		propNotifyAccess(),
 		systemd.PropRemainAfterExit(false),
 		{Name: "WorkingDirectory", Value: dbus.MakeVariant(p.parent.Bundle)},
 		{Name: "PIDFile", Value: dbus.MakeVariant(p.pidFile())},
@@ -215,11 +215,21 @@ func (p *execProcess) startProperties() ([]systemd.Property, error) {
 	return props, nil
 }
 
-func (p *process) unitType() string {
-	if p.opts.SdNotifyEnable {
-		return "notify"
-	}
-	return "forking"
+// propNotifyAccess allows the create re-exec to keep reporting after it has
+// handed the main pid over.
+//
+// `Type=notify` implies `NotifyAccess=main`, which is not enough. Once systemd
+// accepts `MAINPID=`, the workload is the main process and the re-exec's
+// notifications are refused -- including the one that matters most, the report
+// of a workload that died while the handoff was in flight. systemd has no
+// record of that exit either, because the re-exec is the subreaper and reaped
+// it, so refusing the report loses the exit status outright.
+//
+// The workload cannot abuse the wider access: NOTIFY_SOCKET is a filesystem
+// socket that is not in the container's mount namespace, and the container's
+// environment comes from the OCI spec rather than the unit.
+func propNotifyAccess() systemd.Property {
+	return systemd.Property{Name: "NotifyAccess", Value: dbus.MakeVariant("all")}
 }
 
 // abandonStartedUnit tears down a unit whose process was deleted while it was
@@ -290,18 +300,18 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		if !p.ProcessState().Exited() {
 			log.G(ctx).Debug("runc start failed but process is still running, sending sigkill")
 			p.systemd.KillUnitContext(ctx, p.Name(), int32(unix.SIGKILL))
-			if err := p.LoadState(ctx); err != nil {
-				log.G(ctx).WithError(err).Debug("Error loading process state")
-			}
 
-			if !p.ProcessState().Exited() {
-				p.SetState(ctx, pState{
-					Pid:      p.Pid(),
-					ExitCode: 255,
-					ExitedAt: time.Now(),
-					Status:   "failed",
-				})
-			}
+			// The workload never ran, so the exit of the process the shim just
+			// killed is the shim's own doing rather than the task's result.
+			// Reading it back would make a failed start report 137 or 255
+			// depending only on whether the kill landed before the read, so
+			// record the failure instead.
+			p.SetState(ctx, pState{
+				Pid:      p.Pid(),
+				ExitCode: 255,
+				ExitedAt: time.Now(),
+				Status:   "failed",
+			})
 		}
 		p.cond.Broadcast()
 
@@ -323,18 +333,10 @@ func (p *initProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		return 0, ret
 	}
 
-	for p.Pid() == 0 && !p.ProcessState().Exited() {
-		select {
-		case <-ctx.Done():
-		default:
-		}
-
-		if err := p.LoadState(ctx); err != nil {
-			log.G(ctx).WithError(err).Warn("Error loading process state")
-		}
+	if pid = p.Pid(); pid == 0 {
+		return 0, fmt.Errorf("could not get container pid: %s", p.ProcessState())
 	}
 
-	pid = p.Pid()
 	return pid, nil
 }
 
@@ -496,22 +498,32 @@ func (p *execProcess) Start(ctx context.Context) (pid uint32, retErr error) {
 		}
 	}
 
-	p.LoadState(ctx)
-
-	if p.ProcessState().Status == exitedInit {
-		ret := fmt.Errorf("error starting exec process")
-		if p.runc.Debug {
-			debug, err := os.ReadFile(p.runc.Log)
-			if err == nil {
-				ret = fmt.Errorf("%w:\nrunc debug:\n%s", ret, string(debug))
-			}
-		}
-		return 0, ret
-	}
-
+	// No state read on the way in. The unit is Type=notify, so "done" means the
+	// create re-exec sent READY=1, which it only does once runc has left a
+	// workload behind -- and that means a pid file. Its absence, not a property
+	// read, is what says runc failed.
 	pid, err = p.getPid(ctx)
 	if err != nil {
-		return 0, err
+		// runc left no pid, so ask systemd why. An exited-init is runc's own
+		// failure; anything else means the workload ran and exited fast enough
+		// that systemd unlinked PIDFile, in which case the state just loaded
+		// still names it.
+		if lerr := p.LoadState(ctx); lerr != nil {
+			log.G(ctx).WithError(lerr).Warn("Error loading process state")
+		}
+		if p.ProcessState().Status == exitedInit {
+			ret := fmt.Errorf("error starting exec process")
+			if p.runc.Debug {
+				debug, derr := os.ReadFile(p.runc.Log)
+				if derr == nil {
+					ret = fmt.Errorf("%w:\nrunc debug:\n%s", ret, string(debug))
+				}
+			}
+			return 0, ret
+		}
+		if pid, err = p.getPid(ctx); err != nil {
+			return 0, err
+		}
 	}
 
 	p.mu.Lock()

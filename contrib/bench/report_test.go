@@ -119,8 +119,8 @@ func syntheticReport() Report {
 	mem := func(shim uint64) map[string]uint64 {
 		return map[string]uint64{"shim-systemd": shim, "tty-helper": 0, "shim-runc": shim, "runc": 4 << 20, "systemd": 20 << 20, "containerd": 30 << 20}
 	}
-	vars := func(hit, getall, ondisk int64) *ShimVarsDelta {
-		d := &ShimVarsDelta{ReactorHits: hit, GetAllFallbacks: getall, OnDiskReads: ondisk}
+	vars := func(hit, getall int64) *ShimVarsDelta {
+		d := &ShimVarsDelta{ReactorHits: hit, GetAllFallbacks: getall}
 		if hit+getall > 0 {
 			d.ReactorHitRate = float64(hit) / float64(hit+getall)
 		}
@@ -142,7 +142,7 @@ func syntheticReport() Report {
 				AttribCPUSeconds: 6.5 - float64(ri)*3, SystemUtilPct: 40 - float64(ri)*10,
 			}
 			if sysd {
-				c.ShimVars = vars(int64(90+p), int64(10), int64(2))
+				c.ShimVars = vars(int64(90+p), int64(10))
 				c.ShimGoHeapBytes = 12 << 20
 			}
 			add(c)
@@ -154,7 +154,7 @@ func syntheticReport() Report {
 				CPUSeconds: cpu(0.8, 1.1), MemPeakPss: mem(uint64(38+ri*8) << 20),
 			}
 			if sysd {
-				e.ShimVars = vars(int64(80), int64(5), int64(1))
+				e.ShimVars = vars(int64(80), int64(5))
 			}
 			add(e)
 
@@ -192,7 +192,7 @@ func syntheticReport() Report {
 				MemPeakPss: mem(uint64((30+ri*5)+n*(2+ri*3)) << 20),
 			}
 			if sysd {
-				sc.ShimVars = vars(int64(n*2), int64(1), 0)
+				sc.ShimVars = vars(int64(n*2), int64(1))
 			}
 			add(sc)
 		}

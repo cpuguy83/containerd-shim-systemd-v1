@@ -506,53 +506,231 @@ func TestServiceTaskRestoreAgainstSystemd(t *testing.T) {
 // and the unmount is checked after delete. (The PrivateMounts variant's property
 // construction is covered by TestInitProcessRootfsMountProperties; its runtime
 // needs cross-namespace runc state the in-process stub cannot model.)
-func TestServiceTaskRootfsMountAgainstSystemd(t *testing.T) {
+// TestServiceUnitNotifyPropertiesAgainstSystemd pins the notify configuration
+// the shim's exit reporting depends on, for both unit kinds.
+//
+// Type=notify alone is not enough. It implies NotifyAccess=main, and once
+// systemd accepts MAINPID= the workload is the main process -- so the create
+// re-exec's report of a workload that died during the handoff is refused, and
+// systemd has no record of that exit either because the re-exec reaped it. The
+// exit status is lost outright. Dropping NotifyAccess=all would not fail any
+// other test in this suite; it would just start losing exit codes under load.
+func TestServiceUnitNotifyPropertiesAgainstSystemd(t *testing.T) {
 	h := newServiceIntegrationHarness(t)
-	requireBindMount(t)
-
-	const marker = "mounted"
-	src := t.TempDir()
-	if err := os.WriteFile(filepath.Join(src, marker), nil, 0600); err != nil {
-		t.Fatalf("write rootfs marker: %v", err)
+	ctx, req, initUnit := h.task(t, "notify-props", runcStubConfig{ExitDelay: 30 * time.Second})
+	if _, err := h.service.Create(ctx, req); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
+		t.Fatalf("start task: %v", err)
+	}
+	execUnit := h.exec(t, ctx, req, "notify-props-exec", runcStubConfig{ExitDelay: 30 * time.Second})
+	if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID, ExecID: "notify-props-exec"}); err != nil {
+		t.Fatalf("start exec: %v", err)
 	}
 
-	ctx, req, _ := h.task(t, "rootfs-mount", runcStubConfig{ExitDelay: 100 * time.Millisecond}, func(s *specs.Spec) {
-		s.Annotations[runcStubRootfsMarkerAnnotation] = marker
-		s.Linux.RootfsPropagation = "shared" // selects the no-new-namespace path
-	})
-	req.Rootfs = []*types.Mount{{Type: "bind", Source: src, Options: []string{"rbind"}}}
-	rootfs := filepath.Join(req.Bundle, "rootfs")
+	for name, unit := range map[string]string{"a container unit": initUnit, "an exec unit": execUnit} {
+		t.Run(name+" accepts the create re-exec's reports after the main pid moves", func(t *testing.T) {
+			props, err := h.conn.GetAllPropertiesContext(ctx, unit)
+			if err != nil {
+				t.Fatalf("read unit properties: %v", err)
+			}
+			if got := props["Type"]; got != "notify" {
+				t.Fatalf("unit Type = %v, want notify", got)
+			}
+			if got := props["NotifyAccess"]; got != "all" {
+				t.Fatalf("unit NotifyAccess = %v, want all", got)
+			}
+		})
+	}
+
+	if _, err := h.service.Kill(ctx, &taskapi.KillRequest{ID: req.ID, Signal: uint32(unix.SIGKILL), All: true}); err != nil {
+		t.Fatalf("kill task: %v", err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if _, err := h.service.Wait(waitCtx, &taskapi.WaitRequest{ID: req.ID}); err != nil {
+		t.Fatalf("wait for task: %v", err)
+	}
+	if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID, ExecID: "notify-props-exec"}); err != nil {
+		t.Fatalf("delete exec: %v", err)
+	}
+	if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID}); err != nil {
+		t.Fatalf("delete task: %v", err)
+	}
+}
+
+// TestServiceWaitRecoversMissedExitAgainstSystemd is the counterpart to
+// TestServiceTaskMissedExitSignalAgainstSystemd for the Wait path. Wait skips
+// its property read while the signal stream is up, on the grounds that nothing
+// can have been missed; with the stream down that reasoning does not hold, so it
+// must still look. waitForExit parks in sync.Cond.Wait, which no context can
+// interrupt, so a regression here hangs rather than failing.
+func TestServiceWaitRecoversMissedExitAgainstSystemd(t *testing.T) {
+	h := newServiceIntegrationHarness(t)
+	ctx, req, unit := h.task(t, "missed-exit-wait", runcStubConfig{ExitCode: 7, ExitDelay: 300 * time.Millisecond})
 
 	if _, err := h.service.Create(ctx, req); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	// ExecStartPre mounted the rootfs in the host namespace.
-	if _, err := os.Stat(filepath.Join(rootfs, marker)); err != nil {
-		t.Fatalf("rootfs not mounted in host namespace: %v", err)
-	}
-
 	if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
 		t.Fatalf("start task: %v", err)
 	}
 
-	// A clean zero exit proves the container saw its mounted rootfs; a missing
-	// mount would have exited runcStubRootfsMissing instead.
-	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	waited, err := h.service.Wait(waitCtx, &taskapi.WaitRequest{ID: req.ID})
-	if err != nil {
-		t.Fatalf("wait for task: %v", err)
+	// Drop the stream before the workload exits, so nothing reconciles it.
+	h.stopReactor()
+
+	if !eventually(15*time.Second, 20*time.Millisecond, func() bool {
+		st, err := loadExitFromUnit(ctx, h.conn, unit)
+		return err == nil && st.Exited()
+	}) {
+		t.Fatal("unit never exited in systemd")
 	}
-	if waited.ExitStatus != 0 {
-		t.Fatalf("task exit status = %d, want 0 (container saw the rootfs marker)", waited.ExitStatus)
+	if h.service.processes.Get(path.Join(h.namespace, req.ID)).ProcessState().Exited() {
+		t.Skip("shim recorded the exit without the event stream; cannot exercise the missed-signal path")
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	type waitResult struct {
+		resp *taskapi.WaitResponse
+		err  error
+	}
+	done := make(chan waitResult, 1)
+	go func() {
+		resp, err := h.service.Wait(waitCtx, &taskapi.WaitRequest{ID: req.ID})
+		done <- waitResult{resp, err}
+	}()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("wait for task: %v", res.err)
+		}
+		if res.resp.ExitStatus != 7 {
+			t.Errorf("wait reported exit status %d, want 7 recovered from the still-loaded unit", res.resp.ExitStatus)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("wait blocked: the exit on the still-loaded unit was never read with the stream down")
 	}
 
 	if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID}); err != nil {
 		t.Fatalf("delete task: %v", err)
 	}
-	// ExecStopPost unmounted the rootfs, so the host no longer sees it.
-	if _, err := os.Stat(filepath.Join(rootfs, marker)); !os.IsNotExist(err) {
-		t.Fatalf("rootfs still mounted after delete: %v", err)
+}
+
+// TestServiceTaskRootfsMountFailureAgainstSystemd covers the unit failing before
+// it ever has a main process. ExecStartPre mounts the rootfs on the
+// no-new-namespace path, and a mount that cannot succeed fails the unit while
+// ExecMainPID is still 0 -- properties identical to a unit that has not started
+// yet, apart from Result. Reading that as "not started" makes Create report
+// success with pid 0 for a container whose rootfs was never mounted.
+//
+// Unlike the success path this needs no privileges: the mount has to fail, and
+// it fails unprivileged just as well.
+func TestServiceTaskRootfsMountFailureAgainstSystemd(t *testing.T) {
+	h := newServiceIntegrationHarness(t)
+
+	ctx, req, _ := h.task(t, "rootfs-mount-failure", runcStubConfig{}, func(s *specs.Spec) {
+		s.Linux.RootfsPropagation = "shared" // selects the ExecStartPre mount path
+	})
+	req.Rootfs = []*types.Mount{{
+		Type:    "bind",
+		Source:  filepath.Join(t.TempDir(), "does-not-exist"),
+		Options: []string{"rbind"},
+	}}
+
+	created, err := h.service.Create(ctx, req)
+	if err == nil {
+		t.Fatalf("create succeeded with an unmountable rootfs, pid %d", created.Pid)
+	}
+
+	state, err := h.service.State(ctx, &taskapi.StateRequest{ID: req.ID})
+	if err != nil {
+		// Create may have torn the task down entirely, which is also a correct
+		// answer -- what must not happen is a live task with no exit.
+		return
+	}
+	if state.Status != tasktypes.Status_STOPPED {
+		t.Fatalf("task status = %s, want stopped after a failed rootfs mount", state.Status)
+	}
+	if state.ExitStatus == 0 {
+		t.Fatal("task reported exit status 0 after a failed rootfs mount")
+	}
+}
+
+func TestServiceTaskRootfsMountAgainstSystemd(t *testing.T) {
+	requireBindMount(t)
+
+	// The two rootfs paths differ in who mounts and where. A shared propagation
+	// keeps the container in the host mount namespace, so ExecStartPre mounts
+	// the rootfs where the host can see it. Otherwise the unit gets
+	// PrivateMounts and the create re-exec mounts inside it, invisible to the
+	// host -- and that re-exec cannot reap the workload, so it reports readiness
+	// and nothing else.
+	for _, tc := range []struct {
+		name        string
+		specOpt     func(*specs.Spec)
+		hostMounted bool
+	}{
+		{
+			name:        "a shared rootfs propagation mounts the rootfs where the host can see it",
+			specOpt:     func(s *specs.Spec) { s.Linux.RootfsPropagation = "shared" },
+			hostMounted: true,
+		},
+		{
+			name:        "a private mount namespace mounts the rootfs inside the unit",
+			specOpt:     func(s *specs.Spec) {},
+			hostMounted: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newServiceIntegrationHarness(t)
+
+			const marker = "mounted"
+			src := t.TempDir()
+			if err := os.WriteFile(filepath.Join(src, marker), nil, 0600); err != nil {
+				t.Fatalf("write rootfs marker: %v", err)
+			}
+
+			ctx, req, _ := h.task(t, "rootfs-mount", runcStubConfig{ExitDelay: 100 * time.Millisecond}, func(s *specs.Spec) {
+				s.Annotations[runcStubRootfsMarkerAnnotation] = marker
+				tc.specOpt(s)
+			})
+			req.Rootfs = []*types.Mount{{Type: "bind", Source: src, Options: []string{"rbind"}}}
+			rootfs := filepath.Join(req.Bundle, "rootfs")
+
+			if _, err := h.service.Create(ctx, req); err != nil {
+				t.Fatalf("create task: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(rootfs, marker)); tc.hostMounted != (err == nil) {
+				t.Fatalf("rootfs visible in host namespace = %v, want %v (%v)", err == nil, tc.hostMounted, err)
+			}
+
+			if _, err := h.service.Start(ctx, &taskapi.StartRequest{ID: req.ID}); err != nil {
+				t.Fatalf("start task: %v", err)
+			}
+
+			// A clean zero exit proves the container saw its mounted rootfs; a
+			// missing mount would have exited runcStubRootfsMissing instead.
+			waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			waited, err := h.service.Wait(waitCtx, &taskapi.WaitRequest{ID: req.ID})
+			if err != nil {
+				t.Fatalf("wait for task: %v", err)
+			}
+			if waited.ExitStatus != 0 {
+				t.Fatalf("task exit status = %d, want 0 (container saw the rootfs marker)", waited.ExitStatus)
+			}
+
+			if _, err := h.service.Delete(ctx, &taskapi.DeleteRequest{ID: req.ID}); err != nil {
+				t.Fatalf("delete task: %v", err)
+			}
+			// ExecStopPost unmounted the rootfs, so the host no longer sees it.
+			if _, err := os.Stat(filepath.Join(rootfs, marker)); !os.IsNotExist(err) {
+				t.Fatalf("rootfs still mounted after delete: %v", err)
+			}
+		})
 	}
 }
 
@@ -702,7 +880,12 @@ func newServiceIntegrationHarness(t *testing.T) *serviceIntegrationHarness {
 		reactor := newEventReactor(service.units)
 		stop := reactor.start(reactorCtx)
 		defer stop()
+		// Mirror runEventReactor: while the stream is up, callers trust in-memory
+		// state instead of reading systemd. stopReactor waits for this goroutine,
+		// so the flag is false by the time a test that drops the stream proceeds.
+		service.reactorUp.Store(true)
 		reactor.consume(reactorCtx, unitUpdates(reactorCtx, signals))
+		service.reactorUp.Store(false)
 	}()
 
 	var stopReactorOnce sync.Once
@@ -761,8 +944,7 @@ func (h *serviceIntegrationHarness) task(t *testing.T, id string, cfg runcStubCo
 	}
 
 	createOptions, err := typeurl.MarshalAnyToProto(&options.CreateOptions{
-		LogMode:        options.LogMode_NULL,
-		SdNotifyEnable: true,
+		LogMode: options.LogMode_NULL,
 	})
 	if err != nil {
 		t.Fatalf("marshal create options: %v", err)
