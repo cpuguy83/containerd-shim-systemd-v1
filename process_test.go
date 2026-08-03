@@ -142,6 +142,72 @@ func TestExecProcessPIDFallback(t *testing.T) {
 	})
 }
 
+// The create re-exec's argv puts the subcommand before its own flags:
+// `<exe> --bundle=B create --mounts=M --tty <runc> ...`. A single flag.Parse
+// stops at "create", so --mounts is never seen and is handed to exec as the
+// container command instead -- which fails the unit, and only on the
+// PrivateMounts path, since the other path has no --mounts to misplace.
+func TestParseShimCreateArgs(t *testing.T) {
+	runc := []string{"/bin/runc-stub", "--root", "/run/runc", "create", "--bundle=/b", "ctr"}
+
+	t.Run("the private-mounts argv yields the mount config and the runc command", func(t *testing.T) {
+		argv := append([]string{"--debug=false", "--bundle=/b", "create", "--mounts=/b/mounts.json"}, runc...)
+
+		bundle, mounts, tty, cmd, err := parseShimCreateArgs(argv)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if bundle != "/b" {
+			t.Fatalf("bundle = %q, want /b", bundle)
+		}
+		if mounts != "/b/mounts.json" {
+			t.Fatalf("mounts = %q, want /b/mounts.json", mounts)
+		}
+		if tty {
+			t.Fatal("tty set without --tty")
+		}
+		if !slices.Equal(cmd, runc) {
+			t.Fatalf("command = %q, want %q", cmd, runc)
+		}
+	})
+
+	t.Run("the shared-propagation argv carries no mount config", func(t *testing.T) {
+		argv := append([]string{"--debug=false", "--bundle=/b", "create"}, runc...)
+
+		_, mounts, _, cmd, err := parseShimCreateArgs(argv)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if mounts != "" {
+			t.Fatalf("mounts = %q, want empty", mounts)
+		}
+		if !slices.Equal(cmd, runc) {
+			t.Fatalf("command = %q, want %q", cmd, runc)
+		}
+	})
+
+	t.Run("a tty argv sets tty without consuming the runc command", func(t *testing.T) {
+		argv := append([]string{"--bundle=/b", "create", "--mounts=/b/mounts.json", "--tty"}, runc...)
+
+		_, mounts, tty, cmd, err := parseShimCreateArgs(argv)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if !tty || mounts != "/b/mounts.json" {
+			t.Fatalf("tty = %v, mounts = %q", tty, mounts)
+		}
+		if !slices.Equal(cmd, runc) {
+			t.Fatalf("command = %q, want %q", cmd, runc)
+		}
+	})
+
+	t.Run("argv without a command is rejected", func(t *testing.T) {
+		if _, _, _, _, err := parseShimCreateArgs([]string{"--bundle=/b", "create", "--mounts=/b/m.json"}); err == nil {
+			t.Fatal("expected an argv with no runc command to be rejected")
+		}
+	})
+}
+
 func TestInitExitCleanup(t *testing.T) {
 	t.Run("a private PID namespace relies on kernel cleanup", func(t *testing.T) {
 		spec := &specs.Spec{Linux: &specs.Linux{
