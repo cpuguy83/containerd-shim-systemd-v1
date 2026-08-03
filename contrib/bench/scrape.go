@@ -14,7 +14,6 @@ import (
 type ShimVarsSnapshot struct {
 	ReactorHits     int64
 	GetAllFallbacks int64
-	OnDiskReads     int64
 	GetUnitCalls    int64
 	GoHeapAlloc     uint64
 }
@@ -23,7 +22,6 @@ type ShimVarsSnapshot struct {
 type ShimVarsDelta struct {
 	ReactorHits     int64   `json:"reactor_hits"`
 	GetAllFallbacks int64   `json:"getall_fallbacks"`
-	OnDiskReads     int64   `json:"ondisk_reads"`
 	GetUnitCalls    int64   `json:"getunitstate_calls"`
 	ReactorHitRate  float64 `json:"reactor_hit_rate"`
 }
@@ -55,7 +53,6 @@ func scrapeShimVars(ctx context.Context, url string) (*ShimVarsSnapshot, error) 
 		ShimState struct {
 			ReactorHits int64 `json:"exitstate_reactor_hits"`
 			GetAll      int64 `json:"exitstate_getall_fallbacks"`
-			OnDisk      int64 `json:"state_ondisk_reads"`
 			GetUnit     int64 `json:"getunitstate_calls"`
 		} `json:"shim_state"`
 		Memstats struct {
@@ -68,7 +65,6 @@ func scrapeShimVars(ctx context.Context, url string) (*ShimVarsSnapshot, error) 
 	return &ShimVarsSnapshot{
 		ReactorHits:     raw.ShimState.ReactorHits,
 		GetAllFallbacks: raw.ShimState.GetAll,
-		OnDiskReads:     raw.ShimState.OnDisk,
 		GetUnitCalls:    raw.ShimState.GetUnit,
 		GoHeapAlloc:     raw.Memstats.Alloc,
 	}, nil
@@ -82,7 +78,6 @@ func diffShimVars(before, after *ShimVarsSnapshot) *ShimVarsDelta {
 	d := &ShimVarsDelta{
 		ReactorHits:     after.ReactorHits - before.ReactorHits,
 		GetAllFallbacks: after.GetAllFallbacks - before.GetAllFallbacks,
-		OnDiskReads:     after.OnDiskReads - before.OnDiskReads,
 		GetUnitCalls:    after.GetUnitCalls - before.GetUnitCalls,
 	}
 	if total := d.ReactorHits + d.GetAllFallbacks; total > 0 {

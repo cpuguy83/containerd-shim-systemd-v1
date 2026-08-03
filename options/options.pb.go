@@ -74,11 +74,10 @@ func (LogMode) EnumDescriptor() ([]byte, []int) {
 }
 
 type CreateOptions struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	LogMode        LogMode                `protobuf:"varint,1,opt,name=log_mode,json=logMode,proto3,enum=containerd.systemd.v1.LogMode" json:"log_mode,omitempty"`
-	SdNotifyEnable bool                   `protobuf:"varint,2,opt,name=sd_notify_enable,json=sdNotifyEnable,proto3" json:"sd_notify_enable,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	LogMode       LogMode                `protobuf:"varint,1,opt,name=log_mode,json=logMode,proto3,enum=containerd.systemd.v1.LogMode" json:"log_mode,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CreateOptions) Reset() {
@@ -118,21 +117,13 @@ func (x *CreateOptions) GetLogMode() LogMode {
 	return LogMode_DEFAULT
 }
 
-func (x *CreateOptions) GetSdNotifyEnable() bool {
-	if x != nil {
-		return x.SdNotifyEnable
-	}
-	return false
-}
-
 var File_options_options_proto protoreflect.FileDescriptor
 
 const file_options_options_proto_rawDesc = "" +
 	"\n" +
-	"\x15options/options.proto\x12\x15containerd.systemd.v1\"t\n" +
+	"\x15options/options.proto\x12\x15containerd.systemd.v1\"b\n" +
 	"\rCreateOptions\x129\n" +
-	"\blog_mode\x18\x01 \x01(\x0e2\x1e.containerd.systemd.v1.LogModeR\alogMode\x12(\n" +
-	"\x10sd_notify_enable\x18\x02 \x01(\bR\x0esdNotifyEnable*9\n" +
+	"\blog_mode\x18\x01 \x01(\x0e2\x1e.containerd.systemd.v1.LogModeR\alogModeJ\x04\b\x02\x10\x03R\x10sd_notify_enable*9\n" +
 	"\aLogMode\x12\v\n" +
 	"\aDEFAULT\x10\x00\x12\f\n" +
 	"\bJOURNALD\x10\x01\x12\t\n" +

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/cgroups/v3"
@@ -166,6 +167,15 @@ type Service struct {
 
 	processes *processManager
 	units     *unitManager
+
+	// reactorUp reports whether the signal stream is currently connected. While
+	// it is, no unit event can have been missed -- the D-Bus client hands
+	// overflowed signals to goroutines rather than dropping them -- so the shim's
+	// in-memory state is current and a caller need not read systemd to check it.
+	// A drop is recovered by the resync on reconnect, which reconciles every
+	// tracked unit, so this only has to be conservative while the stream is
+	// actually down.
+	reactorUp atomic.Bool
 
 	defaultLogMode options.LogMode
 

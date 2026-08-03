@@ -46,7 +46,15 @@ func TestReactorReactsToRealExit(t *testing.T) {
 
 		startTransient(t, ctx, conn, unit, []string{"/bin/sh", "-c", "exit 3"})
 
-		if !eventually(10*time.Second, 10*time.Millisecond, func() bool { return p.LoadStateCalls() >= 1 }) {
+		// A reconcile answers from the reactor's own recording when the signal
+		// carried the exit, and reads systemd when it did not. Either is the
+		// reactor handling the exit, so count both -- asserting on the read alone
+		// would make this test a check on which path happened to win.
+		reactions := func() int64 {
+			return int64(p.LoadStateCalls() + p.LoadRecordedExitStateCalls())
+		}
+
+		if !eventually(10*time.Second, 10*time.Millisecond, func() bool { return reactions() >= 1 }) {
 			t.Fatal("reactor never observed the unit exit")
 		}
 
@@ -54,7 +62,7 @@ func TestReactorReactsToRealExit(t *testing.T) {
 		// stableFor returns as soon as the count stops changing, so a correct
 		// (single-reaction) run returns after the short debounce rather than a
 		// fixed delay; a duplicate-reaction bug keeps it climbing until timeout.
-		if got := stableFor(10*time.Second, 300*time.Millisecond, 10*time.Millisecond, func() int64 { return int64(p.LoadStateCalls()) }); got != 1 {
+		if got := stableFor(10*time.Second, 300*time.Millisecond, 10*time.Millisecond, reactions); got != 1 {
 			t.Fatalf("expected exactly one reaction to a single exit, got %d", got)
 		}
 	})

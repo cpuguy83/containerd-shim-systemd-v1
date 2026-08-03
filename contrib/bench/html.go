@@ -118,7 +118,7 @@ func writeCharts(b *strings.Builder, r *Report) {
 
 	// Shim-internal fallback (systemd only).
 	section("Exit-state source: reactor vs GetAll (systemd shim)",
-		"Exit-state loads served by the in-memory D-Bus reactor vs the systemd GetAll fallback (hit rate = reactor ÷ (reactor+GetAll)). On-disk reads are a separate LoadState path, shown for volume — not part of the hit rate.",
+		"Exit-state loads served by the in-memory D-Bus reactor vs the systemd GetAll fallback (hit rate = reactor ÷ (reactor+GetAll)).",
 		chartFallback(r))
 
 	b.WriteString(`</section>`)
@@ -293,7 +293,7 @@ func chartAttribCPU(r *Report, scenario string) string {
 func chartFallback(r *Report) string {
 	// aggregate systemd shim counters per scenario name
 	order := []string{"container", "exec", "exec-tty", "container-tty", "status", "scale"}
-	type agg struct{ reactor, getall, ondisk int64 }
+	type agg struct{ reactor, getall int64 }
 	sums := map[string]*agg{}
 	for i := range r.Scenarios {
 		s := &r.Scenarios[i]
@@ -307,7 +307,6 @@ func chartFallback(r *Report) string {
 		}
 		a.reactor += s.ShimVars.ReactorHits
 		a.getall += s.ShimVars.GetAllFallbacks
-		a.ondisk += s.ShimVars.OnDiskReads
 	}
 	var cats []string
 	for _, name := range order {
@@ -320,17 +319,14 @@ func chartFallback(r *Report) string {
 	}
 	reactor := make([]float64, len(cats))
 	getall := make([]float64, len(cats))
-	ondisk := make([]float64, len(cats))
 	for i, name := range cats {
 		a := sums[name]
 		reactor[i] = float64(a.reactor)
 		getall[i] = float64(a.getall)
-		ondisk[i] = float64(a.ondisk)
 	}
 	segs := []stackSeg{
 		{"reactor hit", "var(--cat-1)", reactor},
 		{"GetAll fallback", "var(--cat-6)", getall},
-		{"on-disk read", "var(--cat-4)", ondisk},
 	}
 	return stackedBars("state-source", "events", cats, segs)
 }

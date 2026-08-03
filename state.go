@@ -2,11 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"path"
-	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	taskapi "github.com/containerd/containerd/api/runtime/task/v3"
@@ -85,9 +84,27 @@ func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState)
 	if err != nil {
 		return err
 	}
+	applyUnitProperties(state, st)
+	return nil
+}
 
-	if p := state["ExecMainPID"]; p != nil {
-		st.Pid = uint32(p.(uint32))
+// applyUnitProperties folds a unit's systemd properties into st. It is the
+// property-read counterpart of serviceExitState, which decodes the same facts
+// out of a signal, and is separate from the read itself so the precedence
+// between the two accounts of an exit is testable without a bus.
+func applyUnitProperties(state map[string]interface{}, st *pState) {
+	if status := state["SubState"]; status != nil {
+		st.Status = status.(string)
+	}
+
+	// ExecMainPID is the create re-exec's own pid until it hands the workload
+	// over with MAINPID=, which for a notify unit is the moment the unit
+	// finishes activating. Reading it before then latches the re-exec's pid as
+	// the task's, and the first pid the shim records is the one it keeps.
+	if !activatingSubState(st.Status) {
+		if p := state["ExecMainPID"]; p != nil {
+			st.Pid = uint32(p.(uint32))
+		}
 	}
 	// systemd reports a killed main process as the bare signal number, with
 	// ExecMainCode carrying the si_code that says so.
@@ -99,28 +116,92 @@ func getUnitState(ctx context.Context, conn *dbus.Conn, unit string, st *pState)
 		st.ExitCode = exitStatusFor(mainCode, c.(int32))
 	}
 
-	// if ts := state["ExecMainExitTimestamp"]; ts != nil {
-	// st.ExitedAt = time.UnixMicro(int64(ts.(uint64)))
-	// if !st.ExitedAt.After(timeZero) {
-	if st.ExitCode == 0 {
-		execStart := state["ExecStart"].([][]interface{})
-		if len(execStart) > 0 {
-			code, _ := readExecStatusExit(state["ExecStart"].([][]interface{})[0])
-			// if t.After(timeZero) {
-			// st.ExitedAt = t
-			if code > 0 {
-				st.ExitCode = uint32(code)
-			}
+	if ts := state["ExecMainExitTimestamp"]; ts != nil {
+		if micros := ts.(uint64); micros > 0 {
+			st.ExitedAt = time.UnixMicro(int64(micros))
 		}
-		// }
-	}
-	//}
-	// }
-	if status := state["SubState"]; status != nil {
-		st.Status = status.(string)
 	}
 
-	return nil
+	// The create re-exec's own report comes last because it is the only source
+	// for an exit systemd did not witness: when the re-exec reaped the workload
+	// itself, ExecMainPID/Code/Status describe the re-exec rather than the
+	// workload, and SubState only says the unit is dead.
+	if v := state["StatusText"]; v != nil {
+		if status, pid := parseStatusText(v.(string)); status == exitedInit || status == "exited" {
+			st.Status = status
+			st.Pid = pid
+			st.ExitCode = 0
+			if e := state["StatusErrno"]; e != nil {
+				if errno := e.(int32); errno > 0 {
+					st.ExitCode = uint32(errno)
+				}
+			}
+		}
+	}
+
+	// A unit that has not started yet reads exactly like one that failed before it
+	// ever had a main process: inactive/dead, no main pid, no exit code. Result
+	// tells them apart -- it stays "success" until something actually fails.
+	//
+	// Getting this wrong in either direction is a real bug: reporting the
+	// pre-start state as an exit kills a container before runc runs, and
+	// discarding a genuine early failure (an ExecStartPre that is not allowed to
+	// fail, say) leaves the task looking alive with nothing left to report it.
+	if st.Pid == 0 && st.ExitCode == 0 && toStatus(st.Status) == task.Status_STOPPED {
+		if unitFailed(state) {
+			// No workload ran, so there is no exit code to report. 255 is the
+			// shim's code for a failure of its own making.
+			st.ExitCode = 255
+		} else {
+			st.Reset()
+		}
+	}
+
+	// A terminal state is worth nothing to containerd without an exit time, and
+	// a report the create re-exec sent carries none of its own. Stamping the
+	// read is the closest available: the exit it describes has only just
+	// happened.
+	if st.Exited() && !st.ExitedAt.After(timeZero) {
+		st.ExitedAt = time.Now()
+	}
+}
+
+// unitFailed reports whether systemd's Result says the unit failed. It reads
+// "success" both for a unit that has not run yet and for one that ran cleanly,
+// and systemd sets it only after applying the "-" ignore-failure prefix on Exec*
+// commands -- so a command that is allowed to fail never shows up here.
+func unitFailed(state map[string]interface{}) bool {
+	result, _ := state["Result"].(string)
+	return result != "" && result != "success"
+}
+
+// activatingSubState reports whether a service SubState is one systemd uses
+// while the unit is still starting, so its main process is the create re-exec
+// rather than the workload the re-exec is bringing up.
+func activatingSubState(s string) bool {
+	switch s {
+	case "start-pre", "start":
+		return true
+	}
+	return false
+}
+
+// parseStatusText splits the STATUS= text notifyStatus sends into the status
+// and the pid it belongs to.
+//
+// Text without a usable pid yields the status alone rather than an error: the
+// status is what says the workload exited, and losing the pid is better than
+// losing the exit.
+func parseStatusText(s string) (status string, pid uint32) {
+	status, rest, ok := strings.Cut(s, " ")
+	if !ok {
+		return status, 0
+	}
+	v, err := strconv.ParseUint(rest, 10, 32)
+	if err != nil {
+		return status, 0
+	}
+	return status, uint32(v)
 }
 
 type State struct {
@@ -150,17 +231,6 @@ func (p *initProcess) State(ctx context.Context) (*State, error) {
 
 func (p *initProcess) LoadState(ctx context.Context) error {
 	var st pState
-	if err := p.readExitState(&st); err == nil {
-		if st.Pid > 0 && st.Status == "" {
-			st.Status = "running"
-		}
-		p.SetState(ctx, st)
-		return nil
-	} else if p.Pid() == 0 {
-		// Nothing to load
-		return nil
-	}
-
 	st.Reset()
 	if err := getUnitState(ctx, p.systemd, p.Name(), &st); err != nil {
 		return err
@@ -171,102 +241,48 @@ func (p *initProcess) LoadState(ctx context.Context) error {
 
 func (p *execProcess) LoadState(ctx context.Context) error {
 	var st pState
-	err := p.readExitState(&st)
-	if err == nil {
-		p.SetState(ctx, st)
-		return nil
+	st.Reset()
+	if err := getUnitState(ctx, p.systemd, p.Name(), &st); err != nil {
+		return err
 	}
-
-	if !os.IsNotExist(err) {
-		log.G(ctx).WithField("unit", p.Name()).WithError(err).Debug("Error reading exit state file")
-	}
+	p.SetState(ctx, st)
 	return nil
 }
 
-// loadExitFromUnit is the fallback when the signal stream did not record a
-// terminal Service update. It reads ExecMainStatus and SubState while the unit
-// is still loaded. getUnitState leaves ExitedAt unset, so stamp it for a clean
-// exit whose code is 0 (its exited status still comes through SubState).
+// loadExitFromUnit reads a unit's terminal state directly, for callers that have
+// no recorded exit to fall back on -- delete, which has just stopped the unit
+// itself, and the tests that assert against systemd.
 func loadExitFromUnit(ctx context.Context, conn *dbus.Conn, name string) (pState, error) {
 	var st pState
 	st.Reset()
 	if err := getUnitState(ctx, conn, name, &st); err != nil {
 		return pState{}, err
 	}
-	if st.Exited() && !st.ExitedAt.After(timeZero) {
-		st.ExitedAt = time.Now()
-	}
 	return st, nil
 }
 
-func (p *initProcess) LoadExitState(ctx context.Context) error {
-	if st, ok := p.loadRecordedSystemdExitState(); ok {
-		countState(metricReactorHits)
-		p.SetState(ctx, st)
-		return nil
+// LoadRecordedExitState applies the terminal state the reactor decoded from the
+// unit's own signal, and reports whether there was one. It does no I/O: the
+// signal that enqueued a unit already carried the exit, so a reconcile can
+// answer from it rather than asking systemd for what it has already been told.
+func (p *initProcess) LoadRecordedExitState(ctx context.Context) bool {
+	st, ok := p.loadRecordedSystemdExitState()
+	if !ok {
+		return false
 	}
-	st, err := loadExitFromUnit(ctx, p.systemd, p.Name())
-	if err != nil {
-		return err
-	}
-	// Count a fallback only when GetAll actually recovered a terminal exit the
-	// reactor missed; a pre-start / non-terminal read is not a reactor miss.
-	if st.Exited() {
-		countState(metricGetAllFallbacks)
-	}
+	countState(metricReactorHits)
 	p.SetState(ctx, st)
-	return nil
+	return true
 }
 
-func (p *execProcess) LoadExitState(ctx context.Context) error {
-	if st, ok := p.loadRecordedSystemdExitState(); ok {
-		countState(metricReactorHits)
-		p.SetState(ctx, st)
-		return nil
+func (p *execProcess) LoadRecordedExitState(ctx context.Context) bool {
+	st, ok := p.loadRecordedSystemdExitState()
+	if !ok {
+		return false
 	}
-	st, err := loadExitFromUnit(ctx, p.systemd, p.Name())
-	if err != nil {
-		return err
-	}
-	// Count a fallback only when GetAll actually recovered a terminal exit the
-	// reactor missed; a pre-start / non-terminal read is not a reactor miss.
-	if st.Exited() {
-		countState(metricGetAllFallbacks)
-	}
+	countState(metricReactorHits)
 	p.SetState(ctx, st)
-	return nil
-}
-
-func (p *execProcess) exitStatePath() string {
-	return filepath.Join(p.stateDir(), "exit_status.json")
-}
-
-func (p *execProcess) readExitState(st *pState) error {
-	data, err := os.ReadFile(p.exitStatePath())
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(data, st); err != nil {
-		return err
-	}
-	countState(metricOnDiskReads)
-	return nil
-}
-
-func (p *initProcess) exitStatePath() string {
-	return filepath.Join(p.Bundle, "init_exit_status.json")
-}
-
-func (p *initProcess) readExitState(st *pState) error {
-	data, err := os.ReadFile(p.exitStatePath())
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(data, st); err != nil {
-		return err
-	}
-	countState(metricOnDiskReads)
-	return nil
+	return true
 }
 
 func (p *execProcess) State(ctx context.Context) (*State, error) {
@@ -421,10 +437,6 @@ type execState struct {
 	Args       []string
 	Pid        uint32
 	StatusCode uint32 // This is the systemd status (e.g. "exited")
-}
-
-func readExecStatusExit(i []interface{}) (uint32, time.Time) {
-	return uint32(i[9].(int32)), time.UnixMicro(int64(i[5].(uint64)))
 }
 
 func parseExecStartStatus(ii [][]interface{}, st *execState) error {

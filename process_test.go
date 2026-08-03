@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -104,12 +103,12 @@ func TestRuncCommandArguments(t *testing.T) {
 }
 
 func TestExecProcessPIDFallback(t *testing.T) {
-	for _, status := range []string{"running", "exited"} {
-		t.Run("a "+status+" helper state supplies the workload PID after systemd removes PIDFile", func(t *testing.T) {
+	for _, status := range []string{"running", "exited", "failed"} {
+		t.Run("a "+status+" state supplies the workload PID after systemd removes PIDFile", func(t *testing.T) {
 			parent, _ := newTestInitProcess("container")
 			parent.Bundle = t.TempDir()
 			exec := newTestExecProcess(parent, "exec")
-			writeTestProcessState(t, exec.exitStatePath(), pState{Pid: 42, Status: status})
+			exec.SetState(context.Background(), pState{Pid: 42, Status: status})
 
 			pid, err := exec.getPid(context.Background())
 			if err != nil {
@@ -125,10 +124,86 @@ func TestExecProcessPIDFallback(t *testing.T) {
 		parent, _ := newTestInitProcess("container")
 		parent.Bundle = t.TempDir()
 		exec := newTestExecProcess(parent, "exec")
-		writeTestProcessState(t, exec.exitStatePath(), pState{Pid: 42, Status: exitedInit})
+		exec.SetState(context.Background(), pState{Pid: 42, Status: exitedInit})
 
 		if _, err := exec.getPid(context.Background()); err == nil {
 			t.Fatal("expected missing workload PID to fail")
+		}
+	})
+
+	t.Run("a process that never ran reports no PID", func(t *testing.T) {
+		parent, _ := newTestInitProcess("container")
+		parent.Bundle = t.TempDir()
+		exec := newTestExecProcess(parent, "exec")
+
+		if _, err := exec.getPid(context.Background()); err == nil {
+			t.Fatal("expected missing workload PID to fail")
+		}
+	})
+}
+
+// The create re-exec's argv puts the subcommand before its own flags:
+// `<exe> --bundle=B create --mounts=M --tty <runc> ...`. A single flag.Parse
+// stops at "create", so --mounts is never seen and is handed to exec as the
+// container command instead -- which fails the unit, and only on the
+// PrivateMounts path, since the other path has no --mounts to misplace.
+func TestParseShimCreateArgs(t *testing.T) {
+	runc := []string{"/bin/runc-stub", "--root", "/run/runc", "create", "--bundle=/b", "ctr"}
+
+	t.Run("the private-mounts argv yields the mount config and the runc command", func(t *testing.T) {
+		argv := append([]string{"--debug=false", "--bundle=/b", "create", "--mounts=/b/mounts.json"}, runc...)
+
+		bundle, mounts, tty, cmd, err := parseShimCreateArgs(argv)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if bundle != "/b" {
+			t.Fatalf("bundle = %q, want /b", bundle)
+		}
+		if mounts != "/b/mounts.json" {
+			t.Fatalf("mounts = %q, want /b/mounts.json", mounts)
+		}
+		if tty {
+			t.Fatal("tty set without --tty")
+		}
+		if !slices.Equal(cmd, runc) {
+			t.Fatalf("command = %q, want %q", cmd, runc)
+		}
+	})
+
+	t.Run("the shared-propagation argv carries no mount config", func(t *testing.T) {
+		argv := append([]string{"--debug=false", "--bundle=/b", "create"}, runc...)
+
+		_, mounts, _, cmd, err := parseShimCreateArgs(argv)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if mounts != "" {
+			t.Fatalf("mounts = %q, want empty", mounts)
+		}
+		if !slices.Equal(cmd, runc) {
+			t.Fatalf("command = %q, want %q", cmd, runc)
+		}
+	})
+
+	t.Run("a tty argv sets tty without consuming the runc command", func(t *testing.T) {
+		argv := append([]string{"--bundle=/b", "create", "--mounts=/b/mounts.json", "--tty"}, runc...)
+
+		_, mounts, tty, cmd, err := parseShimCreateArgs(argv)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if !tty || mounts != "/b/mounts.json" {
+			t.Fatalf("tty = %v, mounts = %q", tty, mounts)
+		}
+		if !slices.Equal(cmd, runc) {
+			t.Fatalf("command = %q, want %q", cmd, runc)
+		}
+	})
+
+	t.Run("argv without a command is rejected", func(t *testing.T) {
+		if _, _, _, _, err := parseShimCreateArgs([]string{"--bundle=/b", "create", "--mounts=/b/m.json"}); err == nil {
+			t.Fatal("expected an argv with no runc command to be rejected")
 		}
 	})
 }
@@ -395,20 +470,6 @@ func newTestExecProcess(parent *initProcess, execID string) *execProcess {
 	ep.cond = sync.NewCond(&ep.mu)
 	ep.events.Send(context.Background(), &eventsapi.TaskExecStarted{ExecID: execID})
 	return ep
-}
-
-func writeTestProcessState(t *testing.T, path string, state pState) {
-	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		t.Fatalf("create process state directory: %v", err)
-	}
-	data, err := json.Marshal(state)
-	if err != nil {
-		t.Fatalf("marshal process state: %v", err)
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatalf("write process state: %v", err)
-	}
 }
 
 func newRuncStub(t *testing.T) string {

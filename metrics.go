@@ -4,15 +4,13 @@ import (
 	"expvar"
 )
 
-// State-source metric keys. These count how the shim answers process
-// state/exit queries: from the in-memory D-Bus event reactor (the fast path)
-// versus falling back to a systemd GetAll property read or an on-disk exit
-// file. The reactor-hit vs getall-fallback ratio is the event reactor's
-// effective hit rate; on-disk reads are the other fallback source.
+// State-source metric keys. These count how the shim resolves a process's exit:
+// from the in-memory D-Bus event reactor (the fast path) versus having to read
+// the unit's properties from systemd. The reactor-hit vs getall-fallback ratio
+// is the event reactor's effective hit rate.
 const (
 	metricReactorHits     = "exitstate_reactor_hits"
 	metricGetAllFallbacks = "exitstate_getall_fallbacks"
-	metricOnDiskReads     = "state_ondisk_reads"
 	metricGetUnitCalls    = "getunitstate_calls"
 )
 
@@ -25,7 +23,6 @@ var stateMetrics = func() *expvar.Map {
 	for _, k := range []string{
 		metricReactorHits,
 		metricGetAllFallbacks,
-		metricOnDiskReads,
 		metricGetUnitCalls,
 	} {
 		m.Add(k, 0)

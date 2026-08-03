@@ -74,22 +74,25 @@ func TestStartTransientUnitAddRefSurvivesGC(t *testing.T) {
 	startClean(pinned, true)
 	startClean(control, false)
 
-	// Confirm both exited cleanly, reading their exit while still loaded.
-	for _, name := range []string{pinned, control} {
-		var st pState
-		if !eventually(10*time.Second, 20*time.Millisecond, func() bool {
-			s, err := loadExitFromUnit(ctx, conn, name)
-			if err == nil && s.Exited() {
-				st = s
-				return true
-			}
-			return false
-		}) {
-			t.Fatalf("%s never reported an exit via systemd", name)
+	// The referenced unit's exit stays readable, which is the whole point of the
+	// reference. The control's does not: a property read on a collected
+	// transient unit re-materializes it as an empty one, which reports no pid
+	// and no exit -- so there is nothing to confirm for it here. That it was
+	// collected at all establishes it exited cleanly, because a failed unit
+	// lingers regardless of the reference.
+	var st pState
+	if !eventually(10*time.Second, 20*time.Millisecond, func() bool {
+		s, err := loadExitFromUnit(ctx, conn, pinned)
+		if err == nil && s.Exited() {
+			st = s
+			return true
 		}
-		if st.ExitCode != 0 {
-			t.Fatalf("%s did not exit cleanly (code %d); a failed unit lingers regardless of the reference", name, st.ExitCode)
-		}
+		return false
+	}) {
+		t.Fatalf("%s never reported an exit via systemd", pinned)
+	}
+	if st.ExitCode != 0 {
+		t.Fatalf("%s did not exit cleanly (code %d)", pinned, st.ExitCode)
 	}
 
 	// The unreferenced control is collected once systemd's GC queue runs (churn

@@ -117,6 +117,39 @@ func decodeSystemdPropertiesChanged(sig *dbus.Signal) (unitUpdate, bool) {
 	}, true
 }
 
+// helperExitReport extracts the create re-exec's own account of an exit from a
+// Service PropertiesChanged payload. systemd emits the status text it was sent
+// like any other property, so the report reaches the reactor as a signal.
+//
+// This is the only account that exists for a workload the re-exec reaped before
+// systemd could adopt its pid: systemd has no exit record of its own, and the
+// pid rides in the status text because MAINPID= is refused for a process that
+// has already exited. The report carries no timestamp, so the moment it is
+// decoded is the closest thing to one -- the exit it describes has only just
+// happened.
+func helperExitReport(changed map[string]dbus.Variant) (pState, bool) {
+	v, ok := changed["StatusText"]
+	if !ok {
+		return pState{}, false
+	}
+	text, ok := v.Value().(string)
+	if !ok {
+		return pState{}, false
+	}
+	status, pid := parseStatusText(text)
+	if status != exitedInit && status != "exited" {
+		return pState{}, false
+	}
+
+	st := pState{Pid: pid, Status: status, ExitedAt: time.Now()}
+	if e, ok := changed["StatusErrno"]; ok {
+		if errno, ok := e.Value().(int32); ok && errno > 0 {
+			st.ExitCode = uint32(errno)
+		}
+	}
+	return st, true
+}
+
 func serviceExitState(changed map[string]dbus.Variant) (pState, bool) {
 	pidValue, ok := changed["ExecMainPID"]
 	if !ok {

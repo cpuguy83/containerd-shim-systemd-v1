@@ -91,26 +91,44 @@ func runShimCreateHelper() error {
 		}
 	}
 
-	flags := flag.NewFlagSet(shimCreateHelperName, flag.ContinueOnError)
-	flags.Bool("debug", false, "")
-	bundle := flags.String("bundle", "", "")
-	tty := flags.Bool("tty", false, "")
-	mounts := flags.String("mounts", "", "")
-	if err := flags.Parse(os.Args[1:]); err != nil {
+	bundle, mounts, tty, cmd, err := parseShimCreateArgs(os.Args[1:])
+	if err != nil {
 		return err
 	}
-
-	args := flags.Args()
-	if len(args) < 2 || args[0] != "create" {
-		return fmt.Errorf("invalid shim helper arguments: %q", os.Args[1:])
-	}
 	// The PrivateMounts path mounts the rootfs in the create re-exec before runc.
-	if *mounts != "" {
-		if err := mountRootfs(*mounts); err != nil {
+	if mounts != "" {
+		if err := mountRootfs(mounts); err != nil {
 			return err
 		}
 	}
-	return createCmd(context.Background(), *bundle, args[1:], *tty, *mounts != "")
+	return createCmd(context.Background(), bundle, cmd, tty, mounts != "")
+}
+
+// parseShimCreateArgs mirrors main()'s two-stage parse: global flags up to the
+// subcommand, then the subcommand's own flags. A single pass would stop at
+// "create" and leave --mounts= to be exec'd as the container command, which is
+// exactly the shape the PrivateMounts path produces.
+func parseShimCreateArgs(argv []string) (bundle, mounts string, tty bool, cmd []string, err error) {
+	rootFlags := flag.NewFlagSet(shimCreateHelperName, flag.ContinueOnError)
+	rootFlags.Bool("debug", false, "")
+	rootBundle := rootFlags.String("bundle", "", "")
+	if err := rootFlags.Parse(argv); err != nil {
+		return "", "", false, nil, err
+	}
+	if rootFlags.NArg() < 1 || rootFlags.Arg(0) != "create" {
+		return "", "", false, nil, fmt.Errorf("invalid shim helper arguments: %q", argv)
+	}
+
+	subFlags := flag.NewFlagSet(shimCreateHelperName+" create", flag.ContinueOnError)
+	subTTY := subFlags.Bool("tty", false, "")
+	subMounts := subFlags.String("mounts", "", "")
+	if err := subFlags.Parse(rootFlags.Args()[1:]); err != nil {
+		return "", "", false, nil, err
+	}
+	if subFlags.NArg() < 1 {
+		return "", "", false, nil, fmt.Errorf("invalid shim helper arguments: %q", argv)
+	}
+	return *rootBundle, *subMounts, *subTTY, subFlags.Args(), nil
 }
 
 func runRuncStub() int {

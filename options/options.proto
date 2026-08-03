@@ -13,5 +13,10 @@ enum LogMode {
 
 message CreateOptions {
     LogMode log_mode = 1;
-    bool sd_notify_enable = 2;
+
+    // sd_notify_enable only ever toggled the unit type. Every unit is
+    // Type=notify now, and the option never gave the workload the notify
+    // socket it implied.
+    reserved 2;
+    reserved "sd_notify_enable";
 }

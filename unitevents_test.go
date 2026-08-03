@@ -136,6 +136,57 @@ func TestEnqueueIfExit(t *testing.T) {
 		}
 	})
 
+	t.Run("a reported exit is recorded before reconciliation is enqueued", func(t *testing.T) {
+		p := &fakeProcess{name: unit}
+		q, units := newQueued(p)
+
+		enqueueIfExit(q, units, helperExitUpdate(unit, "exited 42", 19))
+
+		if queueLen(q) != 1 {
+			t.Fatalf("expected the exiting service to be enqueued, queue has %d", queueLen(q))
+		}
+		recorded, ok := p.recordedSystemdExitState()
+		if !ok {
+			t.Fatal("the reported exit was not recorded")
+		}
+		if recorded.Pid != 42 || recorded.ExitCode != 19 {
+			t.Fatalf("recorded state = %s, want pid 42, exit 19", recorded)
+		}
+	})
+
+	// The create re-exec is still the unit's main process when it reports, so
+	// systemd publishes the re-exec's own exit microseconds later. The informer
+	// sees both, and the second must not overwrite the first.
+	t.Run("the re-exec's own exit does not overwrite the exit it reported", func(t *testing.T) {
+		p := &fakeProcess{name: unit}
+		q, units := newQueued(p)
+
+		enqueueIfExit(q, units, helperExitUpdate(unit, "exited 42", 19))
+		enqueueIfExit(q, units, serviceExitUpdate(unit, 7, 3, time.Now().Add(time.Second)))
+
+		recorded, ok := p.recordedSystemdExitState()
+		if !ok {
+			t.Fatal("the reported exit was not recorded")
+		}
+		if recorded.Pid != 42 || recorded.ExitCode != 19 {
+			t.Fatalf("recorded state = %s, want the reported pid 42 and exit 19", recorded)
+		}
+	})
+
+	t.Run("an empty status text is not enqueued as an exit", func(t *testing.T) {
+		p := &fakeProcess{name: unit}
+		q, units := newQueued(p)
+
+		enqueueIfExit(q, units, helperExitUpdate(unit, "", 0))
+
+		if queueLen(q) != 0 {
+			t.Fatalf("expected an empty status text not to enqueue, queue has %d", queueLen(q))
+		}
+		if _, ok := p.recordedSystemdExitState(); ok {
+			t.Fatal("an empty status text was recorded as an exit")
+		}
+	})
+
 	t.Run("a non-exit transition is not enqueued", func(t *testing.T) {
 		q, units := newQueued(&fakeProcess{name: unit})
 		running := newUpdate(unit, changedProps(map[string]string{"ActiveState": "active", "SubState": "running"}))
@@ -209,7 +260,7 @@ func TestReactToUnitEvents(t *testing.T) {
 		}) {
 			t.Fatalf("recorded service exit was not reconciled: %s", p.ProcessState())
 		}
-		if got := p.LoadExitStateCalls(); got != 1 {
+		if got := p.LoadRecordedExitStateCalls(); got != 1 {
 			t.Fatalf("expected one recorded exit-state load, got %d", got)
 		}
 		cancel()
@@ -264,14 +315,10 @@ func TestReactToUnitEvents(t *testing.T) {
 		}
 	})
 
-	t.Run("a started process whose persisted state is not terminal reads the exit code from systemd", func(t *testing.T) {
+	t.Run("an exit the reactor did not record is read from systemd", func(t *testing.T) {
 		p := &fakeProcess{
 			name: unit,
 			loadStateFn: func(f *fakeProcess) error {
-				f.setState(pState{Pid: 42, Status: "running"}) // create's running-state file
-				return nil
-			},
-			loadExitStateFn: func(f *fakeProcess) error {
 				f.setState(pState{Pid: 42, ExitCode: 7, ExitedAt: time.Now()})
 				return nil
 			},
@@ -293,16 +340,49 @@ func TestReactToUnitEvents(t *testing.T) {
 		if got := p.ProcessState().ExitCode; got != 7 {
 			t.Fatalf("expected exit code 7 from systemd, got %d", got)
 		}
-		if got := p.LoadExitStateCalls(); got != 1 {
-			t.Fatalf("expected exactly one systemd exit read, got %d", got)
+		if got := p.LoadRecordedExitStateCalls(); got != 0 {
+			t.Fatalf("expected no recorded exit to consume, got %d", got)
 		}
 		cancel()
 		<-done
 	})
 
-	t.Run("an unstarted process does not read the exit code from systemd", func(t *testing.T) {
+	// The reactor decoded this exit from the signal that enqueued the unit, so a
+	// property read would only recompute what it already has. This is the
+	// regression guard for reading systemd before consulting the recording.
+	t.Run("a recorded exit is applied without reading systemd", func(t *testing.T) {
 		p := &fakeProcess{name: unit, loadStateFn: func(f *fakeProcess) error {
-			return nil // models LoadState no-op for a not-yet-started process (pid==0)
+			t.Error("reconcile read systemd despite holding a recorded exit")
+			return nil
+		}}
+		p.RecordSystemdExitState(pState{Pid: 9, ExitCode: 2, ExitedAt: time.Now()})
+		units := &fakeLookup{m: map[string]Process{unit: p}}
+
+		updates := make(chan unitUpdate, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		done := make(chan struct{})
+		go func() { reactToUnitEvents(ctx, units, seqFromChan(ctx, updates)); close(done) }()
+
+		updates <- exitUpdate(unit)
+
+		if !eventually(2*time.Second, time.Millisecond, func() bool { return p.ProcessState().Exited() }) {
+			t.Fatal("reactor never applied the recorded exit")
+		}
+		if got := p.ProcessState().ExitCode; got != 2 {
+			t.Fatalf("expected the recorded exit code 2 to stand, got %d", got)
+		}
+		if got := p.LoadStateCalls(); got != 0 {
+			t.Fatalf("expected no systemd read, got %d", got)
+		}
+		cancel()
+		<-done
+	})
+
+	t.Run("a pre-start event does not mark the process exited", func(t *testing.T) {
+		p := &fakeProcess{name: unit, loadStateFn: func(f *fakeProcess) error {
+			return nil // a unit that has not started reports nothing
 		}}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
 
@@ -318,9 +398,6 @@ func TestReactToUnitEvents(t *testing.T) {
 		if !eventually(2*time.Second, time.Millisecond, func() bool { return p.LoadStateCalls() >= 1 }) {
 			t.Fatal("reactor never reconciled the pre-start event")
 		}
-		if got := p.LoadExitStateCalls(); got != 0 {
-			t.Fatalf("expected no systemd exit read for an unstarted unit, got %d", got)
-		}
 		if p.ProcessState().Exited() {
 			t.Fatal("pre-start event spuriously marked the process exited")
 		}
@@ -328,9 +405,9 @@ func TestReactToUnitEvents(t *testing.T) {
 		<-done
 	})
 
-	t.Run("a persisted terminal exit is not re-read from systemd", func(t *testing.T) {
+	t.Run("a read that yields a terminal exit is not followed by another", func(t *testing.T) {
 		p := &fakeProcess{name: unit, loadStateFn: func(f *fakeProcess) error {
-			f.setState(pState{Pid: 9, ExitCode: 2, ExitedAt: time.Now()}) // create's fast-exit file
+			f.setState(pState{Pid: 9, ExitCode: 2, ExitedAt: time.Now()})
 			return nil
 		}}
 		units := &fakeLookup{m: map[string]Process{unit: p}}
@@ -344,14 +421,14 @@ func TestReactToUnitEvents(t *testing.T) {
 
 		updates <- exitUpdate(unit)
 
-		if !eventually(2*time.Second, time.Millisecond, func() bool { return p.LoadStateCalls() >= 1 }) {
+		if !eventually(2*time.Second, time.Millisecond, func() bool { return p.ProcessState().Exited() }) {
 			t.Fatal("reactor never reconciled the unit")
 		}
-		if got := p.LoadExitStateCalls(); got != 0 {
-			t.Fatalf("expected no systemd exit read when the file is already terminal, got %d", got)
+		if got := p.LoadStateCalls(); got != 1 {
+			t.Fatalf("expected exactly one systemd read, got %d", got)
 		}
 		if got := p.ProcessState().ExitCode; got != 2 {
-			t.Fatalf("expected the persisted exit code 2 to stand, got %d", got)
+			t.Fatalf("expected the exit code 2 to stand, got %d", got)
 		}
 		cancel()
 		<-done
@@ -727,6 +804,17 @@ func serviceExitUpdate(unit string, pid, exitCode uint32, exitedAt time.Time) un
 	}
 }
 
+func helperExitUpdate(unit, statusText string, errno int32) unitUpdate {
+	return unitUpdate{
+		pathBase:      systemd.PathBusEscape(unit),
+		interfaceName: serviceInterface,
+		changed: map[string]dbus.Variant{
+			"StatusText":  dbus.MakeVariant(statusText),
+			"StatusErrno": dbus.MakeVariant(errno),
+		},
+	}
+}
+
 // newUpdate builds a unitUpdate the way the decoder does: the reactor keys off
 // the systemd-escaped object-path base, so tests escape the real unit name here
 // rather than hand-writing escaped paths.
@@ -806,15 +894,15 @@ func (l *fakeLookup) remove(name string) {
 }
 
 type fakeProcess struct {
-	name            string
-	mu              sync.Mutex
-	state           pState
-	loadCalls       int32
-	loadExitCalls   int32
-	loadStateFn     func(*fakeProcess) error
-	loadExitStateFn func(*fakeProcess) error
-	systemdExit     pState
-	hasSystemdExit  bool
+	name           string
+	mu             sync.Mutex
+	state          pState
+	loadCalls      int32
+	loadExitCalls  int32
+	loadStateFn    func(*fakeProcess) error
+	systemdExit    pState
+	hasSystemdExit bool
+	helperExit     bool
 }
 
 // LoadState mirrors the real implementations, which do NOT hold the process lock
@@ -833,20 +921,20 @@ func (f *fakeProcess) LoadStateCalls() int {
 	return int(atomic.LoadInt32(&f.loadCalls))
 }
 
-// LoadExitState mirrors the real reconcile-path systemd read. Like LoadState it
-// does not hold the process lock while running loadExitStateFn.
-func (f *fakeProcess) LoadExitState(context.Context) error {
+// LoadRecordedExitState mirrors the real reconcile-path consumption of the
+// reactor's recording: it applies a recorded exit and reports whether there was
+// one, doing no I/O either way.
+func (f *fakeProcess) LoadRecordedExitState(context.Context) bool {
+	state, ok := f.recordedSystemdExitState()
+	if !ok {
+		return false
+	}
 	atomic.AddInt32(&f.loadExitCalls, 1)
-	if f.loadExitStateFn != nil {
-		return f.loadExitStateFn(f)
-	}
-	if state, ok := f.recordedSystemdExitState(); ok {
-		f.setState(state)
-	}
-	return nil
+	f.setState(state)
+	return true
 }
 
-func (f *fakeProcess) LoadExitStateCalls() int {
+func (f *fakeProcess) LoadRecordedExitStateCalls() int {
 	return int(atomic.LoadInt32(&f.loadExitCalls))
 }
 
@@ -858,10 +946,18 @@ func (f *fakeProcess) setState(st pState) {
 
 func (f *fakeProcess) RecordSystemdExitState(state pState) {
 	f.mu.Lock()
-	if !f.hasSystemdExit {
+	if !f.hasSystemdExit && !f.helperExit {
 		f.systemdExit = state
 		f.hasSystemdExit = true
 	}
+	f.mu.Unlock()
+}
+
+func (f *fakeProcess) RecordHelperExitState(state pState) {
+	f.mu.Lock()
+	f.systemdExit = state
+	f.hasSystemdExit = true
+	f.helperExit = true
 	f.mu.Unlock()
 }
 

@@ -76,7 +76,7 @@ func writeResourceCSV(path string, r *Report) error {
 	for _, c := range sampledCategories {
 		header = append(header, "peak_pss_"+string(c))
 	}
-	header = append(header, "reactor_hits", "getall_fallbacks", "ondisk_reads", "reactor_hit_rate",
+	header = append(header, "reactor_hits", "getall_fallbacks", "reactor_hit_rate",
 		"shim_go_heap_bytes")
 	w.Write(header)
 
@@ -96,10 +96,9 @@ func writeResourceCSV(path string, r *Report) error {
 		if s.ShimVars != nil {
 			row = append(row, strconv.FormatInt(s.ShimVars.ReactorHits, 10),
 				strconv.FormatInt(s.ShimVars.GetAllFallbacks, 10),
-				strconv.FormatInt(s.ShimVars.OnDiskReads, 10),
 				f2(s.ShimVars.ReactorHitRate))
 		} else {
-			row = append(row, "", "", "", "")
+			row = append(row, "", "", "")
 		}
 		row = append(row, strconv.FormatUint(s.ShimGoHeapBytes, 10))
 		w.Write(row)

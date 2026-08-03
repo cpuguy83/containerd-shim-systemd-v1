@@ -17,9 +17,9 @@ func TestServiceWaitReconcilesExitState(t *testing.T) {
 		id        = "container"
 	)
 
-	t.Run("nonterminal disk state falls back to systemd before waiting", func(t *testing.T) {
+	t.Run("a process with no recorded exit is read from systemd before waiting", func(t *testing.T) {
 		p := newWaitProcess(id, pState{Pid: 42, Status: "running"})
-		p.loadExitStateFn = func(p *fakeProcess) error {
+		p.loadStateFn = func(p *fakeProcess) error {
 			p.setState(pState{
 				Pid:      42,
 				ExitCode: 9,
@@ -40,22 +40,25 @@ func TestServiceWaitReconcilesExitState(t *testing.T) {
 		if response.ExitStatus != 9 {
 			t.Fatalf("exit status = %d, want 9", response.ExitStatus)
 		}
-		if got := p.LoadExitStateCalls(); got != 1 {
-			t.Fatalf("systemd exit-state loads = %d, want 1", got)
+		if got := p.LoadStateCalls(); got != 1 {
+			t.Fatalf("systemd reads = %d, want 1", got)
 		}
 	})
 
-	t.Run("terminal disk state does not fall back to systemd", func(t *testing.T) {
+	// The reactor already decoded this exit, so Wait must not spend a property
+	// read recomputing it.
+	t.Run("a recorded exit answers the wait without reading systemd", func(t *testing.T) {
 		p := newWaitProcess(id, pState{Pid: 42, Status: "running"})
 		p.loadStateFn = func(p *fakeProcess) error {
-			p.setState(pState{
-				Pid:      42,
-				ExitCode: 7,
-				ExitedAt: time.Now(),
-				Status:   "failed",
-			})
+			t.Error("wait read systemd despite a recorded exit")
 			return nil
 		}
+		p.RecordSystemdExitState(pState{
+			Pid:      42,
+			ExitCode: 7,
+			ExitedAt: time.Now(),
+			Status:   "failed",
+		})
 		service := newWaitService(t, namespace, id, p)
 
 		response, err := service.Wait(
@@ -68,8 +71,8 @@ func TestServiceWaitReconcilesExitState(t *testing.T) {
 		if response.ExitStatus != 7 {
 			t.Fatalf("exit status = %d, want 7", response.ExitStatus)
 		}
-		if got := p.LoadExitStateCalls(); got != 0 {
-			t.Fatalf("systemd exit-state loads = %d, want 0", got)
+		if got := p.LoadStateCalls(); got != 0 {
+			t.Fatalf("systemd reads = %d, want 0", got)
 		}
 	})
 }

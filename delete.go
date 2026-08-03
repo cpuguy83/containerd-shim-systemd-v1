@@ -176,6 +176,10 @@ func (p *initProcess) Delete(ctx context.Context) (retState pState, retErr error
 		if err != nil {
 			return pState{}, err
 		}
+	} else {
+		// A process whose runc invocation failed never had a workload pid to
+		// wait on, but the failure is its exit and containerd still asks for it.
+		ps = p.ProcessState()
 	}
 
 	if p.Terminal {
@@ -255,6 +259,10 @@ func (p *execProcess) Delete(ctx context.Context) (retState pState, retErr error
 		if err != nil {
 			return pState{}, err
 		}
+	} else {
+		// A process whose runc invocation failed never had a workload pid to
+		// wait on, but the failure is its exit and containerd still asks for it.
+		ps = p.ProcessState()
 	}
 	p.finishDelete(ctx)
 

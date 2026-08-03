@@ -157,6 +157,91 @@ func TestServiceExitState(t *testing.T) {
 	})
 }
 
+func TestHelperExitReport(t *testing.T) {
+	t.Run("a reported exit carries the workload's pid and exit code", func(t *testing.T) {
+		changed := map[string]dbus.Variant{
+			"StatusText":  dbus.MakeVariant("exited 1234"),
+			"StatusErrno": dbus.MakeVariant(int32(19)),
+		}
+
+		state, ok := helperExitReport(changed)
+		if !ok {
+			t.Fatal("a reported exit was not recognized")
+		}
+		if state.Pid != 1234 || state.ExitCode != 19 || state.Status != "exited" {
+			t.Fatalf("state = %s, want pid 1234, exit 19, status exited", state)
+		}
+		if !state.Exited() {
+			t.Fatalf("state = %s, want it to be terminal", state)
+		}
+	})
+
+	// runc failing is not the workload exiting, and the pid runc ran under must
+	// never be reported as the workload's.
+	t.Run("a reported init failure carries runc's exit code and no pid", func(t *testing.T) {
+		changed := map[string]dbus.Variant{
+			"StatusText":  dbus.MakeVariant(exitedInit),
+			"StatusErrno": dbus.MakeVariant(int32(1)),
+		}
+
+		state, ok := helperExitReport(changed)
+		if !ok {
+			t.Fatal("a reported init failure was not recognized")
+		}
+		if state.Pid != 0 || state.ExitCode != 1 || state.Status != exitedInit {
+			t.Fatalf("state = %s, want no pid, exit 1, status %s", state, exitedInit)
+		}
+	})
+
+	t.Run("a workload that exited zero is still terminal", func(t *testing.T) {
+		changed := map[string]dbus.Variant{
+			"StatusText":  dbus.MakeVariant("exited 1234"),
+			"StatusErrno": dbus.MakeVariant(int32(0)),
+		}
+
+		state, ok := helperExitReport(changed)
+		if !ok {
+			t.Fatal("a reported zero exit was not recognized")
+		}
+		if state.ExitCode != 0 || !state.Exited() {
+			t.Fatalf("state = %s, want exit 0 and terminal", state)
+		}
+	})
+
+	// systemd emits StatusText on every Service property change, so the empty
+	// value has to stay silent or every running unit would look like an exit.
+	t.Run("an empty status text is not an exit", func(t *testing.T) {
+		changed := map[string]dbus.Variant{
+			"StatusText":  dbus.MakeVariant(""),
+			"StatusErrno": dbus.MakeVariant(int32(0)),
+		}
+
+		if _, ok := helperExitReport(changed); ok {
+			t.Fatal("an empty status text was recognized as an exit")
+		}
+	})
+
+	t.Run("a status text the shim did not write is not an exit", func(t *testing.T) {
+		changed := map[string]dbus.Variant{
+			"StatusText": dbus.MakeVariant("Ready to serve requests"),
+		}
+
+		if _, ok := helperExitReport(changed); ok {
+			t.Fatal("an unrelated status text was recognized as an exit")
+		}
+	})
+
+	t.Run("service properties without a status text are left to the systemd record", func(t *testing.T) {
+		changed := map[string]dbus.Variant{
+			"ExecMainPID": dbus.MakeVariant(uint32(42)),
+		}
+
+		if _, ok := helperExitReport(changed); ok {
+			t.Fatal("an exit was reported without a status text")
+		}
+	})
+}
+
 func TestUnitUpdates(t *testing.T) {
 	changed := changedProps(map[string]string{"ActiveState": "failed"})
 

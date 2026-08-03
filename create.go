@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
@@ -86,7 +85,6 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		switch vv := v.(type) {
 		case *options.CreateOptions:
 			opts.LogMode = vv.LogMode.String()
-			opts.SdNotifyEnable = vv.SdNotifyEnable
 			// TODO: Add other runc options to our CreateOptions.
 		case *v2runcopts.Options:
 			opts.NoPivotRoot = vv.NoPivotRoot
@@ -124,7 +122,7 @@ func (s *Service) Create(ctx context.Context, r *taskapi.CreateTaskRequest) (_ *
 		logPath = filepath.Join(r.Bundle, "init-runc-debug.log")
 	}
 
-	specData, err := ioutil.ReadFile(filepath.Join(r.Bundle, "config.json"))
+	specData, err := os.ReadFile(filepath.Join(r.Bundle, "config.json"))
 	if err != nil {
 		return nil, fmt.Errorf("error reading spec: %w", err)
 	}
@@ -526,48 +524,61 @@ func (p *initProcess) startUnit(ctx context.Context) (uint32, error) {
 			if status != "done" {
 				return fmt.Errorf("error starting systemd unit: %s", status)
 			}
-
-			if err := p.LoadState(ctx); err != nil {
-				return err
-			}
-
-			if p.ProcessState().Exited() {
-				return fmt.Errorf("container exited immediately, code: %d", p.ProcessState().ExitCode)
-			}
+			// No exit check here. The unit is Type=notify, so "done" means the
+			// create re-exec sent READY=1, which it only does for a workload that
+			// was running when it looked. A workload that died before that never
+			// reaches "done". One that dies during the MAINPID handoff still can,
+			// and handlePid below makes exactly this check against state the
+			// reactor has by then applied -- reading it here only asks systemd for
+			// an answer the next call already produces.
 		}
 
 		return nil
 	}
 
+	// handlePid resolves the pid runc left behind, and reports an exit that
+	// happened before this ran.
+	//
+	// The pid comes off disk rather than out of systemd. runc wrote it before it
+	// exited, and the unit reaching "done" means the create re-exec had already
+	// read that same file and handed the value over as MAINPID=, so ExecMainPID
+	// is a D-Bus round trip for a number already sitting in the bundle.
+	//
+	// The systemd fallback is for the caller below that runs this after do()
+	// failed: the unit may never have started, or may still be coming up.
 	handlePid := func() (uint32, error) {
-		if err := p.LoadState(ctx); err != nil {
-			log.G(ctx).WithError(err).Error("Error loading state")
-		}
-		for retries := 0; retries < 10 && p.Pid() == 0 && !p.ProcessState().Exited(); retries++ {
-			select {
-			case <-ctx.Done():
-				return 0, ctx.Err()
-			default:
-			}
+		pid, err := parsePidFile(p.pidFile())
+		if err != nil {
+			log.G(ctx).WithError(err).Debug("No usable runc pid file; reading state from systemd")
 
-			time.Sleep(10 * time.Millisecond)
 			if err := p.LoadState(ctx); err != nil {
 				log.G(ctx).WithError(err).Error("Error loading state")
 			}
-		}
-		pid := p.Pid()
+			for retries := 0; retries < 10 && p.Pid() == 0 && !p.ProcessState().Exited(); retries++ {
+				select {
+				case <-ctx.Done():
+					return 0, ctx.Err()
+				default:
+				}
 
-		p.mu.Lock()
-		if p.state.Pid == 0 {
-			p.state.Pid = uint32(pid)
+				time.Sleep(10 * time.Millisecond)
+				if err := p.LoadState(ctx); err != nil {
+					log.G(ctx).WithError(err).Error("Error loading state")
+				}
+			}
+			pid = p.Pid()
+		} else {
+			// Record it the way the systemd read used to: applyState rewrites
+			// "running" to "created" while the phase is below running, so this
+			// lands the same state without the round trip.
+			p.SetState(ctx, pState{Pid: pid, Status: "running"})
 		}
-		p.mu.Unlock()
-		var err error
+
 		if p.ProcessState().Exited() {
 			p.cond.Broadcast()
-			err = fmt.Errorf("container exited immediately, code: %d", p.ProcessState().ExitCode)
+			return pid, fmt.Errorf("container exited immediately, code: %d", p.ProcessState().ExitCode)
 		}
-		return uint32(pid), err
+		return pid, nil
 	}
 
 	if err := do(); err != nil {
@@ -724,27 +735,14 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		retErr = fmt.Errorf("process exited with code %d", st.ExitCode)
 	}()
 
-	writeFile := func() error {
-		data, err := json.Marshal(st)
-		if err != nil {
-			return fmt.Errorf("error marshalling state: %v", err)
-		}
-
-		if err := os.WriteFile(os.Getenv("EXIT_STATE_PATH"), data, 0600); err != nil {
-			return fmt.Errorf("error writing state: %v", err)
-		}
-		return nil
-	}
-
 	if err := cmd.Wait(); err != nil {
-		// runc exited non-zero
+		// runc exited non-zero. It never produced a workload, so there is no pid
+		// to report: the pid runc ran under must not be mistaken for one.
 		st.ExitCode = uint32(cmd.ProcessState.ExitCode())
 		st.ExitedAt = time.Now()
 		st.Status = exitedInit
-		st.Pid = uint32(cmd.Process.Pid)
-		err = writeFile()
-		sdNotify(ctx, notifyErrno(st.ExitCode), notifyStatus(st.Status))
-		return err
+		notifyWorkload(ctx, st)
+		return nil
 	}
 
 	// runc detaches, so it has written the pid of the process it left behind
@@ -754,16 +752,20 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		return err
 	}
 
-	st = pState{Pid: uint32(pid)}
-	if !noReap {
-		if st, err = workloadState(pid); err != nil {
-			return err
-		}
+	st = pState{Pid: uint32(pid), Status: "running"}
+	if noReap {
+		// Nothing here set PR_SET_CHILD_SUBREAPER, so the workload reparents to
+		// systemd, which reaps it and records its exit. Announcing the pid is the
+		// whole job: this process has no exit to report and nothing to re-check.
+		// The unit is Type=notify, so skipping the announcement would fail it.
+		notifyWorkload(ctx, st)
+		return nil
 	}
 
-	if err := writeFile(); err != nil {
+	if st, err = workloadState(pid); err != nil {
 		return err
 	}
+
 	notifyWorkload(ctx, st)
 
 	if st.Status != "running" {
@@ -789,9 +791,6 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 		// systemd has the pid and the pid is alive, so systemd owns its exit.
 		return nil
 	}
-	if err := writeFile(); err != nil {
-		return err
-	}
 	notifyWorkload(ctx, st)
 	return nil
 }
@@ -800,17 +799,32 @@ func createCmd(ctx context.Context, bundle string, cmdLine []string, tty, noReap
 // exits, so this only covers a write that has not landed yet.
 const pidFileTimeout = 5 * time.Second
 
-// readPidFile reads the pid runc recorded for the process it left behind.
+// parsePidFile reads the pid runc recorded at path. runc writes the file before
+// it exits, so any caller that has seen runc finish will find it complete.
+func parsePidFile(path string) (uint32, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid pid in %s: %w", path, err)
+	}
+	if pid == 0 {
+		return 0, fmt.Errorf("pid file %s contains zero", path)
+	}
+	return uint32(pid), nil
+}
+
+// readPidFile waits for runc to record the pid of the process it left behind.
+// runc writes it before it exits, so this only covers a write that has not
+// landed yet.
 func readPidFile(ctx context.Context, path string) (int, error) {
 	deadline := time.Now().Add(pidFileTimeout)
 	for {
-		data, err := os.ReadFile(path)
+		pid, err := parsePidFile(path)
 		if err == nil {
-			var pid int
-			if pid, err = strconv.Atoi(strings.TrimSpace(string(data))); err == nil {
-				return pid, nil
-			}
-			err = fmt.Errorf("invalid pid in %s: %w", path, err)
+			return int(pid), nil
 		}
 
 		if time.Now().After(deadline) {
@@ -864,13 +878,19 @@ func workloadState(pid int) (pState, error) {
 	return st, nil
 }
 
+// notifyWorkload tells systemd what runc left behind. It is the only channel
+// the shim has for a workload systemd never got to reap for itself, so a state
+// it cannot describe must not be reported at all rather than reported wrongly.
 func notifyWorkload(ctx context.Context, st pState) {
 	switch st.Status {
-	case "exited":
-		sdNotify(ctx, notifyStatus(st.Status), notifyErrno(st.ExitCode), notifyMainPID(st.Pid))
 	case "running":
 		sdNotify(ctx, daemon.SdNotifyReady, notifyMainPID(st.Pid))
 		log.G(ctx).Debug("Process is up!")
+	case exitedInit, "exited":
+		// No MAINPID: systemd refuses a pid that has already exited, and for an
+		// exited-init there is no workload pid in the first place. The pid the
+		// shim needs travels in the status text instead.
+		sdNotify(ctx, notifyStatus(st), notifyErrno(st.ExitCode))
 	}
 }
 
@@ -889,8 +909,18 @@ func notifyMainPID(pid uint32) string {
 	return fmt.Sprintf("MAINPID=%d", pid)
 }
 
-func notifyStatus(status string) string {
-	return fmt.Sprintf("STATUS=%s", status)
+// notifyStatus renders the STATUS= line: the systemd-shaped status, and the
+// workload's pid when there is one.
+//
+// STATUS= is the only free-form text systemd retains for a unit, which makes it
+// the one place a pid can survive an exit systemd did not witness -- MAINPID= is
+// refused for a process that is already dead, so ExecMainPID names this process
+// rather than the workload. parseStatusText reads it back.
+func notifyStatus(st pState) string {
+	if st.Pid == 0 {
+		return "STATUS=" + st.Status
+	}
+	return fmt.Sprintf("STATUS=%s %d", st.Status, st.Pid)
 }
 
 func notifyErrno(errno uint32) string {
